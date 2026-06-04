@@ -32,18 +32,20 @@ func New(cfg config.StreamConfig) *Capturer {
 func (c *Capturer) Start(ctx context.Context) (io.ReadCloser, error) {
 	ctx, c.cancel = context.WithCancel(ctx)
 
-	// GOP de 1s: keyframe a cada segundo. Em WebRTC na LAN não há retransmissão
-	// de pacote perdido aqui; um GOP curto garante recuperação rápida sem
-	// depender de PLI, ao custo de banda aceitável a 20Mbps.
-	gop := fmt.Sprintf("%d", c.cfg.FPS)
-	if gop == "0" {
-		gop = "60"
+	// GOP de meio segundo: keyframe a cada ~0,5s. Sem PLI->IDR sob demanda, a TV
+	// só (re)inicia a exibição no próximo IDR; metade do GOP corta pela metade o
+	// pior caso de "tela parada" ao conectar ou após perda de pacote — principal
+	// fonte do delay de 1-2s percebido na Tizen. Custo de banda aceitável na LAN.
+	gop := fmt.Sprintf("%d", c.cfg.FPS/2)
+	if c.cfg.FPS == 0 {
+		gop = "30"
 	}
 
-	// VBV buffer enxuto: um quarto de segundo de bitrate. Quanto menor o
-	// bufsize, menos o encoder "guarda" antes de emitir — elimina o ramp-up de
-	// vários segundos que enchia um buffer grande no início do stream.
-	bufsize := c.cfg.Bitrate / 4
+	// VBV buffer mínimo: ~1/8 de segundo de bitrate. Quanto menor o bufsize,
+	// menos o encoder "guarda" antes de emitir — reduz a latência de saída do
+	// NVENC além de eliminar o ramp-up inicial. Em CBR low-latency na LAN, um
+	// buffer enxuto não compromete a qualidade perceptível.
+	bufsize := c.cfg.Bitrate / 8
 	if bufsize == 0 {
 		bufsize = c.cfg.Bitrate
 	}
@@ -82,10 +84,15 @@ func (c *Capturer) Start(ctx context.Context) (io.ReadCloser, error) {
 		"-b:v", fmt.Sprintf("%dk", c.cfg.Bitrate),
 		"-maxrate", fmt.Sprintf("%dk", c.cfg.Bitrate),
 		"-bufsize", fmt.Sprintf("%dk", bufsize),
-		"-g", gop, // GOP de 1s
+		"-g", gop, // GOP de ~0,5s
 		"-bf", "0", // sem B-frames (latência)
 		"-delay", "0", // sem reordenação/atraso de saída do encoder
 		"-rc-lookahead", "0", // NVENC não segura frames analisando o futuro
+		// zerolatency: desliga o atraso interno de 1 quadro do rate control do
+		// NVENC. Cada frame codificado é emitido imediatamente, sem o "pipeline
+		// delay" que o encoder normalmente mantém para suavizar bitrate. Essencial
+		// para streaming interativo em LAN.
+		"-zerolatency", "1",
 		"-no-scenecut", "1",
 		// força um keyframe (IDR) logo no primeiro frame -> o client tem o que
 		// decodificar imediatamente, sem esperar o primeiro GOP.
