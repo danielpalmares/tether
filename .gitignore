@@ -1,0 +1,29 @@
+# --- Binários compilados ---
+/tether-host
+/tether-host.exe
+*.exe
+*.dll
+*.so
+*.dylib
+
+# --- Artefatos de teste/cobertura Go ---
+*.test
+*.out
+coverage.*
+
+# --- Probes/capturas de mídia geradas em debug ---
+*.h264
+*.mp4
+*.log
+
+# --- IDE / editor ---
+.vscode/
+.idea/
+*.swp
+
+# --- Sistema operacional ---
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# vendor/ é versionado de propósito (build offline e reprodutível).

@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TETHER · HOST</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="wrap">
+
+  <div class="topbar">
+    <div class="brand">
+      <div class="mark"></div>
+      <h1>Tether</h1>
+      <span class="role">host</span>
+    </div>
+    <div class="statline">
+      NODE <b id="hostname">—</b><br>
+      LAN <b id="lanaddr">—</b>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="hdr">status do nó <span class="idx">SYS · 00</span></div>
+    <div style="display:flex; align-items:center; gap:16px; flex-wrap:wrap;">
+      <span class="pill on" id="onlinePill"><span class="dot"></span> online · aguardando</span>
+      <span class="pill" id="streamPill"><span class="dot"></span> stream inativo</span>
+      <div style="margin-left:auto" class="hint">
+        Mantenha este app aberto. Enquanto rodar, o nó fica disponível na rede.
+      </div>
+    </div>
+  </div>
+
+  <div class="grid cols-2">
+    <div class="panel">
+      <div class="hdr">vídeo <span class="idx">CFG · 01</span></div>
+
+      <div class="field">
+        <label>resolução</label>
+        <div class="seg" id="resSeg">
+          <button data-w="1280" data-h="720">720p</button>
+          <button data-w="1920" data-h="1080" class="active">1080p</button>
+          <button data-w="2560" data-h="1440">1440p</button>
+        </div>
+      </div>
+
+      <div class="field">
+        <label>taxa de quadros <span class="val" id="fpsVal">60 fps</span></label>
+        <div class="seg" id="fpsSeg">
+          <button data-fps="30">30</button>
+          <button data-fps="60" class="active">60</button>
+          <button data-fps="120">120</button>
+        </div>
+      </div>
+
+      <div class="field">
+        <label>bitrate <span class="val" id="brVal">20 Mbps</span></label>
+        <input type="range" id="bitrate" min="4000" max="50000" step="1000" value="20000">
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="hdr">encoder <span class="idx">CFG · 02</span></div>
+
+      <div class="field">
+        <label>codec</label>
+        <div class="seg">
+          <button class="active">H.264 · NVENC</button>
+        </div>
+      </div>
+
+      <div class="field">
+        <label>monitor de origem</label>
+        <select id="display">
+          <option value="0">Monitor primário (0)</option>
+          <option value="1">Monitor secundário (1)</option>
+        </select>
+      </div>
+
+      <div class="field">
+        <label>perfil de latência</label>
+        <div class="seg">
+          <button class="active">ULTRA-LOW · ll</button>
+        </div>
+      </div>
+
+      <div class="hint" style="margin-top:14px">
+        Requer GPU NVIDIA + FFmpeg no PATH. O Steam Big Picture abre
+        automaticamente quando um client conecta.
+      </div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="hdr">log do sistema <span class="idx">LOG · 03</span></div>
+    <div class="console" id="log"></div>
+  </div>
+
+  <button class="btn primary" id="saveBtn">salvar configuração</button>
+
+</div>
+
+<script>
+const log = (msg, cls='') => {
+  const el = document.getElementById('log');
+  const ln = document.createElement('div');
+  ln.className = 'ln ' + cls;
+  ln.textContent = msg;
+  el.appendChild(ln); el.scrollTop = el.scrollHeight;
+};
+
+let cfg = { width:1920, height:1080, fps:60, bitrate:20000, codec:'h264', display:0 };
+
+// segmented controls
+document.querySelectorAll('#resSeg button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('#resSeg button').forEach(x=>x.classList.remove('active'));
+  b.classList.add('active'); cfg.width=+b.dataset.w; cfg.height=+b.dataset.h;
+});
+document.querySelectorAll('#fpsSeg button').forEach(b => b.onclick = () => {
+  document.querySelectorAll('#fpsSeg button').forEach(x=>x.classList.remove('active'));
+  b.classList.add('active'); cfg.fps=+b.dataset.fps;
+  document.getElementById('fpsVal').textContent = cfg.fps + ' fps';
+});
+const br = document.getElementById('bitrate');
+br.oninput = () => {
+  cfg.bitrate = +br.value;
+  document.getElementById('brVal').textContent = (cfg.bitrate/1000).toFixed(0) + ' Mbps';
+};
+document.getElementById('display').onchange = e => cfg.display = +e.target.value;
+
+document.getElementById('saveBtn').onclick = async () => {
+  try {
+    const r = await fetch('/api/config', {method:'POST', body: JSON.stringify(cfg)});
+    if (r.ok) log('configuração salva · ' + cfg.width+'x'+cfg.height+' @'+cfg.fps+'fps', 'ok');
+    else log('falha ao salvar config', 'err');
+  } catch(e){ log('erro: '+e.message, 'err'); }
+};
+
+// boot
+(async () => {
+  log('inicializando nó tether...', 'ok');
+  try {
+    const info = await (await fetch('/api/info')).json();
+    document.getElementById('hostname').textContent = info.host || '—';
+    log('host identificado: ' + info.host);
+  } catch(e){ log('não foi possível ler /api/info', 'warn'); }
+  try {
+    const c = await (await fetch('/api/config')).json();
+    cfg = c;
+    document.getElementById('brVal').textContent = (cfg.bitrate/1000).toFixed(0)+' Mbps';
+    br.value = cfg.bitrate;
+    log('config carregada do host', 'ok');
+  } catch(e){}
+  document.getElementById('lanaddr').textContent = location.host;
+  log('aguardando conexão de client na rede...', 'warn');
+})();
+
+// poll de status de streaming
+setInterval(async () => {
+  try {
+    const info = await (await fetch('/api/info')).json();
+    const sp = document.getElementById('streamPill');
+    const op = document.getElementById('onlinePill');
+    if (info.streaming) {
+      sp.className = 'pill live'; sp.querySelector('.dot').nextSibling.textContent=' stream ativo · transmitindo';
+      sp.innerHTML = '<span class="dot"></span> stream ativo · transmitindo';
+      op.innerHTML = '<span class="dot"></span> online · em sessão';
+    } else {
+      sp.className = 'pill'; sp.innerHTML = '<span class="dot"></span> stream inativo';
+    }
+  } catch(e){}
+}, 2000);
+</script>
+</body>
+</html>

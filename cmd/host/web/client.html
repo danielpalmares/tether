@@ -1,0 +1,306 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TETHER · CLIENT</title>
+<link rel="stylesheet" href="style.css">
+<style>
+  /* player de stream em tela cheia */
+  #stage {
+    position: fixed; inset: 0; background: #000; z-index: 500;
+    display: none; align-items: center; justify-content: center;
+  }
+  #stage.show { display: flex; }
+  #stage video { width: 100%; height: 100%; object-fit: contain; }
+  #stageHud {
+    position: fixed; top: 14px; left: 14px; z-index: 501;
+    display: flex; gap: 10px; align-items: center;
+  }
+  #stageExit {
+    position: fixed; top: 14px; right: 14px; z-index: 501; width: auto; padding: 10px 18px;
+  }
+
+  /* gamepad tester */
+  .pad-wrap { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; align-items: center; }
+  @media (max-width:720px){ .pad-wrap{ grid-template-columns: 1fr; } }
+  .pad-svg { width: 100%; }
+  .pad-btn { fill: var(--line); stroke: var(--line-2); stroke-width: 1.5; transition: fill .05s; }
+  .pad-btn.on { fill: var(--acid); }
+  .pad-lbl { fill: var(--txt-mute); font: 9px var(--mono); }
+  .stick { fill: var(--panel-2); stroke: var(--line-2); stroke-width: 1.5; }
+  .stick-dot { fill: var(--signal); }
+  .trig-bar { fill: var(--acid); }
+  .pad-status { font-family: var(--mono); font-size: 12px; line-height: 2; }
+  .pad-status .k { color: var(--txt-dim); letter-spacing:1px; }
+  .pad-status .v { color: var(--acid); }
+  .pad-status .v.off { color: var(--txt-mute); }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="topbar">
+    <div class="brand">
+      <div class="mark"></div>
+      <h1>Tether</h1>
+      <span class="role" style="color:var(--cyan);border-color:var(--cyan)">client</span>
+    </div>
+    <div class="statline">
+      LINK <b id="linkState">offline</b><br>
+      RTT <b id="rtt">—</b>
+    </div>
+  </div>
+
+  <!-- 01 · descoberta -->
+  <div class="panel">
+    <div class="hdr">localizar host <span class="idx">NET · 01</span></div>
+    <div class="grid cols-2">
+      <div class="field" style="margin:0">
+        <label>endereço do host na rede</label>
+        <input type="text" id="hostAddr" placeholder="192.168.0.10:8787" value="">
+      </div>
+      <div style="display:flex; align-items:flex-end;">
+        <button class="btn" id="probeBtn">vincular host</button>
+      </div>
+    </div>
+    <div id="hostInfo" class="hint" style="margin-top:14px">
+      Digite o IP:porta exibido no painel do PC host. (descoberta mDNS automática chega na v2)
+    </div>
+  </div>
+
+  <!-- 02 · controle -->
+  <div class="panel">
+    <div class="hdr">controle · xbox <span class="idx">HID · 02</span></div>
+    <div class="pad-wrap">
+      <svg class="pad-svg" viewBox="0 0 320 200" id="padSvg">
+        <!-- corpo -->
+        <rect x="20" y="50" width="280" height="110" rx="40" fill="var(--bg-2)" stroke="var(--line)" stroke-width="1.5"/>
+        <!-- gatilhos (barras) -->
+        <rect x="50" y="34" width="40" height="8" rx="2" fill="var(--line-2)"/>
+        <rect x="50" y="34" width="0" height="8" rx="2" class="trig-bar" id="tLT"/>
+        <rect x="230" y="34" width="40" height="8" rx="2" fill="var(--line-2)"/>
+        <rect x="230" y="34" width="0" height="8" rx="2" class="trig-bar" id="tRT"/>
+        <text x="50" y="28" class="pad-lbl">LT</text>
+        <text x="255" y="28" class="pad-lbl">RT</text>
+        <!-- LB / RB -->
+        <rect x="50" y="46" width="40" height="7" rx="3" class="pad-btn" id="bLB"/>
+        <rect x="230" y="46" width="40" height="7" rx="3" class="pad-btn" id="bRB"/>
+        <!-- stick esquerdo -->
+        <circle cx="78" cy="92" r="20" class="stick"/>
+        <circle cx="78" cy="92" r="7" class="stick-dot" id="sL"/>
+        <!-- dpad -->
+        <rect x="116" y="118" width="12" height="34" rx="2" class="pad-btn" id="bDV"/>
+        <rect x="105" y="129" width="34" height="12" rx="2" class="pad-btn" id="bDH"/>
+        <!-- stick direito -->
+        <circle cx="200" cy="124" r="18" class="stick"/>
+        <circle cx="200" cy="124" r="6" class="stick-dot" id="sR"/>
+        <!-- botões ABXY -->
+        <circle cx="250" cy="92" r="11" class="pad-btn" id="bA"/><text x="246" y="96" class="pad-lbl">A</text>
+        <circle cx="272" cy="70" r="11" class="pad-btn" id="bB"/><text x="268" y="74" class="pad-lbl">B</text>
+        <circle cx="228" cy="70" r="11" class="pad-btn" id="bX"/><text x="224" y="74" class="pad-lbl">X</text>
+        <circle cx="250" cy="48" r="11" class="pad-btn" id="bY"/><text x="246" y="52" class="pad-lbl">Y</text>
+        <!-- back / start / guide -->
+        <circle cx="135" cy="92" r="6" class="pad-btn" id="bBack"/>
+        <circle cx="185" cy="92" r="6" class="pad-btn" id="bStart"/>
+        <circle cx="160" cy="80" r="9" class="pad-btn" id="bGuide"/>
+      </svg>
+      <div class="pad-status" id="padStatus">
+        <div><span class="k">DISPOSITIVO</span> &middot; <span class="v off" id="padName">nenhum detectado</span></div>
+        <div class="hint" style="margin-top:10px">Conecte um controle Xbox e pressione qualquer botão para ativá-lo.</div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 03 · iniciar -->
+  <div class="panel">
+    <div class="hdr">sessão <span class="idx">RUN · 03</span></div>
+    <div style="display:flex; align-items:center; gap:16px; flex-wrap:wrap;">
+      <span class="pill" id="readyPill"><span class="dot"></span> aguardando host + controle</span>
+      <button class="btn live" id="startBtn" style="margin-left:auto; max-width:260px" disabled>
+        iniciar streaming ▸
+      </button>
+    </div>
+    <div class="console" id="log" style="margin-top:16px; height:120px"></div>
+  </div>
+
+</div>
+
+<!-- palco de streaming -->
+<div id="stage">
+  <video id="video" autoplay playsinline></video>
+  <div id="stageHud">
+    <span class="pill live"><span class="dot"></span> ao vivo</span>
+    <span class="pill"><span class="dot" style="background:var(--cyan)"></span> <span id="hudRtt">— ms</span></span>
+  </div>
+  <button class="btn" id="stageExit">⛒ encerrar</button>
+</div>
+
+<script>
+const log=(m,c='')=>{const e=document.getElementById('log'),l=document.createElement('div');l.className='ln '+c;l.textContent=m;e.appendChild(l);e.scrollTop=e.scrollHeight;};
+
+let hostAddr=null, padIndex=null, pc=null, dc=null, inputTimer=null;
+
+/* ---------- 01 · vincular host ---------- */
+document.getElementById('probeBtn').onclick = async () => {
+  let a=document.getElementById('hostAddr').value.trim();
+  if(!a){log('informe o endereço do host','warn');return;}
+  if(!a.includes(':')) a+=':8787';
+  try{
+    const info=await(await fetch('http://'+a+'/api/info')).json();
+    hostAddr=a;
+    document.getElementById('hostInfo').innerHTML='host <b style="color:var(--acid)">'+info.host+'</b> vinculado · '+(info.streaming?'OCUPADO':'disponível');
+    document.getElementById('linkState').textContent='vinculado';
+    log('host vinculado: '+info.host+' ('+a+')','ok');
+    refreshReady();
+  }catch(e){ log('host não encontrado em '+a,'err'); }
+};
+
+/* ---------- 02 · gamepad ---------- */
+window.addEventListener('gamepadconnected', e => {
+  padIndex=e.gamepad.index;
+  document.getElementById('padName').textContent=e.gamepad.id.slice(0,28);
+  document.getElementById('padName').className='v';
+  log('controle conectado: '+e.gamepad.id.slice(0,40),'ok');
+  refreshReady();
+});
+window.addEventListener('gamepaddisconnected', () => {
+  padIndex=null;
+  document.getElementById('padName').textContent='nenhum detectado';
+  document.getElementById('padName').className='v off';
+  refreshReady();
+});
+
+const setBtn=(id,on)=>{const el=document.getElementById(id);if(el)el.classList.toggle('on',on);};
+
+// loop de leitura/visualização do controle
+function padLoop(){
+  if(padIndex!==null){
+    const gp=navigator.getGamepads()[padIndex];
+    if(gp){
+      const b=gp.buttons.map(x=>x.pressed);
+      const ax=gp.axes;
+      // visual
+      setBtn('bA',b[0]);setBtn('bB',b[1]);setBtn('bX',b[2]);setBtn('bY',b[3]);
+      setBtn('bLB',b[4]);setBtn('bRB',b[5]);
+      setBtn('bBack',b[8]);setBtn('bStart',b[9]);setBtn('bGuide',b[16]);
+      setBtn('bDV',b[12]||b[13]);setBtn('bDH',b[14]||b[15]);
+      // gatilhos analógicos (botões 6/7)
+      document.getElementById('tLT').setAttribute('width',(gp.buttons[6].value*40).toFixed(1));
+      document.getElementById('tRT').setAttribute('width',(gp.buttons[7].value*40).toFixed(1));
+      // sticks
+      document.getElementById('sL').setAttribute('cx',78+(ax[0]||0)*11);
+      document.getElementById('sL').setAttribute('cy',92+(ax[1]||0)*11);
+      document.getElementById('sR').setAttribute('cx',200+(ax[2]||0)*10);
+      document.getElementById('sR').setAttribute('cy',124+(ax[3]||0)*10);
+    }
+  }
+  requestAnimationFrame(padLoop);
+}
+padLoop();
+
+function refreshReady(){
+  // O controle é opcional: o vídeo flui sem ele (input só fica indisponível).
+  // Basta o host vinculado para iniciar o streaming.
+  const ok = !!hostAddr;
+  const p=document.getElementById('readyPill');
+  const btn=document.getElementById('startBtn');
+  if(ok){
+    btn.disabled=false; p.className='pill on';
+    p.innerHTML='<span class="dot"></span> '+(padIndex!==null?'pronto para conectar':'pronto (sem controle)');
+  } else {
+    p.className='pill'; p.innerHTML='<span class="dot"></span> aguardando host'; btn.disabled=true;
+  }
+}
+
+/* ---------- 03 · streaming (WebRTC) ---------- */
+document.getElementById('startBtn').onclick = startStream;
+
+async function startStream(){
+  if(!hostAddr) return;
+  log('estabelecendo link webrtc...','warn');
+  if(padIndex===null) log('iniciando sem controle (somente vídeo)','warn');
+
+  pc=new RTCPeerConnection({iceServers:[]});
+
+  // recebe vídeo
+  pc.ontrack = ev => {
+    document.getElementById('video').srcObject = ev.streams[0];
+    document.getElementById('stage').classList.add('show');
+    log('vídeo recebido · sessão ao vivo','ok');
+  };
+  pc.onconnectionstatechange = () => {
+    log('conexão: '+pc.connectionState, pc.connectionState==='connected'?'ok':'');
+    if(['failed','disconnected','closed'].includes(pc.connectionState)) endStream();
+  };
+
+  // precisa receber vídeo
+  pc.addTransceiver('video', {direction:'recvonly'});
+
+  // data channel de input
+  dc = pc.createDataChannel('input', {ordered:false, maxRetransmits:0});
+  dc.onopen = () => {
+    log('canal de input aberto · enviando @60hz','ok');
+    inputTimer=setInterval(sendInput, 1000/60);
+  };
+
+  // signaling via websocket
+  const ws=new WebSocket('ws://'+hostAddr+'/ws');
+  ws.onopen = async () => {
+    const offer=await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    await new Promise(r=>{ if(pc.iceGatheringState==='complete')return r();
+      pc.onicegatheringstatechange=()=>pc.iceGatheringState==='complete'&&r(); });
+    ws.send(JSON.stringify({type:'offer', data: pc.localDescription}));
+    log('offer enviada','ok');
+  };
+  ws.onmessage = async ev => {
+    const msg=JSON.parse(ev.data);
+    if(msg.type==='answer'){
+      await pc.setRemoteDescription(msg.data);
+      log('answer recebida · handshake completo','ok');
+    }
+  };
+  ws.onerror = () => log('erro no signaling websocket','err');
+}
+
+function sendInput(){
+  if(!dc || dc.readyState!=='open' || padIndex===null) return;
+  const gp=navigator.getGamepads()[padIndex];
+  if(!gp) return;
+  const buttons=gp.buttons.map(b=>b.pressed);
+  // anexa valores analógicos dos gatilhos como eixos 4 e 5
+  const axes=[...gp.axes.slice(0,4), gp.buttons[6].value, gp.buttons[7].value];
+  dc.send(JSON.stringify({buttons, axes}));
+}
+
+function endStream(){
+  if(inputTimer) clearInterval(inputTimer);
+  if(dc) dc.close();
+  if(pc) pc.close();
+  pc=null; dc=null;
+  document.getElementById('stage').classList.remove('show');
+  document.getElementById('video').srcObject=null;
+  document.getElementById('linkState').textContent='offline';
+  log('sessão encerrada','warn');
+}
+document.getElementById('stageExit').onclick = endStream;
+
+// medição de RTT
+setInterval(async () => {
+  if(!pc || pc.connectionState!=='connected') return;
+  const stats=await pc.getStats();
+  stats.forEach(r=>{
+    if(r.type==='candidate-pair' && r.state==='succeeded' && r.currentRoundTripTime!=null){
+      const ms=(r.currentRoundTripTime*1000).toFixed(0);
+      document.getElementById('rtt').textContent=ms+' ms';
+      document.getElementById('hudRtt').textContent=ms+' ms';
+    }
+  });
+}, 1000);
+
+log('client tether inicializado','ok');
+</script>
+</body>
+</html>
+
