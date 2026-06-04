@@ -225,6 +225,28 @@ async function startStream(){
 
   // recebe vídeo
   pc.ontrack = ev => {
+    // Minimiza o jitter buffer de playout do receiver. Em LAN o jitter de
+    // chegada é desprezível, mas o player (sobretudo o WebRTC da Tizen) mantém
+    // por padrão um buffer conservador de centenas de ms — esse é o delay
+    // residual percebido depois de já termos enxugado o encoder. Pedir 0 manda
+    // o browser exibir cada frame assim que chega.
+    try {
+      const recv = ev.receiver || (pc.getReceivers && pc.getReceivers().find(r => r.track === ev.track));
+      let applied = [];
+      if (recv && 'jitterBufferTarget' in recv) {
+        recv.jitterBufferTarget = 0; applied.push('jitterBufferTarget');
+      }
+      // playoutDelayHint: hint legado, distinto do jitterBufferTarget. Vários
+      // firmwares Tizen honram este e ignoram aquele — aplicamos ambos para
+      // cobrir o maior número de versões de TV Samsung.
+      if (recv && 'playoutDelayHint' in recv) {
+        recv.playoutDelayHint = 0; applied.push('playoutDelayHint');
+      }
+      log(applied.length ? 'playout minimizado ('+applied.join('+')+'=0)'
+                         : 'nenhum hint de playout suportado (mantém padrão)',
+          applied.length ? 'ok' : 'warn');
+    } catch(e){ log('falha ao ajustar jitter buffer: '+e.message,'warn'); }
+
     document.getElementById('video').srcObject = ev.streams[0];
     document.getElementById('stage').classList.add('show');
     log('vídeo recebido · sessão ao vivo','ok');
@@ -290,13 +312,25 @@ document.getElementById('stageExit').onclick = endStream;
 setInterval(async () => {
   if(!pc || pc.connectionState!=='connected') return;
   const stats=await pc.getStats();
+  let jbDelay=null, jbCount=null;
   stats.forEach(r=>{
     if(r.type==='candidate-pair' && r.state==='succeeded' && r.currentRoundTripTime!=null){
       const ms=(r.currentRoundTripTime*1000).toFixed(0);
       document.getElementById('rtt').textContent=ms+' ms';
       document.getElementById('hudRtt').textContent=ms+' ms';
     }
+    // jitterBufferDelay é acumulado (segundos) e jitterBufferEmittedCount é o nº
+    // de frames; a razão dá o atraso MÉDIO de playout por frame — a métrica que
+    // revela quanto o player está realmente segurando além da rede.
+    if(r.type==='inbound-rtp' && r.kind==='video'){
+      jbDelay=r.jitterBufferDelay; jbCount=r.jitterBufferEmittedCount;
+    }
   });
+  if(jbDelay!=null && jbCount>0){
+    const avgMs=(jbDelay/jbCount*1000).toFixed(0);
+    document.getElementById('hudRtt').textContent=
+      document.getElementById('hudRtt').textContent.split(' · ')[0]+' · buf '+avgMs+'ms';
+  }
 }, 1000);
 
 log('client tether inicializado','ok');

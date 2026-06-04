@@ -7,6 +7,7 @@ import (
 	"log"
 	"time"
 
+	"github.com/pion/interceptor"
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
 	"github.com/pion/webrtc/v4/pkg/media/h264reader"
@@ -28,27 +29,56 @@ type Session struct {
 
 // NewSession cria a peer connection, registra a track de vídeo e o data channel.
 func NewSession(cfg config.StreamConfig, injector input.Injector, onClose func()) (*Session, error) {
-	m := &webrtc.MediaEngine{}
-	if err := m.RegisterCodec(webrtc.RTPCodecParameters{
+	// Codec H264 ÚNICO do host, definido uma vez e reusado em RegisterCodec, na
+	// track e no SetCodecPreferences — os três PRECISAM ser idênticos byte a byte.
+	//
+	// 42c02a = profile_idc 0x42 (Baseline) + profile-iop 0xc0 + level 0x2a (4.2).
+	// O profile-iop reflete os constraint_set flags reais do SPS do NVENC, medidos
+	// com trace_headers: constraint_set0=1, set1=1, set2=0 -> 0b11000000 = 0xc0.
+	// Decoders de TV (Samsung Tizen) configuram o pipeline pelo profile-level-id da
+	// SDP; se o SPS diverge — ou se a SDP anuncia um LEVEL menor que o bitstream —
+	// o decoder de hardware estoura e congela. Chrome/Android toleram; a TV não.
+	h264Codec := webrtc.RTPCodecParameters{
 		RTPCodecCapability: webrtc.RTPCodecCapability{
 			MimeType:    webrtc.MimeTypeH264,
 			ClockRate:   90000,
-			// 42c02a = profile_idc 0x42 (Baseline) + profile-iop 0xc0 + level 0x2a (4.2).
-			// O byte profile-iop DEVE refletir os constraint_set flags reais do SPS
-			// que o NVENC emite, byte a byte. Medição com trace_headers no bitstream:
-			//   constraint_set0=1, set1=1, set2=0  ->  0b11000000 = 0xc0  (NÃO 0xe0).
-			// O 0xe0 (=42e02a) anuncia constraint_set2=1; o SPS tem set2=0. Decoders
-			// de hardware de TV (Samsung Tizen) configuram o pipeline pelo profile-iop
-			// da SDP e congelam após o primeiro IDR quando o SPS diverge em 1 bit.
-			// Chrome/Android toleram (decode flexível); a TV não.
 			SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42c02a",
+			// Os feedbacks PRECISAM viver no próprio codec: o SetCodecPreferences
+			// abaixo substitui a lista negociada pelo transceiver por este codec,
+			// então um RTCPFeedback nil aqui apagaria o nack/pli que o ConfigureNack
+			// registra no MediaEngine. Declarados aqui, nack e nack pli sobrevivem à
+			// restrição e aparecem na answer.
+			RTCPFeedback: []webrtc.RTCPFeedback{
+				{Type: "nack"},
+				{Type: "nack", Parameter: "pli"},
+			},
 		},
 		PayloadType: 102,
-	}, webrtc.RTPCodecTypeVideo); err != nil {
+	}
+
+	m := &webrtc.MediaEngine{}
+	if err := m.RegisterCodec(h264Codec, webrtc.RTPCodecTypeVideo); err != nil {
 		return nil, err
 	}
 
-	api := webrtc.NewAPI(webrtc.WithMediaEngine(m))
+	// NACK (retransmissão de pacotes perdidos) + RTCP Reports. Sem isto, perder
+	// 1 fragmento de keyframe (~50 pacotes a 1080p60) descarta o frame inteiro e
+	// a TV infla o jitter buffer defensivamente (buf travado ~80ms — a causa é
+	// perda, não config de playout). NÃO usamos RegisterDefaultInterceptors: ele
+	// também liga TWCC + header-extensions que incham a SDP, e o decoder Tizen é
+	// estrito (vide o bug do profile-level-id). Registramos só nack e nack pli.
+	ir := &interceptor.Registry{}
+	if err := webrtc.ConfigureNack(m, ir); err != nil {
+		return nil, err
+	}
+	if err := webrtc.ConfigureRTCPReports(ir); err != nil {
+		return nil, err
+	}
+
+	api := webrtc.NewAPI(
+		webrtc.WithMediaEngine(m),
+		webrtc.WithInterceptorRegistry(ir),
+	)
 	pc, err := api.NewPeerConnection(webrtc.Configuration{
 		// Na LAN não precisamos de STUN/TURN; ICE resolve com candidatos locais.
 		ICEServers: []webrtc.ICEServer{},
@@ -60,25 +90,48 @@ func NewSession(cfg config.StreamConfig, injector input.Injector, onClose func()
 	s := &Session{pc: pc, cfg: cfg, injector: injector, onClose: onClose}
 
 	// --- Track de vídeo ---
-	// A track carrega o MESMO fmtp registrado no MediaEngine. Sem isso o Pion
-	// casa a track só pelo MimeType e a answer pode referenciar um payload type
-	// sem o profile-level-id correto — ambiguidade que o decoder estrito da
-	// Samsung resolve travando. O fmtp idêntico garante que o codec negociado e
-	// anunciado na answer seja exatamente o 42c02a que o bitstream produz.
+	// A track carrega o MESMO capability do codec registrado.
 	videoTrack, err := webrtc.NewTrackLocalStaticSample(
-		webrtc.RTPCodecCapability{
-			MimeType:    webrtc.MimeTypeH264,
-			ClockRate:   90000,
-			SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42c02a",
-		},
+		h264Codec.RTPCodecCapability,
 		"video", "tether-screen",
 	)
 	if err != nil {
 		return nil, err
 	}
-	if _, err = pc.AddTrack(videoTrack); err != nil {
+	rtpSender, err := pc.AddTrack(videoTrack)
+	if err != nil {
 		return nil, err
 	}
+
+	// FORÇA o transceiver a ofertar/aceitar SOMENTE o 42c02a. Sem isto, o Pion ao
+	// processar a offer faz match parcial por MIME type e ADICIONA à negociação
+	// todos os perfis H264 que o client oferece (42001f, 42e01f, ...). O 42001f
+	// (Level 3.1 = 720p30) acabava na posição preferencial da answer; a TV casava
+	// esse payload, configurava o decoder para 720p e recebia o bitstream 1080p60
+	// do NVENC — estouro de level -> descarte de frames e congelamento. Restringir
+	// o transceiver ao nosso único codec garante que a answer descreva exatamente
+	// o que o WriteSample empacota. (Pion: SetCodecPreferences ANTES do
+	// CreateAnswer; getCodecs() do transceiver passa a retornar só estes.)
+	for _, t := range pc.GetTransceivers() {
+		if t.Sender() == rtpSender {
+			if err := t.SetCodecPreferences([]webrtc.RTPCodecParameters{h264Codec}); err != nil {
+				return nil, err
+			}
+			break
+		}
+	}
+	// O RTCP do receiver (PLI, NACK, Receiver Reports) chega NESTE sender. É a
+	// leitura de rtpSender que entrega esse RTCP aos interceptors — sem o loop, o
+	// NACK responder nunca vê os pedidos de retransmissão e o feedback é ignorado
+	// em silêncio. Buffer descartável; encerra quando a sessão fecha.
+	go func() {
+		buf := make([]byte, 1500)
+		for {
+			if _, _, rtcpErr := rtpSender.Read(buf); rtcpErr != nil {
+				return
+			}
+		}
+	}()
 
 	// Pré-aquece a captura JÁ, em paralelo ao handshake WebRTC. O DXGI Desktop
 	// Duplication tem ~750ms de custo de inicialização (criar device, primeiro
