@@ -15,7 +15,8 @@
   #stage video { width: 100%; height: 100%; object-fit: contain; }
   #stageHud {
     position: fixed; top: 14px; left: 14px; z-index: 501;
-    display: flex; gap: 10px; align-items: center;
+    display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+    max-width: calc(100% - 180px);
   }
   #stageExit {
     position: fixed; top: 14px; right: 14px; z-index: 501; width: auto; padding: 10px 18px;
@@ -129,6 +130,7 @@
 <!-- palco de streaming -->
 <div id="stage" tabindex="-1">
   <video id="video" autoplay playsinline></video>
+  <audio id="audio" autoplay playsinline></audio>
   <div id="stageHud">
     <span class="pill live"><span class="dot"></span> ao vivo</span>
     <span class="pill"><span class="dot" style="background:var(--cyan)"></span> <span id="hudRtt">— ms</span></span>
@@ -140,10 +142,57 @@
 <script>
 const log=(m,c='')=>{const e=document.getElementById('log'),l=document.createElement('div');l.className='ln '+c;l.textContent=m;e.appendChild(l);e.scrollTop=e.scrollHeight;};
 
-let hostAddr=null, padIndex=null, pc=null, dc=null, inputTimer=null, remoteStream=null, controlHandlers=null;
-let lastVideoStats={framesDropped:0, packetsLost:0};
+let hostAddr=null, padIndex=null, pc=null, dc=null, inputTimer=null, remoteVideoStream=null, remoteAudioStream=null, controlHandlers=null;
+let lastVideoStats=null;
 let latencyHintLogged=false;
 let keysDown=new Set();
+
+function resetVideoStats(){
+  lastVideoStats=null;
+}
+
+function numberStat(report, field){
+  const value=report[field];
+  return typeof value==='number' && Number.isFinite(value) ? value : null;
+}
+
+function snapshotVideoStats(report){
+  const fields=[
+    'framesDecoded','framesDropped','framesReceived','framesPerSecond',
+    'frameWidth','frameHeight','packetsLost','jitter','jitterBufferDelay',
+    'jitterBufferTargetDelay','jitterBufferMinimumDelay','jitterBufferEmittedCount',
+    'nackCount','pliCount','firCount','freezeCount','totalFreezesDuration',
+    'keyFramesDecoded'
+  ];
+  const snap={timestamp:numberStat(report,'timestamp')};
+  fields.forEach(field=>{
+    const value=numberStat(report, field);
+    if(value!==null) snap[field]=value;
+  });
+  return snap;
+}
+
+function counterDelta(now, prev, field){
+  if(!prev || now[field]==null || prev[field]==null) return 0;
+  return Math.max(0, now[field]-prev[field]);
+}
+
+function counterRate(now, prev, field){
+  if(!prev || now[field]==null || prev[field]==null || now.timestamp==null || prev.timestamp==null) return null;
+  const seconds=(now.timestamp-prev.timestamp)/1000;
+  if(seconds<=0) return null;
+  return Math.max(0, now[field]-prev[field])/seconds;
+}
+
+function perEmittedDelayMs(now, prev, delayField){
+  if(now[delayField]==null || now.jitterBufferEmittedCount==null || now.jitterBufferEmittedCount<=0) return null;
+  if(prev && prev[delayField]!=null && prev.jitterBufferEmittedCount!=null){
+    const delayDelta=now[delayField]-prev[delayField];
+    const emittedDelta=now.jitterBufferEmittedCount-prev.jitterBufferEmittedCount;
+    if(delayDelta>=0 && emittedDelta>0) return delayDelta/emittedDelta*1000;
+  }
+  return now[delayField]/now.jitterBufferEmittedCount*1000;
+}
 
 /* ---------- 01 · vincular host ---------- */
 document.getElementById('probeBtn').onclick = async () => {
@@ -151,14 +200,97 @@ document.getElementById('probeBtn').onclick = async () => {
   if(!a){log('informe o endereço do host','warn');return;}
   if(!a.includes(':')) a+=':8787';
   try{
-    const info=await(await fetch('http://'+a+'/api/info')).json();
-    hostAddr=a;
-    document.getElementById('hostInfo').innerHTML='host <b style="color:var(--acid)">'+info.host+'</b> vinculado · '+(info.streaming?'OCUPADO':'disponível');
-    document.getElementById('linkState').textContent='vinculado';
-    log('host vinculado: '+info.host+' ('+a+')','ok');
-    refreshReady();
+    const found=await probeHost(a, 1200);
+    bindHost(found.addr, found.info);
   }catch(e){ log('host não encontrado em '+a,'err'); }
 };
+
+function normalizeHostAddr(a){
+  a=(a||'').trim().replace(/^https?:\/\//,'').replace(/\/.*$/,'');
+  if(!a) return '';
+  if(!a.includes(':')) a+=':8787';
+  return a;
+}
+
+async function probeHost(addr, timeoutMs=700){
+  addr=normalizeHostAddr(addr);
+  const ctrl=new AbortController();
+  const timer=setTimeout(()=>ctrl.abort(), timeoutMs);
+  try{
+    const res=await fetch('http://'+addr+'/api/info', {signal:ctrl.signal, cache:'no-store'});
+    if(!res.ok) throw new Error('HTTP '+res.status);
+    const info=await res.json();
+    if(info.app && info.app!=='Tether') throw new Error('não é Tether');
+    return {addr, info};
+  }finally{
+    clearTimeout(timer);
+  }
+}
+
+function bindHost(addr, info, auto=false){
+  hostAddr=normalizeHostAddr(addr);
+  localStorage.setItem('tether.hostAddr', hostAddr);
+  document.getElementById('hostAddr').value=hostAddr;
+  document.getElementById('hostInfo').innerHTML='host <b style="color:var(--acid)">'+info.host+'</b> vinculado · '+(info.streaming?'OCUPADO':'disponível');
+  document.getElementById('linkState').textContent='vinculado';
+  log((auto?'host detectado: ':'host vinculado: ')+info.host+' ('+hostAddr+')','ok');
+  refreshReady();
+}
+
+function candidateSubnetHosts(){
+  const h=location.hostname;
+  if(!/^\d+\.\d+\.\d+\.\d+$/.test(h)) return [];
+  const parts=h.split('.');
+  if(parts[0]==='127') return [];
+  const prefix=parts.slice(0,3).join('.');
+  const out=[];
+  for(let i=1;i<255;i++) out.push(prefix+'.'+i+':8787');
+  return out;
+}
+
+async function scanHosts(addrs){
+  const found=[];
+  let idx=0;
+  const workers=Array.from({length:32}, async ()=>{
+    while(idx<addrs.length){
+      const addr=addrs[idx++];
+      if(found.some(x=>x.addr===addr)) continue;
+      try{ found.push(await probeHost(addr, 450)); }catch(e){}
+    }
+  });
+  await Promise.all(workers);
+  return found;
+}
+
+function showHostChoices(found){
+  const html=found.map(h=>'<button class="btn" style="margin:6px 8px 0 0; width:auto; padding:8px 12px" data-host="'+h.addr+'">'+h.info.host+'</button>').join('');
+  document.getElementById('hostInfo').innerHTML='hosts encontrados: '+html;
+  document.querySelectorAll('[data-host]').forEach(btn=>{
+    btn.onclick=()=>bindHost(btn.dataset.host, found.find(h=>h.addr===btn.dataset.host).info);
+  });
+}
+
+async function autoDiscoverHosts(){
+  const direct=[];
+  const saved=localStorage.getItem('tether.hostAddr');
+  if(saved) direct.push(saved);
+  if(location.protocol.startsWith('http') && location.host) direct.push(location.host);
+  for(const addr of [...new Set(direct.map(normalizeHostAddr).filter(Boolean))]){
+    try{
+      const found=await probeHost(addr, 600);
+      bindHost(found.addr, found.info, true);
+      return;
+    }catch(e){}
+  }
+
+  const scanList=candidateSubnetHosts();
+  if(!scanList.length) return;
+  log('buscando hosts Tether na rede...','warn');
+  const found=await scanHosts(scanList);
+  if(found.length===1) bindHost(found[0].addr, found[0].info, true);
+  else if(found.length>1) showHostChoices(found);
+  else log('nenhum host Tether encontrado automaticamente','warn');
+}
 
 /* ---------- 02 · gamepad ---------- */
 window.addEventListener('gamepadconnected', e => {
@@ -224,33 +356,42 @@ async function startStream(){
   if(!hostAddr) return;
   log('estabelecendo link webrtc...','warn');
   if(padIndex===null) log('iniciando sem controle (somente vídeo)','warn');
-  lastVideoStats={framesDropped:0, packetsLost:0};
+  resetVideoStats();
   latencyHintLogged=false;
 
   pc=new RTCPeerConnection({iceServers:[]});
-  remoteStream=new MediaStream();
+  remoteVideoStream=new MediaStream();
+  remoteAudioStream=new MediaStream();
   const videoEl=document.getElementById('video');
-  videoEl.srcObject=remoteStream;
+  const audioEl=document.getElementById('audio');
+  videoEl.srcObject=remoteVideoStream;
+  audioEl.srcObject=remoteAudioStream;
   videoEl.volume=1;
   videoEl.muted=false;
+  audioEl.volume=1;
+  audioEl.muted=false;
 
   // recebe mídia
   pc.ontrack = ev => {
     const recv=ev.receiver || (pc.getReceivers && pc.getReceivers().find(r => r.track === ev.track));
-    if(ev.track.kind==='video') minimizeReceiverLatency(recv, true);
+    minimizeReceiverLatency(recv, true);
 
-    if(!remoteStream.getTracks().some(t=>t.id===ev.track.id)){
-      remoteStream.addTrack(ev.track);
-    }
     document.getElementById('stage').classList.add('show');
     document.getElementById('stage').focus({preventScroll:true});
     if(ev.track.kind==='video'){
+      if(!remoteVideoStream.getTracks().some(t=>t.id===ev.track.id)){
+        remoteVideoStream.addTrack(ev.track);
+      }
       log('vídeo recebido · sessão ao vivo','ok');
+      videoEl.play().catch(e=>log('playback aguardando interação: '+e.message,'warn'));
     } else if(ev.track.kind==='audio'){
+      if(!remoteAudioStream.getTracks().some(t=>t.id===ev.track.id)){
+        remoteAudioStream.addTrack(ev.track);
+      }
       document.getElementById('audioState').textContent='aud ok';
       log('áudio recebido','ok');
+      audioEl.play().catch(e=>log('áudio aguardando interação: '+e.message,'warn'));
     }
-    videoEl.play().catch(e=>log('playback aguardando interação: '+e.message,'warn'));
   };
   pc.onconnectionstatechange = () => {
     log('conexão: '+pc.connectionState, pc.connectionState==='connected'?'ok':'');
@@ -330,13 +471,15 @@ function sendInput(){
 }
 
 function minimizeReceiverLatency(recv, shouldLog=false){
-  if(!recv || !recv.track || recv.track.kind!=='video') return;
+  if(!recv || !recv.track) return;
   try {
     let applied = [];
+    const kind = recv.track.kind;
+    const target = kind === 'audio' ? 0.02 : 0.001;
     // LAN local: alvo mínimo. Alguns firmwares aceitam 0; outros estabilizam
     // melhor com valor positivo quase zero.
     if ('jitterBufferTarget' in recv) {
-      recv.jitterBufferTarget = 0.001; applied.push('jitterBufferTarget');
+      recv.jitterBufferTarget = target; applied.push('jitterBufferTarget');
     }
     if ('playoutDelayHint' in recv) {
       recv.playoutDelayHint = 0; applied.push('playoutDelayHint');
@@ -440,14 +583,19 @@ function endStream(){
   if(dc) dc.close();
   if(pc) pc.close();
   pc=null; dc=null;
-  if(remoteStream){
-    remoteStream.getTracks().forEach(t=>t.stop());
-    remoteStream=null;
+  if(remoteVideoStream){
+    remoteVideoStream.getTracks().forEach(t=>t.stop());
+    remoteVideoStream=null;
   }
-  lastVideoStats={framesDropped:0, packetsLost:0};
+  if(remoteAudioStream){
+    remoteAudioStream.getTracks().forEach(t=>t.stop());
+    remoteAudioStream=null;
+  }
+  resetVideoStats();
   latencyHintLogged=false;
   document.getElementById('stage').classList.remove('show');
   document.getElementById('video').srcObject=null;
+  document.getElementById('audio').srcObject=null;
   document.getElementById('audioState').textContent='aud —';
   document.getElementById('linkState').textContent='offline';
   log('sessão encerrada','warn');
@@ -466,28 +614,41 @@ setInterval(async () => {
       rttText=(r.currentRoundTripTime*1000).toFixed(0)+' ms';
       document.getElementById('rtt').textContent=rttText;
     }
-    // jitterBufferDelay é acumulado (segundos) e jitterBufferEmittedCount é o nº
-    // de frames; a razão dá o atraso MÉDIO de playout por frame — a métrica que
-    // revela quanto o player está realmente segurando além da rede.
     if(r.type==='inbound-rtp' && (r.kind==='video' || r.mediaType==='video')){
       videoStats=r;
     }
   });
   if(videoStats){
+    const nowStats=snapshotVideoStats(videoStats);
     const parts=[rttText];
-    if(videoStats.jitterBufferDelay!=null && videoStats.jitterBufferEmittedCount>0){
-      parts.push('buf '+(videoStats.jitterBufferDelay/videoStats.jitterBufferEmittedCount*1000).toFixed(0)+'ms');
+    const bufMs=perEmittedDelayMs(nowStats, lastVideoStats, 'jitterBufferDelay');
+    if(bufMs!==null){
+      parts.push('buf '+bufMs.toFixed(0)+'ms');
     }
-    if(videoStats.jitter!=null){
-      parts.push('jit '+(videoStats.jitter*1000).toFixed(1)+'ms');
+    const targetMs=perEmittedDelayMs(nowStats, lastVideoStats, 'jitterBufferTargetDelay');
+    if(targetMs!==null){
+      parts.push('tgt '+targetMs.toFixed(0)+'ms');
     }
-    const dropped=videoStats.framesDropped || 0;
-    const lost=videoStats.packetsLost || 0;
-    const dropDelta=Math.max(0, dropped-lastVideoStats.framesDropped);
-    const lostDelta=Math.max(0, lost-lastVideoStats.packetsLost);
-    parts.push('lost '+lostDelta+'/s');
-    parts.push('drop '+dropDelta+'/s');
-    lastVideoStats={framesDropped:dropped, packetsLost:lost};
+    if(nowStats.jitter!=null){
+      parts.push('jit '+(nowStats.jitter*1000).toFixed(1)+'ms');
+    }
+    const decodedRate=counterRate(nowStats, lastVideoStats, 'framesDecoded');
+    const fps=nowStats.framesPerSecond!=null ? nowStats.framesPerSecond : decodedRate;
+    if(fps!==null){
+      parts.push('fps '+fps.toFixed(0));
+    }
+    if(nowStats.frameWidth && nowStats.frameHeight){
+      parts.push(nowStats.frameWidth+'x'+nowStats.frameHeight);
+    }
+    const lostRate=counterRate(nowStats, lastVideoStats, 'packetsLost');
+    const dropRate=counterRate(nowStats, lastVideoStats, 'framesDropped');
+    parts.push('lost '+(lostRate===null ? 0 : lostRate).toFixed(0)+'/s');
+    parts.push('drop '+(dropRate===null ? 0 : dropRate).toFixed(0)+'/s');
+    const nackDelta=counterDelta(nowStats, lastVideoStats, 'nackCount');
+    const freezeDelta=counterDelta(nowStats, lastVideoStats, 'freezeCount');
+    if(nackDelta>0) parts.push('nack '+nackDelta);
+    if(freezeDelta>0) parts.push('freeze '+freezeDelta);
+    lastVideoStats=nowStats;
     document.getElementById('hudRtt').textContent=parts.join(' · ');
   } else {
     document.getElementById('hudRtt').textContent=rttText;
@@ -495,6 +656,7 @@ setInterval(async () => {
 }, 1000);
 
 log('client tether inicializado','ok');
+autoDiscoverHosts();
 </script>
 </body>
 </html>

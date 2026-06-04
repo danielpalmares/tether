@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"runtime"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -289,37 +290,147 @@ func capturePCM(ctx context.Context, captureClient *wca.IAudioCaptureClient, wri
 	ticker := time.NewTicker(5 * time.Millisecond)
 	defer ticker.Stop()
 
-	silenceFrames := format.SampleRate / 100
-	if silenceFrames <= 0 {
-		silenceFrames = 480
-	}
-	silence := make([]byte, silenceFrames*format.BlockAlign)
-	lastWrite := time.Now()
+	pacer := newPCMPacer(ctx, writer, format, 10*time.Millisecond, 40*time.Millisecond)
+	defer pacer.Close()
 
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case err := <-pacer.Done():
+			return err
 		case <-ticker.C:
-			wrote, err := drainWASAPIPackets(captureClient, writer, format)
-			if err != nil {
+			if _, err := drainWASAPIPackets(captureClient, pacer, format); err != nil {
 				return err
-			}
-			if wrote {
-				lastWrite = time.Now()
-				continue
-			}
-			if time.Since(lastWrite) >= 10*time.Millisecond {
-				if err := writeAll(writer, silence); err != nil {
-					return err
-				}
-				lastWrite = time.Now()
 			}
 		}
 	}
 }
 
-func drainWASAPIPackets(captureClient *wca.IAudioCaptureClient, writer writeCloser, format pcmFormat) (bool, error) {
+type pcmPacer struct {
+	ctx            context.Context
+	writer         io.Writer
+	chunkDuration  time.Duration
+	chunkBytes     int
+	maxBufferBytes int
+	mu             sync.Mutex
+	buffer         []byte
+	closed         bool
+	done           chan error
+}
+
+func newPCMPacer(ctx context.Context, writer io.Writer, format pcmFormat, chunkDuration, maxBufferDuration time.Duration) *pcmPacer {
+	chunkFrames := int(time.Duration(format.SampleRate) * chunkDuration / time.Second)
+	if chunkFrames <= 0 {
+		chunkFrames = format.SampleRate / 100
+	}
+	if chunkFrames <= 0 {
+		chunkFrames = 480
+	}
+	chunkBytes := chunkFrames * format.BlockAlign
+
+	maxFrames := int(time.Duration(format.SampleRate) * maxBufferDuration / time.Second)
+	if maxFrames < chunkFrames {
+		maxFrames = chunkFrames
+	}
+
+	p := &pcmPacer{
+		ctx:            ctx,
+		writer:         writer,
+		chunkDuration:  chunkDuration,
+		chunkBytes:     chunkBytes,
+		maxBufferBytes: maxFrames * format.BlockAlign,
+		done:           make(chan error, 1),
+	}
+	go p.run()
+	return p
+}
+
+func (p *pcmPacer) Done() <-chan error {
+	return p.done
+}
+
+func (p *pcmPacer) Write(data []byte) (int, error) {
+	if len(data) == 0 {
+		return 0, nil
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.closed {
+		return 0, io.ErrClosedPipe
+	}
+
+	p.buffer = append(p.buffer, data...)
+	if over := len(p.buffer) - p.maxBufferBytes; over > 0 {
+		copy(p.buffer, p.buffer[over:])
+		p.buffer = p.buffer[:len(p.buffer)-over]
+	}
+	return len(data), nil
+}
+
+func (p *pcmPacer) Close() error {
+	p.mu.Lock()
+	p.closed = true
+	p.mu.Unlock()
+
+	select {
+	case err := <-p.done:
+		return err
+	case <-time.After(500 * time.Millisecond):
+		return nil
+	}
+}
+
+func (p *pcmPacer) run() {
+	err := p.runLoop()
+	p.mu.Lock()
+	p.closed = true
+	p.mu.Unlock()
+	p.done <- err
+}
+
+func (p *pcmPacer) runLoop() error {
+	next := time.Now()
+	timer := time.NewTimer(0)
+	defer timer.Stop()
+
+	for {
+		select {
+		case <-p.ctx.Done():
+			return p.ctx.Err()
+		case <-timer.C:
+			if err := writeAll(p.writer, p.nextChunk()); err != nil {
+				return err
+			}
+			next = next.Add(p.chunkDuration)
+			delay := time.Until(next)
+			if delay < -p.chunkDuration {
+				next = time.Now().Add(p.chunkDuration)
+				delay = p.chunkDuration
+			}
+			if delay < 0 {
+				delay = 0
+			}
+			timer.Reset(delay)
+		}
+	}
+}
+
+func (p *pcmPacer) nextChunk() []byte {
+	chunk := make([]byte, p.chunkBytes)
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	n := copy(chunk, p.buffer)
+	if n > 0 {
+		copy(p.buffer, p.buffer[n:])
+		p.buffer = p.buffer[:len(p.buffer)-n]
+	}
+	return chunk
+}
+
+func drainWASAPIPackets(captureClient *wca.IAudioCaptureClient, writer io.Writer, format pcmFormat) (bool, error) {
 	var packetFrames uint32
 	if err := captureClient.GetNextPacketSize(&packetFrames); err != nil {
 		return false, fmt.Errorf("WASAPI next packet: %w", err)

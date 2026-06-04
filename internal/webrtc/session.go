@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"log"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -199,15 +200,23 @@ func NewSession(cfg config.StreamConfig, injector input.Injector, onClose func()
 	} else {
 		go s.pumpVideo(stream, videoTrack)
 	}
-	s.audioCap = newAudioCapturer()
-	go func() {
-		audioStream, audioErr := s.audioCap.Start(context.Background())
-		if audioErr != nil {
-			log.Printf("[audio] captura indisponível: %v", audioErr)
-			return
-		}
-		s.pumpAudio(audioStream, audioTrack)
-	}()
+	var startAudioOnce sync.Once
+	startAudio := func() {
+		startAudioOnce.Do(func() {
+			go func() {
+				if s.pc == nil || s.pc.ConnectionState() != webrtc.PeerConnectionStateConnected {
+					return
+				}
+				s.audioCap = newAudioCapturer()
+				audioStream, audioErr := s.audioCap.Start(context.Background())
+				if audioErr != nil {
+					log.Printf("[audio] captura indisponível: %v", audioErr)
+					return
+				}
+				s.pumpAudio(audioStream, audioTrack)
+			}()
+		})
+	}
 
 	// --- Data channel de input (negociado pelo client) ---
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
@@ -239,6 +248,7 @@ func NewSession(cfg config.StreamConfig, injector input.Injector, onClose func()
 			if err := steam.LaunchBigPicture(); err != nil {
 				log.Printf("[steam] aviso: %v", err)
 			}
+			startAudio()
 		case webrtc.PeerConnectionStateFailed,
 			webrtc.PeerConnectionStateClosed,
 			webrtc.PeerConnectionStateDisconnected:
@@ -427,11 +437,11 @@ const annexBStartCode = "\x00\x00\x00\x01"
 // do browser congela na primeira imagem. O Duration só pode ser contado uma vez
 // por frame, e todas as NALs do mesmo frame compartilham o mesmo timestamp.
 //
-// Pacing: não descartamos frames H.264 no host. P-frames dependem dos frames
-// anteriores; pular um frame no bitstream gera artefatos/blocos até o próximo
-// IDR. Mantemos uma fila curta para absorver travadas breves do writer RTP sem
-// empurrar backpressure imediatamente para o FFmpeg.
-const videoFrameQueueDepth = 4
+// Pacing: o FFmpeg/ddagrab já entrega frames cadenciados em tempo real. O host
+// não deve dormir entre frames aqui; qualquer atraso artificial vira backlog e
+// empurra o jitter buffer do client. Mantemos só uma fila curta para absorver
+// travadas breves do writer RTP sem acumular latência silenciosa.
+const videoFrameQueueDepth = 2
 
 type videoPumpStats struct {
 	readFrames      atomic.Int64
@@ -561,9 +571,9 @@ func writeVideoFrames(frames <-chan encodedFrame, track sampleWriter, stats *vid
 		if err := track.WriteSample(media.Sample{Data: frame.data, Duration: frame.duration}); err != nil {
 			return err
 		}
+		now := time.Now()
 		if stats != nil {
 			stats.sentFrames.Add(1)
-			now := time.Now()
 			recordMaxDuration(&stats.maxWriteNs, now.Sub(start))
 			if !lastSend.IsZero() {
 				recordMaxDuration(&stats.maxSendGapNs, now.Sub(lastSend))

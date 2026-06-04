@@ -58,16 +58,20 @@ func TestReadH264AccessUnitsGroupsOneSamplePerFrame(t *testing.T) {
 
 func TestWriteVideoFramesWritesEveryFrameInOrder(t *testing.T) {
 	frames := make(chan encodedFrame, 3)
-	frames <- encodedFrame{data: []byte{1}, duration: time.Second / 60}
-	frames <- encodedFrame{data: []byte{2}, duration: time.Second / 60}
-	frames <- encodedFrame{data: []byte{3}, duration: time.Second / 60}
+	frames <- encodedFrame{data: []byte{1}, duration: 500 * time.Millisecond}
+	frames <- encodedFrame{data: []byte{2}, duration: 500 * time.Millisecond}
+	frames <- encodedFrame{data: []byte{3}, duration: 500 * time.Millisecond}
 	close(frames)
 
 	writer := &recordingSampleWriter{}
 	var stats videoPumpStats
 
+	start := time.Now()
 	if err := writeVideoFrames(frames, writer, &stats); err != nil {
 		t.Fatalf("write frames: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
+		t.Fatalf("writeVideoFrames paced frames for %s; host must not sleep before RTP writes", elapsed)
 	}
 	if got := len(writer.samples); got != 3 {
 		t.Fatalf("samples = %d, want 3", got)
