@@ -205,12 +205,20 @@ const annexBStartCode = "\x00\x00\x00\x01"
 // do browser congela na primeira imagem. O Duration só pode ser contado uma vez
 // por frame, e todas as NALs do mesmo frame compartilham o mesmo timestamp.
 //
-// Pacing: NÃO usamos ticker. O FFmpeg já produz frames em tempo real (60fps
-// reais, medidos com speed=1x), então a própria cadência de chegada no pipe é o
-// relógio. Um time.Ticker artificial acumula ticks atrasados e os dispara em
-// rajada quando o NextNAL() (bloqueante) finalmente retorna, gerando jitter e
-// travadas. Enviamos cada access unit assim que ele fecha; o Duration serve só
-// para o Pion calcular o timestamp RTP, não para regular a saída.
+// Pacing: NENHUM. O FFmpeg/NVENC em CBR já produz os frames em tempo real (60fps
+// reais), então a cadência de chegada no pipe É o relógio. Cada access unit é
+// enviado ao Pion ASSIM QUE FECHA — latência mínima, que é o que jogo exige.
+//
+// Tentativas anteriores de "suavizar" a saída (relógio de apresentação com
+// time.Sleep, e canal bufferizado) PIORARAM o resultado e ficam aqui registradas
+// para não repetir:
+//   - time.Sleep na própria goroutine de leitura: para de drenar o stdout
+//     enquanto dorme -> backpressure no pipe -> NVENC estola -> micro-stalls.
+//   - canal bufferizado + sleep em goroutine separada: como o encoder produz
+//     ~61fps e o pacing liberava a 60, a fila enchia e ficava cheia, virando um
+//     jitter buffer de ~8 frames (~130ms) somado a input lag de ~1s.
+// A rajada do pipe que o pacing tentava corrigir é pequena; o jitter buffer do
+// PLAYER já a absorve. Trocar suavidade marginal por latência é mau negócio aqui.
 func (s *Session) pumpVideo(stream io.ReadCloser, track *webrtc.TrackLocalStaticSample) {
 	defer stream.Close()
 
@@ -222,16 +230,15 @@ func (s *Session) pumpVideo(stream io.ReadCloser, track *webrtc.TrackLocalStatic
 
 	frameDur := time.Second / time.Duration(s.cfg.FPS)
 
-	var au []byte    // access unit em construção (Annex-B)
-	haveVCL := false // já vimos uma slice (VCL) no AU atual?
+	var au []byte     // access unit em construção (Annex-B)
+	haveVCL := false  // já vimos uma slice (VCL) no AU atual?
 	auHasIDR := false // o AU atual contém um keyframe?
 
-	// --- instrumentação: medir o que sai do host ---
+	// instrumentação
 	var frames, keyframes, bytes int
 	lastLog := time.Now()
 
-	// flush envia o access unit acumulado como um único sample e reinicia o
-	// buffer. Envio imediato — o pacing vem do FFmpeg.
+	// flush envia o access unit acumulado como um único sample, imediatamente.
 	flush := func() error {
 		if len(au) == 0 {
 			return nil
@@ -248,7 +255,7 @@ func (s *Session) pumpVideo(stream io.ReadCloser, track *webrtc.TrackLocalStatic
 			frames, keyframes, bytes = 0, 0, 0
 			lastLog = now
 		}
-		au = nil
+		au = au[:0]
 		haveVCL = false
 		auHasIDR = false
 		return err
@@ -269,9 +276,8 @@ func (s *Session) pumpVideo(stream io.ReadCloser, track *webrtc.TrackLocalStatic
 		nalType := nal.UnitType
 		isVCL := nalType == nalTypeNonIDR || nalType == nalTypeIDR
 
-		// Fronteira de access unit: um AUD, ou uma nova NAL de
-		// parâmetro/slice quando já temos uma slice acumulada, fecha o frame
-		// anterior. (O FFmpeg sem AUD nos obriga a inferir pela transição.)
+		// Fronteira de access unit: AUD, ou nova NAL de parâmetro/slice quando já
+		// temos uma slice acumulada, fecha o frame anterior.
 		boundary := nalType == nalTypeAUD ||
 			(haveVCL && (isVCL || nalType == nalTypeSPS || nalType == nalTypePPS || nalType == nalTypeSEI))
 		if boundary {
