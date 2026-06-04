@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"log"
+	"sync/atomic"
 	"time"
 
 	"github.com/pion/interceptor"
@@ -20,15 +21,26 @@ import (
 
 // Session representa uma sessão de streaming com um client.
 type Session struct {
-	pc        *webrtc.PeerConnection
-	cfg       config.StreamConfig
-	cap       *capture.Capturer
-	injector  input.Injector
-	onClose   func()
+	pc       *webrtc.PeerConnection
+	cfg      config.StreamConfig
+	cap      streamCapturer
+	injector input.Injector
+	onClose  func()
+}
+
+type streamCapturer interface {
+	Start(context.Context) (io.ReadCloser, error)
+	Stop()
+}
+
+var newCapturer = func(cfg config.StreamConfig) streamCapturer {
+	return capture.New(cfg)
 }
 
 // NewSession cria a peer connection, registra a track de vídeo e o data channel.
 func NewSession(cfg config.StreamConfig, injector input.Injector, onClose func()) (*Session, error) {
+	cfg = cfg.Normalize()
+
 	// Codec H264 ÚNICO do host, definido uma vez e reusado em RegisterCodec, na
 	// track e no SetCodecPreferences — os três PRECISAM ser idênticos byte a byte.
 	//
@@ -138,7 +150,7 @@ func NewSession(cfg config.StreamConfig, injector input.Injector, onClose func()
 	// frame). Iniciando aqui — antes de "connected" — o pipeline FFmpeg já está
 	// entregando 60fps quando a conexão sobe, eliminando o ramp-up visível no
 	// começo do stream (qualidade Steam Link: vídeo fluido desde o frame 1).
-	s.cap = capture.New(cfg)
+	s.cap = newCapturer(cfg)
 	stream, capErr := s.cap.Start(context.Background())
 	if capErr != nil {
 		log.Printf("[capture] erro ao pré-aquecer: %v", capErr)
@@ -185,12 +197,12 @@ func NewSession(cfg config.StreamConfig, injector input.Injector, onClose func()
 
 // Tipos de NAL relevantes para o agrupamento por access unit (H.264).
 const (
-	nalTypeNonIDR  = 1 // slice de frame não-IDR (P-frame)
-	nalTypeIDR     = 5 // slice de keyframe (IDR)
-	nalTypeSEI     = 6
-	nalTypeSPS     = 7
-	nalTypePPS     = 8
-	nalTypeAUD     = 9 // access unit delimiter
+	nalTypeNonIDR = 1 // slice de frame não-IDR (P-frame)
+	nalTypeIDR    = 5 // slice de keyframe (IDR)
+	nalTypeSEI    = 6
+	nalTypeSPS    = 7
+	nalTypePPS    = 8
+	nalTypeAUD    = 9 // access unit delimiter
 )
 
 const annexBStartCode = "\x00\x00\x00\x01"
@@ -205,60 +217,92 @@ const annexBStartCode = "\x00\x00\x00\x01"
 // do browser congela na primeira imagem. O Duration só pode ser contado uma vez
 // por frame, e todas as NALs do mesmo frame compartilham o mesmo timestamp.
 //
-// Pacing: NENHUM. O FFmpeg/NVENC em CBR já produz os frames em tempo real (60fps
-// reais), então a cadência de chegada no pipe É o relógio. Cada access unit é
-// enviado ao Pion ASSIM QUE FECHA — latência mínima, que é o que jogo exige.
-//
-// Tentativas anteriores de "suavizar" a saída (relógio de apresentação com
-// time.Sleep, e canal bufferizado) PIORARAM o resultado e ficam aqui registradas
-// para não repetir:
-//   - time.Sleep na própria goroutine de leitura: para de drenar o stdout
-//     enquanto dorme -> backpressure no pipe -> NVENC estola -> micro-stalls.
-//   - canal bufferizado + sleep em goroutine separada: como o encoder produz
-//     ~61fps e o pacing liberava a 60, a fila enchia e ficava cheia, virando um
-//     jitter buffer de ~8 frames (~130ms) somado a input lag de ~1s.
-// A rajada do pipe que o pacing tentava corrigir é pequena; o jitter buffer do
-// PLAYER já a absorve. Trocar suavidade marginal por latência é mau negócio aqui.
-func (s *Session) pumpVideo(stream io.ReadCloser, track *webrtc.TrackLocalStaticSample) {
+// Pacing: não descartamos frames H.264 no host. P-frames dependem dos frames
+// anteriores; pular um frame no bitstream gera artefatos/blocos até o próximo
+// IDR. O FFmpeg/NVENC já produz em tempo real, então a estratégia segura é
+// drenar, agrupar access units e enviar cada frame inteiro na ordem.
+const videoFrameQueueDepth = 1
+
+type sampleWriter interface {
+	WriteSample(media.Sample) error
+}
+
+type encodedFrame struct {
+	data     []byte
+	duration time.Duration
+	keyframe bool
+}
+
+type videoPumpStats struct {
+	readFrames   atomic.Int64
+	sentFrames   atomic.Int64
+	keyframes    atomic.Int64
+	bytes        atomic.Int64
+	maxReadGapNs atomic.Int64
+	maxSendGapNs atomic.Int64
+	maxWriteNs   atomic.Int64
+}
+
+func (s *Session) pumpVideo(stream io.ReadCloser, track sampleWriter) {
 	defer stream.Close()
 
+	frameDur := time.Second / time.Duration(s.cfg.FPS)
+	frames := make(chan encodedFrame, videoFrameQueueDepth)
+	var stats videoPumpStats
+
+	go func() {
+		defer close(frames)
+		if err := readH264AccessUnits(stream, frameDur, frames, &stats); err != nil {
+			log.Printf("[video] leitura H.264: %v", err)
+		}
+	}()
+
+	if err := writeVideoFrames(frames, track, &stats); err != nil {
+		log.Printf("[video] WriteSample: %v", err)
+	}
+}
+
+func readH264AccessUnits(stream io.Reader, frameDur time.Duration, out chan encodedFrame, stats *videoPumpStats) error {
 	h264, err := h264reader.NewReader(stream)
 	if err != nil {
-		log.Printf("[video] h264reader: %v", err)
-		return
+		return err
 	}
-
-	frameDur := time.Second / time.Duration(s.cfg.FPS)
 
 	var au []byte     // access unit em construção (Annex-B)
 	haveVCL := false  // já vimos uma slice (VCL) no AU atual?
 	auHasIDR := false // o AU atual contém um keyframe?
 
-	// instrumentação
-	var frames, keyframes, bytes int
-	lastLog := time.Now()
+	var lastRead time.Time
 
-	// flush envia o access unit acumulado como um único sample, imediatamente.
-	flush := func() error {
-		if len(au) == 0 {
-			return nil
+	// flush publica o access unit acumulado como um frame completo.
+	flush := func() {
+		if len(au) == 0 || !haveVCL {
+			return
 		}
-		err := track.WriteSample(media.Sample{Data: au, Duration: frameDur})
-		frames++
-		bytes += len(au)
-		if auHasIDR {
-			keyframes++
+
+		frame := encodedFrame{
+			data:     au,
+			duration: frameDur,
+			keyframe: auHasIDR,
 		}
-		if now := time.Now(); now.Sub(lastLog) >= time.Second {
-			log.Printf("[video] saída: %d frames/s, %d keyframes, %d KB/s",
-				frames, keyframes, bytes/1024)
-			frames, keyframes, bytes = 0, 0, 0
-			lastLog = now
+		au = nil
+
+		if stats != nil {
+			stats.readFrames.Add(1)
+			stats.bytes.Add(int64(len(frame.data)))
+			if frame.keyframe {
+				stats.keyframes.Add(1)
+			}
+			now := time.Now()
+			if !lastRead.IsZero() {
+				recordMaxDuration(&stats.maxReadGapNs, now.Sub(lastRead))
+			}
+			lastRead = now
 		}
-		au = au[:0]
+
+		out <- frame
 		haveVCL = false
 		auHasIDR = false
-		return err
 	}
 
 	for {
@@ -266,11 +310,12 @@ func (s *Session) pumpVideo(stream io.ReadCloser, track *webrtc.TrackLocalStatic
 		if err != nil {
 			if err == io.EOF {
 				log.Println("[video] fim do stream")
+				flush()
+				return nil
 			} else {
-				log.Printf("[video] NextNAL: %v", err)
+				flush()
+				return err
 			}
-			_ = flush()
-			return
 		}
 
 		nalType := nal.UnitType
@@ -281,10 +326,7 @@ func (s *Session) pumpVideo(stream io.ReadCloser, track *webrtc.TrackLocalStatic
 		boundary := nalType == nalTypeAUD ||
 			(haveVCL && (isVCL || nalType == nalTypeSPS || nalType == nalTypePPS || nalType == nalTypeSEI))
 		if boundary {
-			if err := flush(); err != nil {
-				log.Printf("[video] WriteSample: %v", err)
-				return
-			}
+			flush()
 		}
 
 		// Reconstrói o Annex-B (o h264reader remove o start code).
@@ -297,6 +339,77 @@ func (s *Session) pumpVideo(stream io.ReadCloser, track *webrtc.TrackLocalStatic
 			auHasIDR = true
 		}
 	}
+}
+
+func writeVideoFrames(frames <-chan encodedFrame, track sampleWriter, stats *videoPumpStats) error {
+	logTicker := time.NewTicker(time.Second)
+	defer logTicker.Stop()
+
+	var lastSend time.Time
+
+	send := func(frame encodedFrame) error {
+		start := time.Now()
+		if err := track.WriteSample(media.Sample{Data: frame.data, Duration: frame.duration}); err != nil {
+			return err
+		}
+		if stats != nil {
+			stats.sentFrames.Add(1)
+			now := time.Now()
+			recordMaxDuration(&stats.maxWriteNs, now.Sub(start))
+			if !lastSend.IsZero() {
+				recordMaxDuration(&stats.maxSendGapNs, now.Sub(lastSend))
+			}
+			lastSend = now
+		}
+		return nil
+	}
+
+	for {
+		select {
+		case frame, ok := <-frames:
+			if !ok {
+				logVideoPumpStats(stats)
+				return nil
+			}
+			if err := send(frame); err != nil {
+				return err
+			}
+
+		case <-logTicker.C:
+			logVideoPumpStats(stats)
+		}
+	}
+}
+
+func recordMaxDuration(target *atomic.Int64, d time.Duration) {
+	n := int64(d)
+	for {
+		old := target.Load()
+		if n <= old || target.CompareAndSwap(old, n) {
+			return
+		}
+	}
+}
+
+func logVideoPumpStats(stats *videoPumpStats) {
+	if stats == nil {
+		return
+	}
+
+	read := stats.readFrames.Swap(0)
+	sent := stats.sentFrames.Swap(0)
+	keyframes := stats.keyframes.Swap(0)
+	bytes := stats.bytes.Swap(0)
+	maxReadGap := time.Duration(stats.maxReadGapNs.Swap(0))
+	maxSendGap := time.Duration(stats.maxSendGapNs.Swap(0))
+	maxWrite := time.Duration(stats.maxWriteNs.Swap(0))
+
+	if read == 0 && sent == 0 && keyframes == 0 && bytes == 0 {
+		return
+	}
+
+	log.Printf("[video] lidos=%d fps enviados=%d fps keyframes=%d taxa=%d KB/s gapMax leitura/envio=%s/%s writeMax=%s",
+		read, sent, keyframes, bytes/1024, maxReadGap, maxSendGap, maxWrite)
 }
 
 // HandleOffer processa a SDP offer do client e devolve a answer.

@@ -30,3 +30,27 @@ func Default() StreamConfig {
 		Display: 0,
 	}
 }
+
+// Normalize preenche campos inválidos com o perfil padrão 1080p60.
+func (c StreamConfig) Normalize() StreamConfig {
+	d := Default()
+	if c.Width <= 0 {
+		c.Width = d.Width
+	}
+	if c.Height <= 0 {
+		c.Height = d.Height
+	}
+	if c.FPS <= 0 {
+		c.FPS = d.FPS
+	}
+	if c.Bitrate <= 0 {
+		c.Bitrate = d.Bitrate
+	}
+	if c.Codec == "" {
+		c.Codec = d.Codec
+	}
+	if c.Display < 0 {
+		c.Display = d.Display
+	}
+	return c
+}

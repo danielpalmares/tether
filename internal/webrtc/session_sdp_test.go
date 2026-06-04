@@ -1,6 +1,8 @@
 package webrtc
 
 import (
+	"context"
+	"io"
 	"strings"
 	"testing"
 
@@ -15,6 +17,8 @@ import (
 // retransmissão e a perda de pacote vira frame descartado (causa do delay/buf
 // inflado). Este teste exercita o caminho real de NewSession + HandleOffer.
 func TestAnswerAdvertisesNackPLI(t *testing.T) {
+	disableCaptureForTest(t)
+
 	// Client sintético: gera uma offer recvonly de vídeo, como o client.html faz.
 	clientPC, err := webrtc.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
@@ -79,3 +83,22 @@ func TestAnswerAdvertisesNackPLI(t *testing.T) {
 		}
 	}
 }
+
+func disableCaptureForTest(t *testing.T) {
+	t.Helper()
+	old := newCapturer
+	newCapturer = func(config.StreamConfig) streamCapturer {
+		return noopCapturer{}
+	}
+	t.Cleanup(func() {
+		newCapturer = old
+	})
+}
+
+type noopCapturer struct{}
+
+func (noopCapturer) Start(context.Context) (io.ReadCloser, error) {
+	return io.NopCloser(strings.NewReader("")), nil
+}
+
+func (noopCapturer) Stop() {}

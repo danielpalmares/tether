@@ -140,6 +140,7 @@
 const log=(m,c='')=>{const e=document.getElementById('log'),l=document.createElement('div');l.className='ln '+c;l.textContent=m;e.appendChild(l);e.scrollTop=e.scrollHeight;};
 
 let hostAddr=null, padIndex=null, pc=null, dc=null, inputTimer=null;
+let lastVideoStats={framesDropped:0, packetsLost:0};
 
 /* ---------- 01 · vincular host ---------- */
 document.getElementById('probeBtn').onclick = async () => {
@@ -220,6 +221,7 @@ async function startStream(){
   if(!hostAddr) return;
   log('estabelecendo link webrtc...','warn');
   if(padIndex===null) log('iniciando sem controle (somente vídeo)','warn');
+  lastVideoStats={framesDropped:0, packetsLost:0};
 
   pc=new RTCPeerConnection({iceServers:[]});
 
@@ -301,6 +303,7 @@ function endStream(){
   if(dc) dc.close();
   if(pc) pc.close();
   pc=null; dc=null;
+  lastVideoStats={framesDropped:0, packetsLost:0};
   document.getElementById('stage').classList.remove('show');
   document.getElementById('video').srcObject=null;
   document.getElementById('linkState').textContent='offline';
@@ -312,24 +315,38 @@ document.getElementById('stageExit').onclick = endStream;
 setInterval(async () => {
   if(!pc || pc.connectionState!=='connected') return;
   const stats=await pc.getStats();
-  let jbDelay=null, jbCount=null;
+  let rttText=document.getElementById('rtt').textContent || '— ms';
+  let videoStats=null;
   stats.forEach(r=>{
     if(r.type==='candidate-pair' && r.state==='succeeded' && r.currentRoundTripTime!=null){
-      const ms=(r.currentRoundTripTime*1000).toFixed(0);
-      document.getElementById('rtt').textContent=ms+' ms';
-      document.getElementById('hudRtt').textContent=ms+' ms';
+      rttText=(r.currentRoundTripTime*1000).toFixed(0)+' ms';
+      document.getElementById('rtt').textContent=rttText;
     }
     // jitterBufferDelay é acumulado (segundos) e jitterBufferEmittedCount é o nº
     // de frames; a razão dá o atraso MÉDIO de playout por frame — a métrica que
     // revela quanto o player está realmente segurando além da rede.
-    if(r.type==='inbound-rtp' && r.kind==='video'){
-      jbDelay=r.jitterBufferDelay; jbCount=r.jitterBufferEmittedCount;
+    if(r.type==='inbound-rtp' && (r.kind==='video' || r.mediaType==='video')){
+      videoStats=r;
     }
   });
-  if(jbDelay!=null && jbCount>0){
-    const avgMs=(jbDelay/jbCount*1000).toFixed(0);
-    document.getElementById('hudRtt').textContent=
-      document.getElementById('hudRtt').textContent.split(' · ')[0]+' · buf '+avgMs+'ms';
+  if(videoStats){
+    const parts=[rttText];
+    if(videoStats.jitterBufferDelay!=null && videoStats.jitterBufferEmittedCount>0){
+      parts.push('buf '+(videoStats.jitterBufferDelay/videoStats.jitterBufferEmittedCount*1000).toFixed(0)+'ms');
+    }
+    if(videoStats.jitter!=null){
+      parts.push('jit '+(videoStats.jitter*1000).toFixed(1)+'ms');
+    }
+    const dropped=videoStats.framesDropped || 0;
+    const lost=videoStats.packetsLost || 0;
+    const dropDelta=Math.max(0, dropped-lastVideoStats.framesDropped);
+    const lostDelta=Math.max(0, lost-lastVideoStats.packetsLost);
+    parts.push('lost '+lostDelta+'/s');
+    parts.push('drop '+dropDelta+'/s');
+    lastVideoStats={framesDropped:dropped, packetsLost:lost};
+    document.getElementById('hudRtt').textContent=parts.join(' · ');
+  } else {
+    document.getElementById('hudRtt').textContent=rttText;
   }
 }, 1000);
 

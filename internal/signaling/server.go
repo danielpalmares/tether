@@ -21,10 +21,10 @@ var upgrader = websocket.Upgrader{
 
 // Server mantém o estado do host e a config corrente.
 type Server struct {
-	mu      sync.Mutex
-	cfg     config.StreamConfig
-	active  *webrtc.Session
-	hostNm  string
+	mu     sync.Mutex
+	cfg    config.StreamConfig
+	active *webrtc.Session
+	hostNm string
 }
 
 func NewServer(hostName string) *Server {
@@ -32,8 +32,8 @@ func NewServer(hostName string) *Server {
 }
 
 type wsMsg struct {
-	Type  string          `json:"type"`
-	Data  json.RawMessage `json:"data,omitempty"`
+	Type string          `json:"type"`
+	Data json.RawMessage `json:"data,omitempty"`
 }
 
 // HandleSignal é o endpoint WebSocket de signaling do client.
@@ -120,7 +120,7 @@ func (s *Server) HandleConfig(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		s.cfg = c
+		s.cfg = c.Normalize()
 		_ = json.NewEncoder(w).Encode(s.cfg)
 	default:
 		http.Error(w, "método não permitido", http.StatusMethodNotAllowed)

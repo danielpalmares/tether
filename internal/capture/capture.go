@@ -7,6 +7,8 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
+	"time"
 
 	"tether/internal/config"
 )
@@ -20,23 +22,120 @@ type Capturer struct {
 }
 
 func New(cfg config.StreamConfig) *Capturer {
-	return &Capturer{cfg: cfg}
+	return &Capturer{cfg: cfg.Normalize()}
 }
 
 // Start inicia o FFmpeg e devolve um Reader do bitstream H.264 Annex-B.
 //
-// Pipeline:
-//   ddagrab (captura DXGI da GPU) -> hwupload -> h264_nvenc -> H.264 Annex-B (stdout)
+// Pipeline preferencial:
 //
-// O preset "p1" + "ll" (low latency) + zerolatency tuning minimiza o atraso.
+//	ddagrab (D3D11) -> h264_nvenc -> H.264 Annex-B (stdout)
+//
+// Se o FFmpeg/GPU não aceitar o caminho D3D11 direto, cai para o fallback
+// hwdownload -> nv12 -> h264_nvenc. O preset "p1" + "ull" + zerolatency tuning
+// minimiza fila interna do encoder.
 func (c *Capturer) Start(ctx context.Context) (io.ReadCloser, error) {
 	ctx, c.cancel = context.WithCancel(ctx)
 
-	// GOP de meio segundo: keyframe a cada ~0,5s. Sem PLI->IDR sob demanda, a TV
-	// só (re)inicia a exibição no próximo IDR; metade do GOP corta pela metade o
-	// pior caso de "tela parada" ao conectar ou após perda de pacote — principal
-	// fonte do delay de 1-2s percebido na Tizen. Custo de banda aceitável na LAN.
-	gop := fmt.Sprintf("%d", c.cfg.FPS/2)
+	c.cfg = c.cfg.Normalize()
+	var lastErr error
+	for _, mode := range pipelineOrder() {
+		reader, cmd, err := c.startFFmpeg(ctx, mode)
+		if err == nil {
+			c.cmd = cmd
+			logPipeline(mode)
+			return &procReader{Reader: reader, c: c}, nil
+		}
+		lastErr = err
+		if ctx.Err() != nil {
+			return nil, fmt.Errorf("iniciar ffmpeg: %w", ctx.Err())
+		}
+		if mode == pipelineD3D11 {
+			fmt.Fprintf(os.Stderr, "[capture] pipeline d3d11 direto indisponível, tentando fallback CPU: %v\n", err)
+		}
+	}
+
+	return nil, fmt.Errorf("iniciar ffmpeg (instalado e no PATH?): nenhum pipeline produziu vídeo: %w", lastErr)
+}
+
+type pipelineMode string
+
+const (
+	pipelineD3D11 pipelineMode = "d3d11"
+	pipelineCPU   pipelineMode = "cpu"
+)
+
+func pipelineOrder() []pipelineMode {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("TETHER_FFMPEG_PIPELINE"))) {
+	case "cpu", "download":
+		return []pipelineMode{pipelineCPU}
+	case "d3d11", "direct", "gpu":
+		return []pipelineMode{pipelineD3D11}
+	default:
+		return []pipelineMode{pipelineD3D11, pipelineCPU}
+	}
+}
+
+func logPipeline(mode pipelineMode) {
+	switch mode {
+	case pipelineD3D11:
+		fmt.Fprintln(os.Stderr, "[capture] usando pipeline d3d11 direto para NVENC")
+	case pipelineCPU:
+		fmt.Fprintln(os.Stderr, "[capture] usando fallback hwdownload->CPU->NVENC")
+	}
+}
+
+func (c *Capturer) startFFmpeg(ctx context.Context, mode pipelineMode) (*bufio.Reader, *exec.Cmd, error) {
+	args := c.ffmpegArgs(mode)
+	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, nil, fmt.Errorf("stdout pipe: %w", err)
+	}
+	// stderr do FFmpeg vai pro log do processo pai pra debug (erros de
+	// captura/encoder ficam visíveis em vez de sumirem).
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Start(); err != nil {
+		return nil, nil, err
+	}
+
+	// Confirma que o pipeline escolhido realmente produz H.264. O FFmpeg pode
+	// iniciar e só falhar ao abrir o encoder depois; esperar o primeiro byte
+	// permite cair para o fallback sem devolver um stream morto ao WebRTC.
+	reader := bufio.NewReaderSize(stdout, 64<<10)
+	ready := make(chan error, 1)
+	go func() {
+		_, err := reader.Peek(1)
+		ready <- err
+	}()
+
+	select {
+	case err := <-ready:
+		if err != nil {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			return nil, nil, err
+		}
+		return reader, cmd, nil
+	case <-time.After(3 * time.Second):
+		_ = cmd.Process.Kill()
+		<-ready
+		_ = cmd.Wait()
+		return nil, nil, fmt.Errorf("timeout esperando primeiro byte do stream")
+	case <-ctx.Done():
+		_ = cmd.Process.Kill()
+		<-ready
+		_ = cmd.Wait()
+		return nil, nil, ctx.Err()
+	}
+}
+
+func (c *Capturer) ffmpegArgs(mode pipelineMode) []string {
+	// GOP de um segundo: reduz bursts de IDR em relação a 0,5s, o que ajuda o
+	// jitter buffer da TV a não inflar em ciclos. Na LAN forte, NACK cobre perda
+	// pontual sem precisar de keyframe tão frequente.
+	gop := fmt.Sprintf("%d", c.cfg.FPS)
 	if c.cfg.FPS == 0 {
 		gop = "30"
 	}
@@ -50,27 +149,40 @@ func (c *Capturer) Start(ctx context.Context) (io.ReadCloser, error) {
 		bufsize = c.cfg.Bitrate
 	}
 
+	input := fmt.Sprintf(
+		"ddagrab=output_idx=%d:framerate=%d:video_size=%dx%d:dup_frames=1",
+		c.cfg.Display,
+		c.cfg.FPS,
+		c.cfg.Width,
+		c.cfg.Height,
+	)
+
 	args := []string{
 		"-hide_banner", "-loglevel", "error",
 
 		// --- flags globais de baixa latência na entrada ---
-		"-fflags", "nobuffer",   // não acumula pacotes no demuxer
-		"-flags", "low_delay",   // pipeline de decode/demux em low delay
-		"-probesize", "32",      // não fica "provando" o input antes de começar
+		"-fflags", "nobuffer", // não acumula pacotes no demuxer
+		"-flags", "low_delay", // pipeline de decode/demux em low delay
+		"-probesize", "32", // não fica "provando" o input antes de começar
 
 		// --- entrada: captura de tela DXGI (ddagrab via lavfi) ---
 		"-f", "lavfi",
-		"-i", fmt.Sprintf("ddagrab=output_idx=%d:framerate=%d:dup_frames=1", c.cfg.Display, c.cfg.FPS),
+		"-i", input,
+	}
 
-		// baixa o frame do d3d11 pra CPU e converte pra nv12 (formato do nvenc)
-		"-vf", "hwdownload,format=bgra,format=nv12",
+	if mode == pipelineCPU {
+		args = append(args,
+			// Fallback compatível: baixa o frame do d3d11 pra CPU e converte pra
+			// nv12. O caminho preferencial evita esta cópia.
+			"-vf", "hwdownload,format=bgra,format=nv12",
+		)
+	}
 
-		"-r", fmt.Sprintf("%d", c.cfg.FPS),
-
+	args = append(args,
 		// --- encoder NVENC low-latency ---
 		"-c:v", "h264_nvenc",
 		"-preset", "p1", // mais rápido
-		"-tune", "ll", // low latency
+		"-tune", "ull", // ultra low latency
 		// Constrained Baseline + Level 4.2: casa com o SDP (profile-level-id
 		// 42c02a — profile-iop 0xc0, medido no SPS via trace_headers) e comporta
 		// 1920x1080@60. NVENC por padrão emite Main profile
@@ -84,10 +196,13 @@ func (c *Capturer) Start(ctx context.Context) (io.ReadCloser, error) {
 		"-b:v", fmt.Sprintf("%dk", c.cfg.Bitrate),
 		"-maxrate", fmt.Sprintf("%dk", c.cfg.Bitrate),
 		"-bufsize", fmt.Sprintf("%dk", bufsize),
-		"-g", gop, // GOP de ~0,5s
+		"-g", gop, // GOP de ~1s
 		"-bf", "0", // sem B-frames (latência)
 		"-delay", "0", // sem reordenação/atraso de saída do encoder
 		"-rc-lookahead", "0", // NVENC não segura frames analisando o futuro
+		"-surfaces", "2", // limita a fila interna do NVENC
+		"-multipass", "disabled",
+		"-strict_gop", "1",
 		// zerolatency: desliga o atraso interno de 1 quadro do rate control do
 		// NVENC. Cada frame codificado é emitido imediatamente, sem o "pipeline
 		// delay" que o encoder normalmente mantém para suavizar bitrate. Essencial
@@ -109,24 +224,9 @@ func (c *Capturer) Start(ctx context.Context) (io.ReadCloser, error) {
 		// --- saída: Annex-B cru pro Pion samplear ---
 		"-f", "h264",
 		"-",
-	}
+	)
 
-	c.cmd = exec.CommandContext(ctx, "ffmpeg", args...)
-	stdout, err := c.cmd.StdoutPipe()
-	if err != nil {
-		return nil, fmt.Errorf("stdout pipe: %w", err)
-	}
-	// stderr do FFmpeg vai pro log do processo pai pra debug (erros de
-	// captura/encoder ficam visíveis em vez de sumirem).
-	c.cmd.Stderr = os.Stderr
-
-	if err := c.cmd.Start(); err != nil {
-		return nil, fmt.Errorf("iniciar ffmpeg (instalado e no PATH?): %w", err)
-	}
-
-	// Buffer pequeno (64KB): o suficiente para leitura eficiente sem reter
-	// frames. Um buffer grande adicionaria latência segurando vídeo já pronto.
-	return &procReader{Reader: bufio.NewReaderSize(stdout, 64<<10), c: c}, nil
+	return args
 }
 
 // Stop encerra o FFmpeg.

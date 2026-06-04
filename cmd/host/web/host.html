@@ -55,8 +55,8 @@
       </div>
 
       <div class="field">
-        <label>bitrate <span class="val" id="brVal">20 Mbps</span></label>
-        <input type="range" id="bitrate" min="4000" max="50000" step="1000" value="20000">
+        <label>bitrate <span class="val" id="brVal">12 Mbps</span></label>
+        <input type="range" id="bitrate" min="4000" max="50000" step="1000" value="12000">
       </div>
     </div>
 
@@ -110,7 +110,7 @@ const log = (msg, cls='') => {
   el.appendChild(ln); el.scrollTop = el.scrollHeight;
 };
 
-let cfg = { width:1920, height:1080, fps:60, bitrate:20000, codec:'h264', display:0 };
+let cfg = { width:1920, height:1080, fps:60, bitrate:12000, codec:'h264', display:0 };
 
 // segmented controls
 document.querySelectorAll('#resSeg button').forEach(b => b.onclick = () => {
