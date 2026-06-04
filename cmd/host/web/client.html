@@ -146,6 +146,7 @@ let hostAddr=null, padIndex=null, pc=null, dc=null, inputTimer=null, remoteVideo
 let lastVideoStats=null;
 let latencyHintLogged=false;
 let keysDown=new Set();
+const videoOnlyMode = new URLSearchParams(location.search).has('noaudio');
 
 function resetVideoStats(){
   lastVideoStats=null;
@@ -358,18 +359,21 @@ async function startStream(){
   if(padIndex===null) log('iniciando sem controle (somente vídeo)','warn');
   resetVideoStats();
   latencyHintLogged=false;
+  if(videoOnlyMode) log('modo teste: vídeo sem áudio','warn');
 
   pc=new RTCPeerConnection({iceServers:[]});
   remoteVideoStream=new MediaStream();
-  remoteAudioStream=new MediaStream();
+  remoteAudioStream=videoOnlyMode ? null : new MediaStream();
   const videoEl=document.getElementById('video');
   const audioEl=document.getElementById('audio');
   videoEl.srcObject=remoteVideoStream;
   audioEl.srcObject=remoteAudioStream;
   videoEl.volume=1;
   videoEl.muted=false;
-  audioEl.volume=1;
-  audioEl.muted=false;
+  if(!videoOnlyMode){
+    audioEl.volume=1;
+    audioEl.muted=false;
+  }
 
   // recebe mídia
   pc.ontrack = ev => {
@@ -385,6 +389,7 @@ async function startStream(){
       log('vídeo recebido · sessão ao vivo','ok');
       videoEl.play().catch(e=>log('playback aguardando interação: '+e.message,'warn'));
     } else if(ev.track.kind==='audio'){
+      if(videoOnlyMode) return;
       if(!remoteAudioStream.getTracks().some(t=>t.id===ev.track.id)){
         remoteAudioStream.addTrack(ev.track);
       }
@@ -400,7 +405,9 @@ async function startStream(){
 
   // precisa receber vídeo
   pc.addTransceiver('video', {direction:'recvonly'});
-  pc.addTransceiver('audio', {direction:'recvonly'});
+  if(!videoOnlyMode){
+    pc.addTransceiver('audio', {direction:'recvonly'});
+  }
 
   // data channel de input
   dc = pc.createDataChannel('input', {ordered:false, maxRetransmits:0});
@@ -475,9 +482,11 @@ function minimizeReceiverLatency(recv, shouldLog=false){
   try {
     let applied = [];
     const kind = recv.track.kind;
-    const target = kind === 'audio' ? 0.02 : 0.001;
-    // LAN local: alvo mínimo. Alguns firmwares aceitam 0; outros estabilizam
-    // melhor com valor positivo quase zero.
+    // LAN local: alvo mínimo. jitterBufferTarget é em MILISSEGUNDOS (não segundos)
+    // na spec do W3C — valores como 0.001 eram interpretados como 0 e deixavam o
+    // buffer no adaptativo (~160ms). Áudio precisa de uma folga mínima para não
+    // dar underrun a 20ms/pacote; vídeo pode ir ao chão.
+    const target = kind === 'audio' ? 40 : 0;
     if ('jitterBufferTarget' in recv) {
       recv.jitterBufferTarget = target; applied.push('jitterBufferTarget');
     }

@@ -56,25 +56,36 @@ func TestReadH264AccessUnitsGroupsOneSamplePerFrame(t *testing.T) {
 	}
 }
 
-func TestWriteVideoFramesWritesEveryFrameInOrder(t *testing.T) {
-	frames := make(chan encodedFrame, 3)
-	frames <- encodedFrame{data: []byte{1}, duration: 500 * time.Millisecond}
-	frames <- encodedFrame{data: []byte{2}, duration: 500 * time.Millisecond}
-	frames <- encodedFrame{data: []byte{3}, duration: 500 * time.Millisecond}
+// O pacer anti-jitter pode segurar frames ADIANTADOS (até um frameDur) para
+// suavizar a chegada na TV, mas NUNCA pode acumular atraso: frames que já estão
+// disponíveis em lote (chegaram atrasados / em rajada) devem sair imediatamente.
+// Este teste guarda a invariante de [[no-pacing-immediate-send]] na sua forma
+// correta: alimentar um lote pronto de uma vez NÃO pode resultar em pacing — o
+// relógio de saída realinha ao agora a cada frame atrasado, sem backlog.
+func TestWriteVideoFramesDoesNotBacklogBurst(t *testing.T) {
+	frameDur := time.Second / 60 // 16.6ms
+
+	frames := make(chan encodedFrame, 10)
+	for i := 1; i <= 10; i++ {
+		frames <- encodedFrame{data: []byte{byte(i)}, duration: frameDur}
+	}
 	close(frames)
 
 	writer := &recordingSampleWriter{}
 	var stats videoPumpStats
 
+	// Todos os 10 frames já estão na fila (rajada). Como nenhum está "adiantado"
+	// em relação ao relógio de parede, todos devem sair quase imediatamente. Se o
+	// pacer estivesse dormindo frameDur por frame (o bug de 1s), levaria ~166ms.
 	start := time.Now()
-	if err := writeVideoFrames(frames, writer, &stats); err != nil {
+	if err := writeVideoFrames(frames, writer, frameDur, &stats); err != nil {
 		t.Fatalf("write frames: %v", err)
 	}
-	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
-		t.Fatalf("writeVideoFrames paced frames for %s; host must not sleep before RTP writes", elapsed)
+	if elapsed := time.Since(start); elapsed > 5*frameDur {
+		t.Fatalf("writeVideoFrames segurou rajada por %s (>%s); pacer está acumulando backlog", elapsed, 5*frameDur)
 	}
-	if got := len(writer.samples); got != 3 {
-		t.Fatalf("samples = %d, want 3", got)
+	if got := len(writer.samples); got != 10 {
+		t.Fatalf("samples = %d, want 10", got)
 	}
 	for i, sample := range writer.samples {
 		want := byte(i + 1)

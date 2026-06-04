@@ -20,6 +20,7 @@ import (
 // inflado). Este teste exercita o caminho real de NewSession + HandleOffer.
 func TestAnswerAdvertisesNackPLI(t *testing.T) {
 	disableCaptureForTest(t)
+	t.Setenv("TETHER_VIDEO_NACK", "1")
 
 	// Client sintético: gera uma offer recvonly de vídeo+áudio, como o client.html faz.
 	clientPC, err := webrtc.NewPeerConnection(webrtc.Configuration{})
@@ -50,7 +51,7 @@ func TestAnswerAdvertisesNackPLI(t *testing.T) {
 	}
 	offer.SDP = addPlayoutDelayExtmapForTest(offer.SDP)
 
-	// Host real: mesma construção de produção (NACK + RTCP reports + track).
+	// Host real com NACK explicitamente ligado.
 	// Com CGO_ENABLED=0 o NewInjector devolve o noop (não toca ViGEm).
 	injector, err := input.NewInjector()
 	if err != nil {
@@ -96,6 +97,57 @@ func TestAnswerAdvertisesNackPLI(t *testing.T) {
 		if strings.Contains(sdp, bad) {
 			t.Errorf("answer contém profile indesejado %s (eco da offer; deveria ser só 42c02a)", bad)
 		}
+	}
+}
+
+func TestAnswerOmitsVideoNackByDefault(t *testing.T) {
+	disableCaptureForTest(t)
+
+	clientPC, err := webrtc.NewPeerConnection(webrtc.Configuration{})
+	if err != nil {
+		t.Fatalf("client pc: %v", err)
+	}
+	defer clientPC.Close()
+
+	if _, err := clientPC.AddTransceiverFromKind(
+		webrtc.RTPCodecTypeVideo,
+		webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionRecvonly},
+	); err != nil {
+		t.Fatalf("add transceiver: %v", err)
+	}
+
+	offer, err := clientPC.CreateOffer(nil)
+	if err != nil {
+		t.Fatalf("create offer: %v", err)
+	}
+	if err := clientPC.SetLocalDescription(offer); err != nil {
+		t.Fatalf("set local: %v", err)
+	}
+	offer.SDP = addPlayoutDelayExtmapForTest(offer.SDP)
+
+	injector, err := input.NewInjector()
+	if err != nil {
+		t.Fatalf("injector: %v", err)
+	}
+	sess, err := NewSession(config.Default(), injector, func() {})
+	if err != nil {
+		t.Fatalf("new session: %v", err)
+	}
+	defer sess.Close()
+
+	answer, err := sess.HandleOffer(offer)
+	if err != nil {
+		t.Fatalf("handle offer: %v", err)
+	}
+
+	if strings.Contains(answer.SDP, "nack") {
+		t.Fatalf("answer SDP should omit video NACK by default:\n%s", answer.SDP)
+	}
+	if !strings.Contains(answer.SDP, playoutDelayExtensionURI) {
+		t.Errorf("answer SDP não negocia playout-delay")
+	}
+	if sess.audioOn {
+		t.Errorf("sessão marcou áudio ativo sem m=audio na offer")
 	}
 }
 

@@ -1,6 +1,7 @@
 package webrtc
 
 import (
+	"math"
 	"strings"
 	"sync"
 	"time"
@@ -12,9 +13,17 @@ import (
 )
 
 const (
-	rtpOutboundMTU            = 1200
-	playoutDelayExtensionURI  = "http://www.webrtc.org/experiments/rtp-hdrext/playout-delay"
-	zeroPlayoutDelayExtension = "\x00\x00\x00"
+	rtpOutboundMTU           = 1200
+	playoutDelayExtensionURI = "http://www.webrtc.org/experiments/rtp-hdrext/playout-delay"
+	// playout-delay extension = min_delay (12 bits) + max_delay (12 bits), unidade
+	// de 10ms. min=0, max=1 -> teto rígido de 10ms de playout.
+	//
+	// max=0 ("\x00\x00\x00") NÃO funciona na Tizen: o firmware Samsung interpreta
+	// max=0 como "sem restrição" e cai no jitter buffer adaptativo, que em LAN
+	// ainda assim infla para ~160ms. Um max pequeno porém não-zero é tratado como
+	// limite superior real, prendendo o playout em ~10ms.
+	// Bytes: 0x00 0x00 0x01 = min 0b000000000000, max 0b000000000001.
+	zeroPlayoutDelayExtension = "\x00\x00\x01"
 )
 
 type lowLatencyH264Track struct {
@@ -110,7 +119,7 @@ func (t *lowLatencyH264Track) WriteSample(sample media.Sample) error {
 		return nil
 	}
 
-	samples := uint32(sample.Duration.Seconds() * clockRate)
+	samples := rtpTimestampSamples(sample.Duration, clockRate)
 	packets := packetizer.Packetize(sample.Data, samples)
 	if len(packets) == 0 {
 		return nil
@@ -124,6 +133,22 @@ func (t *lowLatencyH264Track) WriteSample(sample media.Sample) error {
 	}
 
 	return writeErr
+}
+
+func rtpTimestampSamples(duration time.Duration, clockRate float64) uint32 {
+	if duration <= 0 || clockRate <= 0 {
+		return 0
+	}
+
+	samples := math.Round(duration.Seconds() * clockRate)
+	if samples < 1 {
+		return 1
+	}
+	maxUint32 := ^uint32(0)
+	if samples > float64(maxUint32) {
+		return maxUint32
+	}
+	return uint32(samples)
 }
 
 func writePacketToBindings(pkt *rtp.Packet, bindings []lowLatencyTrackBinding) error {

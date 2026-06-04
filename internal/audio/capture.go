@@ -206,14 +206,18 @@ func ffmpegArgs(device string, port int) []string {
 		"-ar", "48000",
 		"-c:a", "libopus",
 		"-application", "lowdelay",
-		"-frame_duration", "10",
+		"-frame_duration", "20",
 		"-b:a", "96k",
 		"-vbr", "off",
 		"-compression_level", "0",
 		"-flush_packets", "1",
+		// Ver nota em ffmpegPCMArgs: zera o buffer do muxer RTP que agregava 90ms.
+		"-max_delay", "0",
+		"-muxdelay", "0",
+		"-muxpreload", "0",
 		"-f", "rtp",
 		"-payload_type", fmt.Sprintf("%d", RTPPayloadType),
-		fmt.Sprintf("rtp://127.0.0.1:%d?pkt_size=1200", port),
+		fmt.Sprintf("rtp://127.0.0.1:%d?pkt_size=400", port),
 	}
 }
 
@@ -233,14 +237,23 @@ func ffmpegPCMArgs(format pcmFormat, port int) []string {
 		"-ar", "48000",
 		"-c:a", "libopus",
 		"-application", "lowdelay",
-		"-frame_duration", "10",
+		"-frame_duration", "20",
 		"-b:a", "96k",
 		"-vbr", "off",
 		"-compression_level", "0",
 		"-flush_packets", "1",
+		// max_delay/muxdelay/muxpreload = 0: o muxer RTP, por padrão, bufferiza
+		// ~90ms de áudio antes de despejar (medido como gapMax=90ms no pumpAudio,
+		// pkt_size sozinho não quebra isso porque o muxer agrega por TEMPO, não
+		// por tamanho). Zerar os três força a emissão de cada frame Opus (~20ms)
+		// imediatamente -> gap cai de 90ms para ~20ms, lip-sync deixa de arrastar
+		// o vídeo.
+		"-max_delay", "0",
+		"-muxdelay", "0",
+		"-muxpreload", "0",
 		"-f", "rtp",
 		"-payload_type", fmt.Sprintf("%d", RTPPayloadType),
-		fmt.Sprintf("rtp://127.0.0.1:%d?pkt_size=1200", port),
+		fmt.Sprintf("rtp://127.0.0.1:%d?pkt_size=400", port),
 	}
 }
 

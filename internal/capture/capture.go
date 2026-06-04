@@ -136,12 +136,12 @@ func (c *Capturer) startFFmpeg(ctx context.Context, mode pipelineMode) (*bufio.R
 }
 
 func (c *Capturer) ffmpegArgs(mode pipelineMode) []string {
-	// GOP de um segundo: reduz bursts de IDR em relação a 0,5s, o que ajuda o
-	// jitter buffer da TV a não inflar em ciclos. Na LAN forte, NACK cobre perda
-	// pontual sem precisar de keyframe tão frequente.
-	gop := fmt.Sprintf("%d", c.cfg.FPS)
+	// GOP de dois segundos: reduz os bursts de IDR que aparecem como gaps de
+	// 40-70ms no receiver da TV. Na LAN, NACK cobre perda pontual sem exigir um
+	// keyframe por segundo.
+	gop := fmt.Sprintf("%d", c.cfg.FPS*2)
 	if c.cfg.FPS == 0 {
-		gop = "30"
+		gop = "60"
 	}
 
 	// VBV buffer mínimo: ~1/8 de segundo de bitrate. Quanto menor o bufsize,

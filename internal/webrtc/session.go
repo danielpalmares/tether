@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"io"
 	"log"
+	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -30,6 +32,7 @@ type Session struct {
 	audioCap audioCapturer
 	injector input.Injector
 	input    inputStats
+	audioOn  bool
 	onClose  func()
 }
 
@@ -54,6 +57,7 @@ var newAudioCapturer = func() audioCapturer {
 // NewSession cria a peer connection, registra a track de vídeo e o data channel.
 func NewSession(cfg config.StreamConfig, injector input.Injector, onClose func()) (*Session, error) {
 	cfg = cfg.Normalize()
+	videoNack := videoNackEnabled()
 
 	// Codec H264 ÚNICO do host, definido uma vez e reusado em RegisterCodec, na
 	// track e no SetCodecPreferences — os três PRECISAM ser idênticos byte a byte.
@@ -66,18 +70,10 @@ func NewSession(cfg config.StreamConfig, injector input.Injector, onClose func()
 	// o decoder de hardware estoura e congela. Chrome/Android toleram; a TV não.
 	h264Codec := webrtc.RTPCodecParameters{
 		RTPCodecCapability: webrtc.RTPCodecCapability{
-			MimeType:    webrtc.MimeTypeH264,
-			ClockRate:   90000,
-			SDPFmtpLine: "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42c02a",
-			// Os feedbacks PRECISAM viver no próprio codec: o SetCodecPreferences
-			// abaixo substitui a lista negociada pelo transceiver por este codec,
-			// então um RTCPFeedback nil aqui apagaria o nack/pli que o ConfigureNack
-			// registra no MediaEngine. Declarados aqui, nack e nack pli sobrevivem à
-			// restrição e aparecem na answer.
-			RTCPFeedback: []webrtc.RTCPFeedback{
-				{Type: "nack"},
-				{Type: "nack", Parameter: "pli"},
-			},
+			MimeType:     webrtc.MimeTypeH264,
+			ClockRate:    90000,
+			SDPFmtpLine:  "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42c02a",
+			RTCPFeedback: videoRTCPFeedback(videoNack),
 		},
 		PayloadType: 102,
 	}
@@ -106,15 +102,14 @@ func NewSession(cfg config.StreamConfig, injector input.Injector, onClose func()
 		return nil, err
 	}
 
-	// NACK (retransmissão de pacotes perdidos) + RTCP Reports. Sem isto, perder
-	// 1 fragmento de keyframe (~50 pacotes a 1080p60) descarta o frame inteiro e
-	// a TV infla o jitter buffer defensivamente (buf travado ~80ms — a causa é
-	// perda, não config de playout). NÃO usamos RegisterDefaultInterceptors: ele
-	// também liga TWCC + header-extensions que incham a SDP, e o decoder Tizen é
-	// estrito (vide o bug do profile-level-id). Registramos só nack e nack pli.
+	// RTCP Reports. NACK genérico é opcional: em streaming interativo na LAN, a TV
+	// pode aumentar o jitter target para esperar retransmissões. O padrão aqui é
+	// não negociar NACK para priorizar input lag; TETHER_VIDEO_NACK=1 religa.
 	ir := &interceptor.Registry{}
-	if err := webrtc.ConfigureNack(m, ir); err != nil {
-		return nil, err
+	if videoNack {
+		if err := webrtc.ConfigureNack(m, ir); err != nil {
+			return nil, err
+		}
 	}
 	if err := webrtc.ConfigureRTCPReports(ir); err != nil {
 		return nil, err
@@ -248,7 +243,9 @@ func NewSession(cfg config.StreamConfig, injector input.Injector, onClose func()
 			if err := steam.LaunchBigPicture(); err != nil {
 				log.Printf("[steam] aviso: %v", err)
 			}
-			startAudio()
+			if s.audioOn {
+				startAudio()
+			}
 		case webrtc.PeerConnectionStateFailed,
 			webrtc.PeerConnectionStateClosed,
 			webrtc.PeerConnectionStateDisconnected:
@@ -259,48 +256,118 @@ func NewSession(cfg config.StreamConfig, injector input.Injector, onClose func()
 	return s, nil
 }
 
+func videoNackEnabled() bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("TETHER_VIDEO_NACK"))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func videoRTCPFeedback(enableNack bool) []webrtc.RTCPFeedback {
+	if !enableNack {
+		return nil
+	}
+	return []webrtc.RTCPFeedback{
+		{Type: "nack"},
+		{Type: "nack", Parameter: "pli"},
+	}
+}
+
+// audioFrameDuration é a cadência alvo de saída do áudio. O FFmpeg empacota Opus
+// em frames de 20ms (frame_duration=20), mas o muxer RTP os emite em RAJADA —
+// vários pacotes colados (<2ms) seguidos de silêncio de ~90ms (medido: 77% dos
+// pacotes saem agrupados). Essa rajada infla o jitter buffer de áudio da TV e,
+// via sincronismo A/V, arrasta o vídeo junto (lip-sync). Nenhuma flag do FFmpeg
+// corrige (testadas max_delay/muxdelay/muxpreload/avioflags=direct/pkt_size). A
+// correção é re-pacear no host: ler o socket sem bloquear e escrever cada pacote
+// no ritmo de 20ms.
+const audioFrameDuration = 20 * time.Millisecond
+
+// audioPaceQueueDepth é a folga máxima antes de descartar. Mantém latência baixa:
+// se a fila passa disto, preferimos soltar o pacote mais antigo a acumular atraso.
+const audioPaceQueueDepth = 8
+
 func (s *Session) pumpAudio(stream *audio.RTPStream, track *webrtc.TrackLocalStaticRTP) {
 	defer stream.Close()
 
+	// Leitor: drena o socket UDP o mais rápido possível para o buffer não
+	// transbordar durante as rajadas do FFmpeg. Nunca bloqueia no pacing.
+	queue := make(chan []byte, audioPaceQueueDepth)
+	go func() {
+		defer close(queue)
+		for {
+			raw, err := stream.ReadPacket()
+			if err != nil {
+				log.Printf("[audio] leitura RTP: %v", err)
+				return
+			}
+			select {
+			case queue <- raw:
+			default:
+				// Fila cheia: descarta o pacote mais antigo e enfileira o novo.
+				// Áudio em tempo real prefere perder um frame velho a atrasar.
+				select {
+				case <-queue:
+				default:
+				}
+				select {
+				case queue <- raw:
+				default:
+				}
+			}
+		}
+	}()
+
+	// Escritor: emite em cadência fixa de 20ms, transformando a rajada do FFmpeg
+	// num fluxo suave que a TV consome sem inflar o jitter buffer.
+	ticker := time.NewTicker(audioFrameDuration)
+	defer ticker.Stop()
 	logTicker := time.NewTicker(time.Second)
 	defer logTicker.Stop()
 
-	var packets int64
-	var bytes int64
+	var packets, bytes int64
 	var maxGap time.Duration
 	var last time.Time
 
 	for {
-		raw, err := stream.ReadPacket()
-		if err != nil {
-			log.Printf("[audio] leitura RTP: %v", err)
-			return
-		}
-		var pkt rtp.Packet
-		if err := pkt.Unmarshal(raw); err != nil {
-			log.Printf("[audio] pacote RTP inválido: %v", err)
-			continue
-		}
-		if err := track.WriteRTP(&pkt); err != nil {
-			log.Printf("[audio] WriteRTP: %v", err)
-			return
-		}
-
-		now := time.Now()
-		if !last.IsZero() && now.Sub(last) > maxGap {
-			maxGap = now.Sub(last)
-		}
-		last = now
-		packets++
-		bytes += int64(len(raw))
-
 		select {
+		case <-ticker.C:
+			var raw []byte
+			select {
+			case r, ok := <-queue:
+				if !ok {
+					return
+				}
+				raw = r
+			default:
+				// Sem pacote pronto neste tick: silêncio breve, sem stall.
+				continue
+			}
+			var pkt rtp.Packet
+			if err := pkt.Unmarshal(raw); err != nil {
+				log.Printf("[audio] pacote RTP inválido: %v", err)
+				continue
+			}
+			if err := track.WriteRTP(&pkt); err != nil {
+				log.Printf("[audio] WriteRTP: %v", err)
+				return
+			}
+
+			now := time.Now()
+			if !last.IsZero() && now.Sub(last) > maxGap {
+				maxGap = now.Sub(last)
+			}
+			last = now
+			packets++
+			bytes += int64(len(raw))
+
 		case <-logTicker.C:
-			log.Printf("[audio] enviados=%d pkt/s taxa=%d KB/s gapMax=%s", packets, bytes/1024, maxGap)
+			log.Printf("[audio] enviados=%d pkt/s taxa=%d KB/s gapMax=%s fila=%d/%d", packets, bytes/1024, maxGap, len(queue), audioPaceQueueDepth)
 			packets = 0
 			bytes = 0
 			maxGap = 0
-		default:
 		}
 	}
 }
@@ -469,7 +536,7 @@ func (s *Session) pumpVideo(stream io.ReadCloser, track sampleWriter) {
 		}
 	}()
 
-	if err := writeVideoFrames(frames, track, &stats); err != nil {
+	if err := writeVideoFrames(frames, track, frameDur, &stats); err != nil {
 		log.Printf("[video] WriteSample: %v", err)
 	}
 }
@@ -560,7 +627,7 @@ func readH264AccessUnits(stream io.Reader, frameDur time.Duration, out chan enco
 	}
 }
 
-func writeVideoFrames(frames <-chan encodedFrame, track sampleWriter, stats *videoPumpStats) error {
+func writeVideoFrames(frames <-chan encodedFrame, track sampleWriter, frameDur time.Duration, stats *videoPumpStats) error {
 	logTicker := time.NewTicker(time.Second)
 	defer logTicker.Stop()
 
@@ -583,6 +650,43 @@ func writeVideoFrames(frames <-chan encodedFrame, track sampleWriter, stats *vid
 		return nil
 	}
 
+	// Anti-jitter de saída (NÃO é o pacing de atraso fixo de [[no-pacing-immediate-send]]):
+	// o caminho ddagrab(dup_frames)->hwdownload->NVENC entrega frames em RAJADA —
+	// metade chega <16ms (colados) e ~16% chega com gap 2-4x (medido: p50=8ms,
+	// p99=64ms). A TV vê essa irregularidade e dimensiona o jitter buffer pro pior
+	// caso (buf 200ms/tgt 150ms, com jit real de só 8ms). Suavizar a CHEGADA faz a
+	// TV relaxar o buffer.
+	//
+	// A diferença crucial para o pacer que causou 1s de lag: aqui SÓ seguramos
+	// frames ADIANTADOS, e por no máximo um frame. Frame atrasado vai imediato e
+	// o relógio realinha ao agora — nunca acumula backlog. Latência adicionada em
+	// regime: zero quando o pipeline está em dia; no pior caso, < frameDur.
+	var nextSlot time.Time
+	maxHold := frameDur // nunca segura mais que um frame
+
+	paced := func(frame encodedFrame, backlog int) error {
+		now := time.Now()
+		if nextSlot.IsZero() {
+			nextSlot = now
+		}
+		// REGRA ANTI-BACKLOG: só suavizamos quando a fila está VAZIA (regime de
+		// tempo real, este é o último frame disponível). Se há outros frames
+		// esperando (backlog>0), o pipeline está atrasado/em rajada — drenamos
+		// imediato e realinhamos o relógio. Sem isto, segurar cada frame da rajada
+		// vira pacing puro e reintroduz o lag de [[no-pacing-immediate-send]].
+		wait := nextSlot.Sub(now)
+		if backlog == 0 && wait > 0 {
+			if wait > maxHold {
+				wait = maxHold
+			}
+			time.Sleep(wait)
+			nextSlot = time.Now().Add(frameDur)
+		} else {
+			nextSlot = now.Add(frameDur)
+		}
+		return send(frame)
+	}
+
 	for {
 		select {
 		case frame, ok := <-frames:
@@ -590,7 +694,7 @@ func writeVideoFrames(frames <-chan encodedFrame, track sampleWriter, stats *vid
 				logVideoPumpStats(stats)
 				return nil
 			}
-			if err := send(frame); err != nil {
+			if err := paced(frame, len(frames)); err != nil {
 				return err
 			}
 
@@ -646,6 +750,7 @@ func logVideoPumpStats(stats *videoPumpStats) {
 
 // HandleOffer processa a SDP offer do client e devolve a answer.
 func (s *Session) HandleOffer(offer webrtc.SessionDescription) (webrtc.SessionDescription, error) {
+	s.audioOn = offerIncludesAudio(offer.SDP)
 	if err := s.pc.SetRemoteDescription(offer); err != nil {
 		return webrtc.SessionDescription{}, err
 	}
@@ -664,6 +769,10 @@ func (s *Session) HandleOffer(offer webrtc.SessionDescription) (webrtc.SessionDe
 	<-gatherComplete
 
 	return *s.pc.LocalDescription(), nil
+}
+
+func offerIncludesAudio(sdp string) bool {
+	return strings.Contains(sdp, "\nm=audio") || strings.Contains(sdp, "\r\nm=audio")
 }
 
 // Close encerra a sessão.

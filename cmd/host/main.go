@@ -37,7 +37,11 @@ func main() {
 	}
 
 	mux := http.NewServeMux()
-	mux.Handle("/", http.FileServer(http.FS(webFS)))
+	// no-cache nos assets estáticos: a TV Samsung Tizen cacheia HTML/JS de forma
+	// agressiva. Sem isto, mudanças no client.html (jitter buffer, playout-delay)
+	// não chegam ao firmware — ele segue rodando a versão antiga em cache, o que
+	// mascara qualquer correção de latência aplicada no front.
+	mux.Handle("/", noCache(http.FileServer(http.FS(webFS))))
 	mux.HandleFunc("/api/info", srv.HandleInfo)
 	mux.HandleFunc("/api/config", srv.HandleConfig)
 	mux.HandleFunc("/ws", srv.HandleSignal)
@@ -55,6 +59,15 @@ func main() {
 	if err := http.ListenAndServe(":"+port, mux); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func noCache(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+		w.Header().Set("Pragma", "no-cache")
+		w.Header().Set("Expires", "0")
+		next.ServeHTTP(w, r)
+	})
 }
 
 func localIP() string {
