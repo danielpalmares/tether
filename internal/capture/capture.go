@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"tether/internal/config"
+	"tether/internal/process"
 )
 
 // Capturer encapsula um processo FFmpeg que captura a tela via DXGI (ddagrab)
@@ -98,6 +99,9 @@ func (c *Capturer) startFFmpeg(ctx context.Context, mode pipelineMode) (*bufio.R
 
 	if err := cmd.Start(); err != nil {
 		return nil, nil, err
+	}
+	if err := process.BoostPID(cmd.Process.Pid); err != nil {
+		fmt.Fprintf(os.Stderr, "[capture] aviso: não foi possível elevar prioridade do FFmpeg: %v\n", err)
 	}
 
 	// Confirma que o pipeline escolhido realmente produz H.264. O FFmpeg pode

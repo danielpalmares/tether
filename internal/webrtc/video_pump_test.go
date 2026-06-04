@@ -51,6 +51,9 @@ func TestReadH264AccessUnitsGroupsOneSamplePerFrame(t *testing.T) {
 	if got := stats.readFrames.Load(); got != 2 {
 		t.Fatalf("readFrames = %d, want 2", got)
 	}
+	if got := stats.maxQueueDepth.Load(); got != 2 {
+		t.Fatalf("maxQueueDepth = %d, want 2", got)
+	}
 }
 
 func TestWriteVideoFramesWritesEveryFrameInOrder(t *testing.T) {

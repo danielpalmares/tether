@@ -72,6 +72,13 @@ func NewSession(cfg config.StreamConfig, injector input.Injector, onClose func()
 	if err := m.RegisterCodec(h264Codec, webrtc.RTPCodecTypeVideo); err != nil {
 		return nil, err
 	}
+	if err := m.RegisterHeaderExtension(
+		webrtc.RTPHeaderExtensionCapability{URI: playoutDelayExtensionURI},
+		webrtc.RTPCodecTypeVideo,
+		webrtc.RTPTransceiverDirectionSendonly,
+	); err != nil {
+		return nil, err
+	}
 
 	// NACK (retransmissão de pacotes perdidos) + RTCP Reports. Sem isto, perder
 	// 1 fragmento de keyframe (~50 pacotes a 1080p60) descarta o frame inteiro e
@@ -103,13 +110,7 @@ func NewSession(cfg config.StreamConfig, injector input.Injector, onClose func()
 
 	// --- Track de vídeo ---
 	// A track carrega o MESMO capability do codec registrado.
-	videoTrack, err := webrtc.NewTrackLocalStaticSample(
-		h264Codec.RTPCodecCapability,
-		"video", "tether-screen",
-	)
-	if err != nil {
-		return nil, err
-	}
+	videoTrack := newLowLatencyH264Track(h264Codec.RTPCodecCapability, "video", "tether-screen")
 	rtpSender, err := pc.AddTrack(videoTrack)
 	if err != nil {
 		return nil, err
@@ -219,28 +220,20 @@ const annexBStartCode = "\x00\x00\x00\x01"
 //
 // Pacing: não descartamos frames H.264 no host. P-frames dependem dos frames
 // anteriores; pular um frame no bitstream gera artefatos/blocos até o próximo
-// IDR. O FFmpeg/NVENC já produz em tempo real, então a estratégia segura é
-// drenar, agrupar access units e enviar cada frame inteiro na ordem.
-const videoFrameQueueDepth = 1
-
-type sampleWriter interface {
-	WriteSample(media.Sample) error
-}
-
-type encodedFrame struct {
-	data     []byte
-	duration time.Duration
-	keyframe bool
-}
+// IDR. Mantemos uma fila curta para absorver travadas breves do writer RTP sem
+// empurrar backpressure imediatamente para o FFmpeg.
+const videoFrameQueueDepth = 4
 
 type videoPumpStats struct {
-	readFrames   atomic.Int64
-	sentFrames   atomic.Int64
-	keyframes    atomic.Int64
-	bytes        atomic.Int64
-	maxReadGapNs atomic.Int64
-	maxSendGapNs atomic.Int64
-	maxWriteNs   atomic.Int64
+	readFrames      atomic.Int64
+	sentFrames      atomic.Int64
+	keyframes       atomic.Int64
+	bytes           atomic.Int64
+	maxReadGapNs    atomic.Int64
+	maxSendGapNs    atomic.Int64
+	maxWriteNs      atomic.Int64
+	maxQueueDepth   atomic.Int64
+	maxQueueBlockNs atomic.Int64
 }
 
 func (s *Session) pumpVideo(stream io.ReadCloser, track sampleWriter) {
@@ -300,7 +293,14 @@ func readH264AccessUnits(stream io.Reader, frameDur time.Duration, out chan enco
 			lastRead = now
 		}
 
+		if stats != nil {
+			recordMaxInt(&stats.maxQueueDepth, boundedQueueDepth(len(out)+1, cap(out)))
+		}
+		enqueueStart := time.Now()
 		out <- frame
+		if stats != nil {
+			recordMaxDuration(&stats.maxQueueBlockNs, time.Since(enqueueStart))
+		}
 		haveVCL = false
 		auHasIDR = false
 	}
@@ -383,12 +383,23 @@ func writeVideoFrames(frames <-chan encodedFrame, track sampleWriter, stats *vid
 
 func recordMaxDuration(target *atomic.Int64, d time.Duration) {
 	n := int64(d)
+	recordMaxInt(target, n)
+}
+
+func recordMaxInt(target *atomic.Int64, n int64) {
 	for {
 		old := target.Load()
 		if n <= old || target.CompareAndSwap(old, n) {
 			return
 		}
 	}
+}
+
+func boundedQueueDepth(depth, capacity int) int64 {
+	if capacity > 0 && depth > capacity {
+		return int64(capacity)
+	}
+	return int64(depth)
 }
 
 func logVideoPumpStats(stats *videoPumpStats) {
@@ -403,13 +414,15 @@ func logVideoPumpStats(stats *videoPumpStats) {
 	maxReadGap := time.Duration(stats.maxReadGapNs.Swap(0))
 	maxSendGap := time.Duration(stats.maxSendGapNs.Swap(0))
 	maxWrite := time.Duration(stats.maxWriteNs.Swap(0))
+	maxQueueDepth := stats.maxQueueDepth.Swap(0)
+	maxQueueBlock := time.Duration(stats.maxQueueBlockNs.Swap(0))
 
 	if read == 0 && sent == 0 && keyframes == 0 && bytes == 0 {
 		return
 	}
 
-	log.Printf("[video] lidos=%d fps enviados=%d fps keyframes=%d taxa=%d KB/s gapMax leitura/envio=%s/%s writeMax=%s",
-		read, sent, keyframes, bytes/1024, maxReadGap, maxSendGap, maxWrite)
+	log.Printf("[video] lidos=%d fps enviados=%d fps keyframes=%d taxa=%d KB/s gapMax leitura/envio=%s/%s writeMax=%s filaMax=%d/%d filaBloqMax=%s",
+		read, sent, keyframes, bytes/1024, maxReadGap, maxSendGap, maxWrite, maxQueueDepth, videoFrameQueueDepth, maxQueueBlock)
 }
 
 // HandleOffer processa a SDP offer do client e devolve a answer.

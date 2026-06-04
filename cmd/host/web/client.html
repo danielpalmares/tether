@@ -141,6 +141,7 @@ const log=(m,c='')=>{const e=document.getElementById('log'),l=document.createEle
 
 let hostAddr=null, padIndex=null, pc=null, dc=null, inputTimer=null;
 let lastVideoStats={framesDropped:0, packetsLost:0};
+let latencyHintLogged=false;
 
 /* ---------- 01 · vincular host ---------- */
 document.getElementById('probeBtn').onclick = async () => {
@@ -222,32 +223,13 @@ async function startStream(){
   log('estabelecendo link webrtc...','warn');
   if(padIndex===null) log('iniciando sem controle (somente vídeo)','warn');
   lastVideoStats={framesDropped:0, packetsLost:0};
+  latencyHintLogged=false;
 
   pc=new RTCPeerConnection({iceServers:[]});
 
   // recebe vídeo
   pc.ontrack = ev => {
-    // Minimiza o jitter buffer de playout do receiver. Em LAN o jitter de
-    // chegada é desprezível, mas o player (sobretudo o WebRTC da Tizen) mantém
-    // por padrão um buffer conservador de centenas de ms — esse é o delay
-    // residual percebido depois de já termos enxugado o encoder. Pedir 0 manda
-    // o browser exibir cada frame assim que chega.
-    try {
-      const recv = ev.receiver || (pc.getReceivers && pc.getReceivers().find(r => r.track === ev.track));
-      let applied = [];
-      if (recv && 'jitterBufferTarget' in recv) {
-        recv.jitterBufferTarget = 0; applied.push('jitterBufferTarget');
-      }
-      // playoutDelayHint: hint legado, distinto do jitterBufferTarget. Vários
-      // firmwares Tizen honram este e ignoram aquele — aplicamos ambos para
-      // cobrir o maior número de versões de TV Samsung.
-      if (recv && 'playoutDelayHint' in recv) {
-        recv.playoutDelayHint = 0; applied.push('playoutDelayHint');
-      }
-      log(applied.length ? 'playout minimizado ('+applied.join('+')+'=0)'
-                         : 'nenhum hint de playout suportado (mantém padrão)',
-          applied.length ? 'ok' : 'warn');
-    } catch(e){ log('falha ao ajustar jitter buffer: '+e.message,'warn'); }
+    minimizeReceiverLatency(ev.receiver || (pc.getReceivers && pc.getReceivers().find(r => r.track === ev.track)), true);
 
     document.getElementById('video').srcObject = ev.streams[0];
     document.getElementById('stage').classList.add('show');
@@ -272,6 +254,7 @@ async function startStream(){
   const ws=new WebSocket('ws://'+hostAddr+'/ws');
   ws.onopen = async () => {
     const offer=await pc.createOffer();
+    offer.sdp=enablePlayoutDelayExtension(offer.sdp);
     await pc.setLocalDescription(offer);
     await new Promise(r=>{ if(pc.iceGatheringState==='complete')return r();
       pc.onicegatheringstatechange=()=>pc.iceGatheringState==='complete'&&r(); });
@@ -282,10 +265,39 @@ async function startStream(){
     const msg=JSON.parse(ev.data);
     if(msg.type==='answer'){
       await pc.setRemoteDescription(msg.data);
+      pc.getReceivers().forEach(r=>minimizeReceiverLatency(r, true));
       log('answer recebida · handshake completo','ok');
     }
   };
   ws.onerror = () => log('erro no signaling websocket','err');
+}
+
+function enablePlayoutDelayExtension(sdp){
+  const uri='http://www.webrtc.org/experiments/rtp-hdrext/playout-delay';
+  if(sdp.includes(uri)) return sdp;
+  const eol=sdp.includes('\r\n') ? '\r\n' : '\n';
+  const lines=sdp.split(eol);
+  let videoStart=-1, videoEnd=lines.length;
+  for(let i=0;i<lines.length;i++){
+    if(lines[i].startsWith('m=video')) videoStart=i;
+    else if(videoStart!==-1 && i>videoStart && lines[i].startsWith('m=')){ videoEnd=i; break; }
+  }
+  if(videoStart===-1) return sdp;
+  const used=new Set();
+  for(let i=videoStart;i<videoEnd;i++){
+    const m=lines[i].match(/^a=extmap:(\d+)/);
+    if(m) used.add(+m[1]);
+  }
+  let id=3;
+  while(used.has(id) && id<15) id++;
+  if(id>=15) return sdp;
+  let insert=videoStart+1;
+  for(let i=videoStart+1;i<videoEnd;i++){
+    if(lines[i].startsWith('a=mid:')){ insert=i+1; break; }
+  }
+  lines.splice(insert,0,'a=extmap:'+id+' '+uri);
+  log('offer com playout-delay extmap id '+id,'ok');
+  return lines.join(eol);
 }
 
 function sendInput(){
@@ -298,12 +310,36 @@ function sendInput(){
   dc.send(JSON.stringify({buttons, axes}));
 }
 
+function minimizeReceiverLatency(recv, shouldLog=false){
+  if(!recv) return;
+  try {
+    let applied = [];
+    // LAN local: alvo mínimo. Alguns firmwares aceitam 0; outros estabilizam
+    // melhor com valor positivo quase zero.
+    if ('jitterBufferTarget' in recv) {
+      recv.jitterBufferTarget = 0.001; applied.push('jitterBufferTarget');
+    }
+    if ('playoutDelayHint' in recv) {
+      recv.playoutDelayHint = 0; applied.push('playoutDelayHint');
+    }
+    if(shouldLog && !latencyHintLogged){
+      log(applied.length ? 'playout mínimo ('+applied.join('+')+')'
+                         : 'nenhum hint de playout suportado (mantém padrão)',
+          applied.length ? 'ok' : 'warn');
+      latencyHintLogged=true;
+    }
+  } catch(e){
+    if(shouldLog) log('falha ao ajustar jitter buffer: '+e.message,'warn');
+  }
+}
+
 function endStream(){
   if(inputTimer) clearInterval(inputTimer);
   if(dc) dc.close();
   if(pc) pc.close();
   pc=null; dc=null;
   lastVideoStats={framesDropped:0, packetsLost:0};
+  latencyHintLogged=false;
   document.getElementById('stage').classList.remove('show');
   document.getElementById('video').srcObject=null;
   document.getElementById('linkState').textContent='offline';
@@ -314,6 +350,7 @@ document.getElementById('stageExit').onclick = endStream;
 // medição de RTT
 setInterval(async () => {
   if(!pc || pc.connectionState!=='connected') return;
+  pc.getReceivers().forEach(r=>minimizeReceiverLatency(r));
   const stats=await pc.getStats();
   let rttText=document.getElementById('rtt').textContent || '— ms';
   let videoStats=null;

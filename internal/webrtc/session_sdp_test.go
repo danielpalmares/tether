@@ -2,6 +2,7 @@ package webrtc
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"strings"
 	"testing"
@@ -40,6 +41,7 @@ func TestAnswerAdvertisesNackPLI(t *testing.T) {
 	if err := clientPC.SetLocalDescription(offer); err != nil {
 		t.Fatalf("set local: %v", err)
 	}
+	offer.SDP = addPlayoutDelayExtmapForTest(offer.SDP)
 
 	// Host real: mesma construção de produção (NACK + RTCP reports + track).
 	// Com CGO_ENABLED=0 o NewInjector devolve o noop (não toca ViGEm).
@@ -65,6 +67,9 @@ func TestAnswerAdvertisesNackPLI(t *testing.T) {
 	if !strings.Contains(sdp, "nack pli") {
 		t.Errorf("answer SDP não anuncia 'nack pli'")
 	}
+	if !strings.Contains(sdp, playoutDelayExtensionURI) {
+		t.Errorf("answer SDP não negocia playout-delay")
+	}
 
 	// 2) EXATAMENTE UM codec H264, e com o profile-level-id 42c02a. Esta é a
 	// regressão crítica: sem SetCodecPreferences o Pion ecoa todos os perfis H264
@@ -82,6 +87,55 @@ func TestAnswerAdvertisesNackPLI(t *testing.T) {
 			t.Errorf("answer contém profile indesejado %s (eco da offer; deveria ser só 42c02a)", bad)
 		}
 	}
+}
+
+func addPlayoutDelayExtmapForTest(sdp string) string {
+	if strings.Contains(sdp, playoutDelayExtensionURI) {
+		return sdp
+	}
+	eol := "\n"
+	if strings.Contains(sdp, "\r\n") {
+		eol = "\r\n"
+	}
+	lines := strings.Split(sdp, eol)
+	videoStart := -1
+	videoEnd := len(lines)
+	for i, line := range lines {
+		if strings.HasPrefix(line, "m=video") {
+			videoStart = i
+			continue
+		}
+		if videoStart >= 0 && i > videoStart && strings.HasPrefix(line, "m=") {
+			videoEnd = i
+			break
+		}
+	}
+	if videoStart < 0 {
+		return sdp
+	}
+	used := map[int]bool{}
+	for _, line := range lines[videoStart:videoEnd] {
+		var id int
+		if _, err := fmt.Sscanf(line, "a=extmap:%d", &id); err == nil {
+			used[id] = true
+		}
+	}
+	id := 3
+	for used[id] && id < 15 {
+		id++
+	}
+	if id >= 15 {
+		return sdp
+	}
+	insert := videoStart + 1
+	for i := videoStart + 1; i < videoEnd; i++ {
+		if strings.HasPrefix(lines[i], "a=mid:") {
+			insert = i + 1
+			break
+		}
+	}
+	lines = append(lines[:insert], append([]string{fmt.Sprintf("a=extmap:%d %s", id, playoutDelayExtensionURI)}, lines[insert:]...)...)
+	return strings.Join(lines, eol)
 }
 
 func disableCaptureForTest(t *testing.T) {

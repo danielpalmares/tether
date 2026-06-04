@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"time"
 
+	"tether/internal/process"
 	"tether/internal/signaling"
 )
 
@@ -21,6 +22,12 @@ var webFiles embed.FS
 const port = "8787"
 
 func main() {
+	if err := process.BoostCurrent(); err != nil {
+		log.Printf("[host] aviso: não foi possível elevar prioridade: %v", err)
+	} else {
+		log.Println("[host] prioridade alta ativa")
+	}
+
 	hostName, _ := os.Hostname()
 	srv := signaling.NewServer(hostName)
 
