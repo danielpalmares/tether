@@ -116,6 +116,10 @@ func (v *vigemInjector) Apply(s GamepadState) error {
 	return nil
 }
 
+func (v *vigemInjector) Command(cmd Command) error {
+	return sendCommand(cmd)
+}
+
 func (v *vigemInjector) Close() error {
 	if v.client != nil {
 		if v.pad != nil {
@@ -155,4 +159,3 @@ func triggerByte(s GamepadState, btnIdx, axisIdx int) C.BYTE {
 	}
 	return 0
 }
-

@@ -1,0 +1,383 @@
+//go:build windows
+
+package audio
+
+import (
+	"bytes"
+	"context"
+	"fmt"
+	"io"
+	"runtime"
+	"syscall"
+	"time"
+	"unsafe"
+
+	"github.com/go-ole/go-ole"
+	"github.com/moutend/go-wca/pkg/wca"
+)
+
+const (
+	waveFormatPCM        = 0x0001
+	waveFormatIEEEFloat  = 0x0003
+	waveFormatExtensible = 0xfffe
+)
+
+var (
+	ksSubTypePCM       = [16]byte{0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}
+	ksSubTypeIEEEFloat = [16]byte{0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}
+)
+
+type wasapiLoopback struct {
+	ctx      context.Context
+	cancel   context.CancelFunc
+	writerCh chan writeCloser
+	done     chan error
+	format   pcmFormat
+}
+
+type wasapiReady struct {
+	format pcmFormat
+	err    error
+}
+
+func newWASAPILoopback(parent context.Context) (pcmLoopback, error) {
+	ctx, cancel := context.WithCancel(parent)
+	w := &wasapiLoopback{
+		ctx:      ctx,
+		cancel:   cancel,
+		writerCh: make(chan writeCloser, 1),
+		done:     make(chan error, 1),
+	}
+
+	ready := make(chan wasapiReady, 1)
+	go w.captureThread(ready)
+
+	select {
+	case r := <-ready:
+		if r.err != nil {
+			cancel()
+			return nil, r.err
+		}
+		w.format = r.format
+		return w, nil
+	case <-time.After(3 * time.Second):
+		cancel()
+		return nil, fmt.Errorf("timeout inicializando WASAPI")
+	case <-parent.Done():
+		cancel()
+		return nil, parent.Err()
+	}
+}
+
+func (w *wasapiLoopback) Name() string {
+	f := w.format
+	return fmt.Sprintf("WASAPI loopback %s/%dHz/%dch", f.FFmpegFormat, f.SampleRate, f.Channels)
+}
+
+func (w *wasapiLoopback) Format() pcmFormat {
+	return w.format
+}
+
+func (w *wasapiLoopback) StartWriting(writer writeCloser) error {
+	select {
+	case w.writerCh <- writer:
+		return nil
+	case <-w.done:
+		return fmt.Errorf("WASAPI encerrou antes de receber o pipe")
+	case <-w.ctx.Done():
+		return w.ctx.Err()
+	}
+}
+
+func (w *wasapiLoopback) Close() error {
+	w.cancel()
+	select {
+	case <-w.done:
+	case <-time.After(750 * time.Millisecond):
+	}
+	return nil
+}
+
+func (w *wasapiLoopback) captureThread(ready chan<- wasapiReady) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	err := w.runCapture(ready)
+	w.done <- err
+}
+
+func (w *wasapiLoopback) runCapture(ready chan<- wasapiReady) error {
+	if err := ole.CoInitializeEx(0, ole.COINIT_MULTITHREADED); err != nil && !oleCode(err, 1) {
+		ready <- wasapiReady{err: fmt.Errorf("CoInitializeEx: %w", err)}
+		return err
+	}
+	defer ole.CoUninitialize()
+
+	var enumerator *wca.IMMDeviceEnumerator
+	if err := wca.CoCreateInstance(
+		wca.CLSID_MMDeviceEnumerator,
+		0,
+		wca.CLSCTX_ALL,
+		wca.IID_IMMDeviceEnumerator,
+		&enumerator,
+	); err != nil {
+		ready <- wasapiReady{err: fmt.Errorf("MMDeviceEnumerator: %w", err)}
+		return err
+	}
+	defer enumerator.Release()
+
+	var device *wca.IMMDevice
+	if err := enumerator.GetDefaultAudioEndpoint(wca.ERender, wca.EMultimedia, &device); err != nil {
+		ready <- wasapiReady{err: fmt.Errorf("endpoint de saída padrão: %w", err)}
+		return err
+	}
+	defer device.Release()
+
+	var audioClient *wca.IAudioClient
+	if err := activateAudioClient(device, &audioClient); err != nil {
+		ready <- wasapiReady{err: fmt.Errorf("IAudioClient: %w", err)}
+		return err
+	}
+	defer audioClient.Release()
+
+	format, err := initializeLoopbackClient(audioClient)
+	if err != nil {
+		ready <- wasapiReady{err: err}
+		return err
+	}
+	ready <- wasapiReady{format: format}
+
+	var captureClient *wca.IAudioCaptureClient
+	if err := audioClient.GetService(wca.IID_IAudioCaptureClient, &captureClient); err != nil {
+		return fmt.Errorf("IAudioCaptureClient: %w", err)
+	}
+	defer captureClient.Release()
+
+	var writer writeCloser
+	select {
+	case writer = <-w.writerCh:
+	case <-w.ctx.Done():
+		return w.ctx.Err()
+	}
+	defer writer.Close()
+
+	if err := audioClient.Start(); err != nil {
+		return fmt.Errorf("WASAPI start: %w", err)
+	}
+	defer audioClient.Stop()
+
+	return capturePCM(w.ctx, captureClient, writer, format)
+}
+
+func activateAudioClient(device *wca.IMMDevice, audioClient **wca.IAudioClient) error {
+	hr, _, _ := syscall.Syscall6(
+		device.VTable().Activate,
+		5,
+		uintptr(unsafe.Pointer(device)),
+		uintptr(unsafe.Pointer(wca.IID_IAudioClient)),
+		uintptr(wca.CLSCTX_ALL),
+		0,
+		uintptr(unsafe.Pointer(audioClient)),
+		0,
+	)
+	if hr != 0 {
+		return ole.NewError(hr)
+	}
+	return nil
+}
+
+func initializeLoopbackClient(audioClient *wca.IAudioClient) (pcmFormat, error) {
+	desiredFormat := wca.WAVEFORMATEX{
+		WFormatTag:      waveFormatIEEEFloat,
+		NChannels:       2,
+		NSamplesPerSec:  48000,
+		WBitsPerSample:  32,
+		NBlockAlign:     2 * 4,
+		NAvgBytesPerSec: 48000 * 2 * 4,
+	}
+	desired := pcmFormat{FFmpegFormat: "f32le", SampleRate: 48000, Channels: 2, BlockAlign: 8}
+	flags := uint32(wca.AUDCLNT_STREAMFLAGS_LOOPBACK | wca.AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | wca.AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY)
+	if err := initializeShared(audioClient, flags, &desiredFormat); err == nil {
+		return desired, nil
+	}
+
+	var mix *wca.WAVEFORMATEX
+	if err := audioClient.GetMixFormat(&mix); err != nil {
+		return pcmFormat{}, fmt.Errorf("WASAPI mix format: %w", err)
+	}
+	defer ole.CoTaskMemFree(uintptr(unsafe.Pointer(mix)))
+
+	format, err := pcmFormatFromWave(mix)
+	if err != nil {
+		return pcmFormat{}, err
+	}
+	if err := initializeShared(audioClient, wca.AUDCLNT_STREAMFLAGS_LOOPBACK, mix); err != nil {
+		return pcmFormat{}, fmt.Errorf("WASAPI initialize: %w", err)
+	}
+	return format, nil
+}
+
+func initializeShared(audioClient *wca.IAudioClient, flags uint32, format *wca.WAVEFORMATEX) error {
+	for _, duration := range []wca.REFERENCE_TIME{200000, 0} {
+		err := audioClient.Initialize(
+			wca.AUDCLNT_SHAREMODE_SHARED,
+			flags,
+			duration,
+			0,
+			format,
+			nil,
+		)
+		if err == nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("formato não aceito pelo engine de áudio")
+}
+
+func pcmFormatFromWave(wfx *wca.WAVEFORMATEX) (pcmFormat, error) {
+	tag := wfx.WFormatTag
+	if tag == waveFormatExtensible && wfx.CbSize >= 22 {
+		subFormat := *(*[16]byte)(unsafe.Pointer(uintptr(unsafe.Pointer(wfx)) + 24))
+		switch {
+		case bytes.Equal(subFormat[:], ksSubTypePCM[:]):
+			tag = waveFormatPCM
+		case bytes.Equal(subFormat[:], ksSubTypeIEEEFloat[:]):
+			tag = waveFormatIEEEFloat
+		default:
+			return pcmFormat{}, fmt.Errorf("WASAPI subformato não suportado: %x", subFormat)
+		}
+	}
+
+	format := pcmFormat{
+		SampleRate: int(wfx.NSamplesPerSec),
+		Channels:   int(wfx.NChannels),
+		BlockAlign: int(wfx.NBlockAlign),
+	}
+	switch tag {
+	case waveFormatIEEEFloat:
+		switch wfx.WBitsPerSample {
+		case 32:
+			format.FFmpegFormat = "f32le"
+		case 64:
+			format.FFmpegFormat = "f64le"
+		default:
+			return pcmFormat{}, fmt.Errorf("WASAPI float %d-bit não suportado", wfx.WBitsPerSample)
+		}
+	case waveFormatPCM:
+		switch wfx.WBitsPerSample {
+		case 8:
+			format.FFmpegFormat = "u8"
+		case 16:
+			format.FFmpegFormat = "s16le"
+		case 24:
+			format.FFmpegFormat = "s24le"
+		case 32:
+			format.FFmpegFormat = "s32le"
+		default:
+			return pcmFormat{}, fmt.Errorf("WASAPI PCM %d-bit não suportado", wfx.WBitsPerSample)
+		}
+	default:
+		return pcmFormat{}, fmt.Errorf("WASAPI formato não suportado: tag=0x%x", wfx.WFormatTag)
+	}
+	if err := format.validate(); err != nil {
+		return pcmFormat{}, err
+	}
+	return format, nil
+}
+
+func capturePCM(ctx context.Context, captureClient *wca.IAudioCaptureClient, writer writeCloser, format pcmFormat) error {
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+
+	silenceFrames := format.SampleRate / 100
+	if silenceFrames <= 0 {
+		silenceFrames = 480
+	}
+	silence := make([]byte, silenceFrames*format.BlockAlign)
+	lastWrite := time.Now()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			wrote, err := drainWASAPIPackets(captureClient, writer, format)
+			if err != nil {
+				return err
+			}
+			if wrote {
+				lastWrite = time.Now()
+				continue
+			}
+			if time.Since(lastWrite) >= 10*time.Millisecond {
+				if err := writeAll(writer, silence); err != nil {
+					return err
+				}
+				lastWrite = time.Now()
+			}
+		}
+	}
+}
+
+func drainWASAPIPackets(captureClient *wca.IAudioCaptureClient, writer writeCloser, format pcmFormat) (bool, error) {
+	var packetFrames uint32
+	if err := captureClient.GetNextPacketSize(&packetFrames); err != nil {
+		return false, fmt.Errorf("WASAPI next packet: %w", err)
+	}
+
+	wrote := false
+	for packetFrames > 0 {
+		var data *byte
+		var frames uint32
+		var flags uint32
+		var devicePosition uint64
+		var qpcPosition uint64
+		if err := captureClient.GetBuffer(&data, &frames, &flags, &devicePosition, &qpcPosition); err != nil {
+			return wrote, fmt.Errorf("WASAPI get buffer: %w", err)
+		}
+
+		byteCount := int(frames) * format.BlockAlign
+		if byteCount > 0 {
+			if flags&wca.AUDCLNT_BUFFERFLAGS_SILENT != 0 || data == nil {
+				if err := writeAll(writer, make([]byte, byteCount)); err != nil {
+					_ = captureClient.ReleaseBuffer(frames)
+					return wrote, err
+				}
+			} else {
+				src := unsafe.Slice(data, byteCount)
+				if err := writeAll(writer, src); err != nil {
+					_ = captureClient.ReleaseBuffer(frames)
+					return wrote, err
+				}
+			}
+			wrote = true
+		}
+
+		if err := captureClient.ReleaseBuffer(frames); err != nil {
+			return wrote, fmt.Errorf("WASAPI release buffer: %w", err)
+		}
+		if err := captureClient.GetNextPacketSize(&packetFrames); err != nil {
+			return wrote, fmt.Errorf("WASAPI next packet: %w", err)
+		}
+	}
+	return wrote, nil
+}
+
+func writeAll(w io.Writer, p []byte) error {
+	for len(p) > 0 {
+		n, err := w.Write(p)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+		p = p[n:]
+	}
+	return nil
+}
+
+func oleCode(err error, code uintptr) bool {
+	oleErr, ok := err.(*ole.OleError)
+	return ok && oleErr.Code() == code
+}

@@ -1,4 +1,4 @@
-//go:build !windows || !cgo
+//go:build !windows
 
 package input
 
@@ -20,5 +20,8 @@ func (n *noopInjector) Apply(s GamepadState) error {
 	return nil
 }
 
-func (n *noopInjector) Close() error { return nil }
+func (n *noopInjector) Command(cmd Command) error {
+	return nil
+}
 
+func (n *noopInjector) Close() error { return nil }

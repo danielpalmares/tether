@@ -12,6 +12,16 @@ type GamepadState struct {
 	Axes []float64 `json:"axes"`
 }
 
+type Command struct {
+	Type   string  `json:"type"`
+	Code   string  `json:"code,omitempty"`
+	Down   bool    `json:"down,omitempty"`
+	Button int     `json:"button,omitempty"`
+	DX     int32   `json:"dx,omitempty"`
+	DY     int32   `json:"dy,omitempty"`
+	DeltaY float64 `json:"deltaY,omitempty"`
+}
+
 // Índices dos botões no array Buttons (Gamepad API standard mapping).
 const (
 	BtnA = iota
@@ -36,6 +46,7 @@ const (
 // Injector recebe estados de gamepad e os aplica num controle virtual no host.
 type Injector interface {
 	Apply(state GamepadState) error
+	Command(cmd Command) error
 	Close() error
 }
 

@@ -57,8 +57,9 @@ go build -o tether-host.exe ./cmd/host
 | WebRTC vídeo (Pion) | ✅ pipeline pronto |
 | Captura+encode (FFmpeg) | ✅ implementado (precisa de GPU/Windows p/ rodar) |
 | Gamepad → data channel | ✅ funcional |
-| Injeção ViGEmBus | ⚙️ requer SDK ViGEmClient (ver `internal/input/vigem_windows.go`) |
-| Áudio | ❌ fora do MVP (próximo passo) |
+| Injeção Xbox 360 virtual | ✅ Windows sem cgo quando `ViGEmClient.dll` está disponível |
+| Teclado/mouse | ✅ fallback Windows sem cgo via SendInput |
+| Áudio | ✅ Opus/WebRTC via WASAPI loopback; DirectShow como fallback |
 | Descoberta mDNS | ❌ v2 (hoje: IP manual) |
 
 ## Estrutura
@@ -70,7 +71,8 @@ internal/config/            struct de configuração de streaming
 internal/capture/           wrapper FFmpeg (ddagrab + h264_nvenc)
 internal/webrtc/            sessão Pion: track de vídeo + data channel de input
 internal/signaling/         servidor HTTP + WebSocket de signaling
-internal/input/             GamepadState + injetor ViGEm (win) / noop (outros)
+internal/input/             GamepadState + injetor ViGEm/SendInput (win) / noop
+internal/audio/             captura WASAPI/DirectShow -> Opus/RTP -> WebRTC
 internal/steam/             dispara steam://open/bigpicture
 ```
 
@@ -81,16 +83,23 @@ internal/steam/             dispara steam://open/bigpicture
   para minimizar latência.
 - **Input não-confiável:** o data channel usa `ordered:false, maxRetransmits:0`
   (UDP-like) — perder um pacote de input é melhor que esperar retransmissão.
-- **ViGEmBus:** `vigem_windows.go` espera o SDK ViGEmClient (header + lib) em
-  `internal/input/vigem/`. Sem ele, compile o stub ajustando a build tag, ou
-  adapte para chamar um helper externo.
+- **Input:** no build padrão (`CGO_ENABLED=0`), o host procura
+  `ViGEmClient.dll` ao lado do executável, em `bin/`, em
+  `internal/input/vigem/bin/`, ou no caminho definido por `TETHER_VIGEM_DLL`.
+  Com a DLL presente, o gamepad do client vira um Xbox 360 virtual real via
+  ViGEmBus. Sem a DLL, o host cai para SendInput e registra isso no log; esse
+  fallback só serve para navegação/teclado, não para jogos que exigem XInput.
+- **Áudio:** tenta WASAPI loopback nativo primeiro, capturando o dispositivo de
+  reprodução padrão do Windows e enviando PCM para o FFmpeg codificar Opus/RTP.
+  Para forçar DirectShow, defina `TETHER_AUDIO_BACKEND=dshow`; se a fonte não
+  aparecer automaticamente, defina `TETHER_AUDIO_DEVICE` com o nome do
+  dispositivo DirectShow.
 - **Y invertido:** a Gamepad API usa +Y para baixo; o XInput espera o oposto —
   já tratado no injetor.
 
 ## Roadmap
 
-1. Áudio do sistema (WASAPI loopback → Opus no WebRTC)
+1. Fluxo explícito de setup para baixar/posicionar `ViGEmClient.dll`
 2. Descoberta mDNS (`_tether._tcp.local`) para listar hosts automaticamente
 3. Captura/encode nativos (DXGI + NVENC via cgo) para cortar o overhead do FFmpeg
-4. Teclado + mouse (jogos não-gamepad)
-5. H.265/AV1 quando o browser do client suportar
+4. H.265/AV1 quando o browser do client suportar

@@ -127,11 +127,12 @@
 </div>
 
 <!-- palco de streaming -->
-<div id="stage">
+<div id="stage" tabindex="-1">
   <video id="video" autoplay playsinline></video>
   <div id="stageHud">
     <span class="pill live"><span class="dot"></span> ao vivo</span>
     <span class="pill"><span class="dot" style="background:var(--cyan)"></span> <span id="hudRtt">— ms</span></span>
+    <span class="pill"><span class="dot" style="background:var(--acid)"></span> <span id="audioState">aud —</span></span>
   </div>
   <button class="btn" id="stageExit">⛒ encerrar</button>
 </div>
@@ -139,9 +140,10 @@
 <script>
 const log=(m,c='')=>{const e=document.getElementById('log'),l=document.createElement('div');l.className='ln '+c;l.textContent=m;e.appendChild(l);e.scrollTop=e.scrollHeight;};
 
-let hostAddr=null, padIndex=null, pc=null, dc=null, inputTimer=null;
+let hostAddr=null, padIndex=null, pc=null, dc=null, inputTimer=null, remoteStream=null, controlHandlers=null;
 let lastVideoStats={framesDropped:0, packetsLost:0};
 let latencyHintLogged=false;
+let keysDown=new Set();
 
 /* ---------- 01 · vincular host ---------- */
 document.getElementById('probeBtn').onclick = async () => {
@@ -226,14 +228,29 @@ async function startStream(){
   latencyHintLogged=false;
 
   pc=new RTCPeerConnection({iceServers:[]});
+  remoteStream=new MediaStream();
+  const videoEl=document.getElementById('video');
+  videoEl.srcObject=remoteStream;
+  videoEl.volume=1;
+  videoEl.muted=false;
 
-  // recebe vídeo
+  // recebe mídia
   pc.ontrack = ev => {
-    minimizeReceiverLatency(ev.receiver || (pc.getReceivers && pc.getReceivers().find(r => r.track === ev.track)), true);
+    const recv=ev.receiver || (pc.getReceivers && pc.getReceivers().find(r => r.track === ev.track));
+    if(ev.track.kind==='video') minimizeReceiverLatency(recv, true);
 
-    document.getElementById('video').srcObject = ev.streams[0];
+    if(!remoteStream.getTracks().some(t=>t.id===ev.track.id)){
+      remoteStream.addTrack(ev.track);
+    }
     document.getElementById('stage').classList.add('show');
-    log('vídeo recebido · sessão ao vivo','ok');
+    document.getElementById('stage').focus({preventScroll:true});
+    if(ev.track.kind==='video'){
+      log('vídeo recebido · sessão ao vivo','ok');
+    } else if(ev.track.kind==='audio'){
+      document.getElementById('audioState').textContent='aud ok';
+      log('áudio recebido','ok');
+    }
+    videoEl.play().catch(e=>log('playback aguardando interação: '+e.message,'warn'));
   };
   pc.onconnectionstatechange = () => {
     log('conexão: '+pc.connectionState, pc.connectionState==='connected'?'ok':'');
@@ -242,11 +259,13 @@ async function startStream(){
 
   // precisa receber vídeo
   pc.addTransceiver('video', {direction:'recvonly'});
+  pc.addTransceiver('audio', {direction:'recvonly'});
 
   // data channel de input
   dc = pc.createDataChannel('input', {ordered:false, maxRetransmits:0});
   dc.onopen = () => {
     log('canal de input aberto · enviando @60hz','ok');
+    installControlCapture();
     inputTimer=setInterval(sendInput, 1000/60);
   };
 
@@ -307,11 +326,11 @@ function sendInput(){
   const buttons=gp.buttons.map(b=>b.pressed);
   // anexa valores analógicos dos gatilhos como eixos 4 e 5
   const axes=[...gp.axes.slice(0,4), gp.buttons[6].value, gp.buttons[7].value];
-  dc.send(JSON.stringify({buttons, axes}));
+  dc.send(JSON.stringify({type:'gamepad', buttons, axes}));
 }
 
 function minimizeReceiverLatency(recv, shouldLog=false){
-  if(!recv) return;
+  if(!recv || !recv.track || recv.track.kind!=='video') return;
   try {
     let applied = [];
     // LAN local: alvo mínimo. Alguns firmwares aceitam 0; outros estabilizam
@@ -333,15 +352,103 @@ function minimizeReceiverLatency(recv, shouldLog=false){
   }
 }
 
+function installControlCapture(){
+  if(controlHandlers) return;
+  const stage=document.getElementById('stage');
+  const video=document.getElementById('video');
+  const active=()=>pc && dc && stage.classList.contains('show');
+  const fromUi=e=>e.target && e.target.closest && e.target.closest('button,input,select,textarea');
+
+  const keydown=e=>{
+    if(!active() || fromUi(e)) return;
+    e.preventDefault();
+    if(e.repeat) return;
+    keysDown.add(e.code);
+    sendCommand({type:'key', code:e.code, down:true});
+  };
+  const keyup=e=>{
+    if(!active()) return;
+    e.preventDefault();
+    keysDown.delete(e.code);
+    sendCommand({type:'key', code:e.code, down:false});
+  };
+  const mousemove=e=>{
+    if(!active()) return;
+    if(document.pointerLockElement!==video && document.pointerLockElement!==stage) return;
+    const dx=Math.trunc(e.movementX||0), dy=Math.trunc(e.movementY||0);
+    if(dx||dy) sendCommand({type:'mouseMove', dx, dy});
+  };
+  const mousedown=e=>{
+    if(!active() || fromUi(e)) return;
+    e.preventDefault();
+    sendCommand({type:'mouseButton', button:e.button, down:true});
+  };
+  const mouseup=e=>{
+    if(!active() || fromUi(e)) return;
+    e.preventDefault();
+    sendCommand({type:'mouseButton', button:e.button, down:false});
+  };
+  const wheel=e=>{
+    if(!active() || fromUi(e)) return;
+    e.preventDefault();
+    sendCommand({type:'wheel', deltaY:e.deltaY});
+  };
+  const click=e=>{
+    if(!active() || fromUi(e)) return;
+    if(document.pointerLockElement!==video && video.requestPointerLock) video.requestPointerLock();
+  };
+  const contextmenu=e=>{ if(active()) e.preventDefault(); };
+
+  window.addEventListener('keydown', keydown, true);
+  window.addEventListener('keyup', keyup, true);
+  document.addEventListener('mousemove', mousemove, true);
+  stage.addEventListener('mousedown', mousedown, true);
+  stage.addEventListener('mouseup', mouseup, true);
+  stage.addEventListener('wheel', wheel, {capture:true, passive:false});
+  stage.addEventListener('click', click, true);
+  stage.addEventListener('contextmenu', contextmenu, true);
+  controlHandlers={keydown,keyup,mousemove,mousedown,mouseup,wheel,click,contextmenu};
+  log('comandos teclado/mouse ativos','ok');
+}
+
+function uninstallControlCapture(){
+  if(!controlHandlers) return;
+  for(const code of keysDown) sendCommand({type:'key', code, down:false});
+  keysDown.clear();
+
+  const stage=document.getElementById('stage');
+  window.removeEventListener('keydown', controlHandlers.keydown, true);
+  window.removeEventListener('keyup', controlHandlers.keyup, true);
+  document.removeEventListener('mousemove', controlHandlers.mousemove, true);
+  stage.removeEventListener('mousedown', controlHandlers.mousedown, true);
+  stage.removeEventListener('mouseup', controlHandlers.mouseup, true);
+  stage.removeEventListener('wheel', controlHandlers.wheel, true);
+  stage.removeEventListener('click', controlHandlers.click, true);
+  stage.removeEventListener('contextmenu', controlHandlers.contextmenu, true);
+  if(document.pointerLockElement && document.exitPointerLock) document.exitPointerLock();
+  controlHandlers=null;
+}
+
+function sendCommand(cmd){
+  if(!dc || dc.readyState!=='open') return;
+  dc.send(JSON.stringify(cmd));
+}
+
 function endStream(){
   if(inputTimer) clearInterval(inputTimer);
+  uninstallControlCapture();
   if(dc) dc.close();
   if(pc) pc.close();
   pc=null; dc=null;
+  if(remoteStream){
+    remoteStream.getTracks().forEach(t=>t.stop());
+    remoteStream=null;
+  }
   lastVideoStats={framesDropped:0, packetsLost:0};
   latencyHintLogged=false;
   document.getElementById('stage').classList.remove('show');
   document.getElementById('video').srcObject=null;
+  document.getElementById('audioState').textContent='aud —';
   document.getElementById('linkState').textContent='offline';
   log('sessão encerrada','warn');
 }

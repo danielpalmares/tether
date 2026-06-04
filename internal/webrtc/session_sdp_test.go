@@ -9,6 +9,7 @@ import (
 
 	"github.com/pion/webrtc/v4"
 
+	"tether/internal/audio"
 	"tether/internal/config"
 	"tether/internal/input"
 )
@@ -20,7 +21,7 @@ import (
 func TestAnswerAdvertisesNackPLI(t *testing.T) {
 	disableCaptureForTest(t)
 
-	// Client sintético: gera uma offer recvonly de vídeo, como o client.html faz.
+	// Client sintético: gera uma offer recvonly de vídeo+áudio, como o client.html faz.
 	clientPC, err := webrtc.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
 		t.Fatalf("client pc: %v", err)
@@ -32,6 +33,12 @@ func TestAnswerAdvertisesNackPLI(t *testing.T) {
 		webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionRecvonly},
 	); err != nil {
 		t.Fatalf("add transceiver: %v", err)
+	}
+	if _, err := clientPC.AddTransceiverFromKind(
+		webrtc.RTPCodecTypeAudio,
+		webrtc.RTPTransceiverInit{Direction: webrtc.RTPTransceiverDirectionRecvonly},
+	); err != nil {
+		t.Fatalf("add audio transceiver: %v", err)
 	}
 
 	offer, err := clientPC.CreateOffer(nil)
@@ -81,6 +88,9 @@ func TestAnswerAdvertisesNackPLI(t *testing.T) {
 	}
 	if !strings.Contains(sdp, "profile-level-id=42c02a") {
 		t.Errorf("answer não anuncia o profile-level-id=42c02a (Level 4.2/1080p)")
+	}
+	if !strings.Contains(sdp, "opus/48000/2") {
+		t.Errorf("answer não anuncia Opus estéreo para áudio")
 	}
 	for _, bad := range []string{"42001f", "42e01f", "4d001f", "64001f"} {
 		if strings.Contains(sdp, bad) {
@@ -141,11 +151,16 @@ func addPlayoutDelayExtmapForTest(sdp string) string {
 func disableCaptureForTest(t *testing.T) {
 	t.Helper()
 	old := newCapturer
+	oldAudio := newAudioCapturer
 	newCapturer = func(config.StreamConfig) streamCapturer {
 		return noopCapturer{}
 	}
+	newAudioCapturer = func() audioCapturer {
+		return noopAudioCapturer{}
+	}
 	t.Cleanup(func() {
 		newCapturer = old
+		newAudioCapturer = oldAudio
 	})
 }
 
@@ -156,3 +171,11 @@ func (noopCapturer) Start(context.Context) (io.ReadCloser, error) {
 }
 
 func (noopCapturer) Stop() {}
+
+type noopAudioCapturer struct{}
+
+func (noopAudioCapturer) Start(context.Context) (*audio.RTPStream, error) {
+	return nil, fmt.Errorf("audio disabled in test")
+}
+
+func (noopAudioCapturer) Stop() {}

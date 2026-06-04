@@ -9,10 +9,12 @@ import (
 	"time"
 
 	"github.com/pion/interceptor"
+	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
 	"github.com/pion/webrtc/v4/pkg/media/h264reader"
 
+	"tether/internal/audio"
 	"tether/internal/capture"
 	"tether/internal/config"
 	"tether/internal/input"
@@ -24,7 +26,9 @@ type Session struct {
 	pc       *webrtc.PeerConnection
 	cfg      config.StreamConfig
 	cap      streamCapturer
+	audioCap audioCapturer
 	injector input.Injector
+	input    inputStats
 	onClose  func()
 }
 
@@ -35,6 +39,15 @@ type streamCapturer interface {
 
 var newCapturer = func(cfg config.StreamConfig) streamCapturer {
 	return capture.New(cfg)
+}
+
+type audioCapturer interface {
+	Start(context.Context) (*audio.RTPStream, error)
+	Stop()
+}
+
+var newAudioCapturer = func() audioCapturer {
+	return audio.New()
 }
 
 // NewSession cria a peer connection, registra a track de vídeo e o data channel.
@@ -67,9 +80,21 @@ func NewSession(cfg config.StreamConfig, injector input.Injector, onClose func()
 		},
 		PayloadType: 102,
 	}
+	opusCodec := webrtc.RTPCodecParameters{
+		RTPCodecCapability: webrtc.RTPCodecCapability{
+			MimeType:    webrtc.MimeTypeOpus,
+			ClockRate:   48000,
+			Channels:    2,
+			SDPFmtpLine: "minptime=10;useinbandfec=0;stereo=1;sprop-stereo=1",
+		},
+		PayloadType: audio.RTPPayloadType,
+	}
 
 	m := &webrtc.MediaEngine{}
 	if err := m.RegisterCodec(h264Codec, webrtc.RTPCodecTypeVideo); err != nil {
+		return nil, err
+	}
+	if err := m.RegisterCodec(opusCodec, webrtc.RTPCodecTypeAudio); err != nil {
 		return nil, err
 	}
 	if err := m.RegisterHeaderExtension(
@@ -102,6 +127,14 @@ func NewSession(cfg config.StreamConfig, injector input.Injector, onClose func()
 		// Na LAN não precisamos de STUN/TURN; ICE resolve com candidatos locais.
 		ICEServers: []webrtc.ICEServer{},
 	})
+	if err != nil {
+		return nil, err
+	}
+	audioTrack, err := webrtc.NewTrackLocalStaticRTP(opusCodec.RTPCodecCapability, "audio", "tether-screen")
+	if err != nil {
+		return nil, err
+	}
+	audioSender, err := pc.AddTrack(audioTrack)
 	if err != nil {
 		return nil, err
 	}
@@ -145,6 +178,14 @@ func NewSession(cfg config.StreamConfig, injector input.Injector, onClose func()
 			}
 		}
 	}()
+	go func() {
+		buf := make([]byte, 1500)
+		for {
+			if _, _, rtcpErr := audioSender.Read(buf); rtcpErr != nil {
+				return
+			}
+		}
+	}()
 
 	// Pré-aquece a captura JÁ, em paralelo ao handshake WebRTC. O DXGI Desktop
 	// Duplication tem ~750ms de custo de inicialização (criar device, primeiro
@@ -158,6 +199,15 @@ func NewSession(cfg config.StreamConfig, injector input.Injector, onClose func()
 	} else {
 		go s.pumpVideo(stream, videoTrack)
 	}
+	s.audioCap = newAudioCapturer()
+	go func() {
+		audioStream, audioErr := s.audioCap.Start(context.Background())
+		if audioErr != nil {
+			log.Printf("[audio] captura indisponível: %v", audioErr)
+			return
+		}
+		s.pumpAudio(audioStream, audioTrack)
+	}()
 
 	// --- Data channel de input (negociado pelo client) ---
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
@@ -165,12 +215,15 @@ func NewSession(cfg config.StreamConfig, injector input.Injector, onClose func()
 			return
 		}
 		log.Println("[webrtc] data channel de input aberto")
+		s.input.lastNs.Store(time.Now().UnixNano())
+		stopInputLog := make(chan struct{})
+		go logInputStats(&s.input, stopInputLog)
+		dc.OnClose(func() {
+			close(stopInputLog)
+			log.Println("[webrtc] data channel de input fechado")
+		})
 		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-			var st input.GamepadState
-			if err := json.Unmarshal(msg.Data, &st); err != nil {
-				return
-			}
-			if err := s.injector.Apply(st); err != nil {
+			if err := s.handleInputMessage(msg.Data); err != nil {
 				log.Printf("[input] apply: %v", err)
 			}
 		})
@@ -194,6 +247,162 @@ func NewSession(cfg config.StreamConfig, injector input.Injector, onClose func()
 	})
 
 	return s, nil
+}
+
+func (s *Session) pumpAudio(stream *audio.RTPStream, track *webrtc.TrackLocalStaticRTP) {
+	defer stream.Close()
+
+	logTicker := time.NewTicker(time.Second)
+	defer logTicker.Stop()
+
+	var packets int64
+	var bytes int64
+	var maxGap time.Duration
+	var last time.Time
+
+	for {
+		raw, err := stream.ReadPacket()
+		if err != nil {
+			log.Printf("[audio] leitura RTP: %v", err)
+			return
+		}
+		var pkt rtp.Packet
+		if err := pkt.Unmarshal(raw); err != nil {
+			log.Printf("[audio] pacote RTP inválido: %v", err)
+			continue
+		}
+		if err := track.WriteRTP(&pkt); err != nil {
+			log.Printf("[audio] WriteRTP: %v", err)
+			return
+		}
+
+		now := time.Now()
+		if !last.IsZero() && now.Sub(last) > maxGap {
+			maxGap = now.Sub(last)
+		}
+		last = now
+		packets++
+		bytes += int64(len(raw))
+
+		select {
+		case <-logTicker.C:
+			log.Printf("[audio] enviados=%d pkt/s taxa=%d KB/s gapMax=%s", packets, bytes/1024, maxGap)
+			packets = 0
+			bytes = 0
+			maxGap = 0
+		default:
+		}
+	}
+}
+
+type inputWireMessage struct {
+	Type    string    `json:"type"`
+	Buttons []bool    `json:"buttons"`
+	Axes    []float64 `json:"axes"`
+	Code    string    `json:"code"`
+	Down    bool      `json:"down"`
+	Button  int       `json:"button"`
+	DX      int32     `json:"dx"`
+	DY      int32     `json:"dy"`
+	DeltaY  float64   `json:"deltaY"`
+}
+
+type inputStats struct {
+	gamepad atomic.Int64
+	key     atomic.Int64
+	mouse   atomic.Int64
+	wheel   atomic.Int64
+	lastNs  atomic.Int64
+}
+
+func (s *Session) handleInputMessage(raw []byte) error {
+	if s.injector == nil {
+		return nil
+	}
+
+	var msg inputWireMessage
+	if err := json.Unmarshal(raw, &msg); err != nil {
+		return err
+	}
+
+	switch msg.Type {
+	case "", "gamepad":
+		s.recordInput("gamepad")
+		return s.injector.Apply(input.GamepadState{Buttons: msg.Buttons, Axes: msg.Axes})
+	case "key":
+		s.recordInput("key")
+		return s.injector.Command(input.Command{
+			Type:   msg.Type,
+			Code:   msg.Code,
+			Down:   msg.Down,
+			Button: msg.Button,
+			DX:     msg.DX,
+			DY:     msg.DY,
+			DeltaY: msg.DeltaY,
+		})
+	case "mouseMove", "mouseButton":
+		s.recordInput("mouse")
+		return s.injector.Command(input.Command{
+			Type:   msg.Type,
+			Code:   msg.Code,
+			Down:   msg.Down,
+			Button: msg.Button,
+			DX:     msg.DX,
+			DY:     msg.DY,
+			DeltaY: msg.DeltaY,
+		})
+	case "wheel":
+		s.recordInput("wheel")
+		return s.injector.Command(input.Command{
+			Type:   msg.Type,
+			Code:   msg.Code,
+			Down:   msg.Down,
+			Button: msg.Button,
+			DX:     msg.DX,
+			DY:     msg.DY,
+			DeltaY: msg.DeltaY,
+		})
+	default:
+		return nil
+	}
+}
+
+func (s *Session) recordInput(kind string) {
+	now := time.Now().UnixNano()
+	s.input.lastNs.Store(now)
+	switch kind {
+	case "gamepad":
+		s.input.gamepad.Add(1)
+	case "key":
+		s.input.key.Add(1)
+	case "mouse":
+		s.input.mouse.Add(1)
+	case "wheel":
+		s.input.wheel.Add(1)
+	}
+}
+
+func logInputStats(stats *inputStats, stop <-chan struct{}) {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			gamepad := stats.gamepad.Swap(0)
+			key := stats.key.Swap(0)
+			mouse := stats.mouse.Swap(0)
+			wheel := stats.wheel.Swap(0)
+			lastNs := stats.lastNs.Load()
+			idle := time.Duration(0)
+			if lastNs > 0 {
+				idle = time.Since(time.Unix(0, lastNs))
+			}
+			log.Printf("[input] gamepad=%d/s key=%d/s mouse=%d/s wheel=%d/s idle=%s", gamepad, key, mouse, wheel, idle.Round(time.Millisecond))
+		case <-stop:
+			return
+		}
+	}
 }
 
 // Tipos de NAL relevantes para o agrupamento por access unit (H.264).
@@ -451,6 +660,9 @@ func (s *Session) HandleOffer(offer webrtc.SessionDescription) (webrtc.SessionDe
 func (s *Session) Close() {
 	if s.cap != nil {
 		s.cap.Stop()
+	}
+	if s.audioCap != nil {
+		s.audioCap.Stop()
 	}
 	if s.pc != nil {
 		_ = s.pc.Close()
