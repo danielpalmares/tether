@@ -12,20 +12,17 @@ type StreamConfig struct {
 
 // Default retorna uma config sensata para a LAN.
 //
-// 1080p60 @ 12Mbps. A 60fps cada frame chega 2x mais rápido, então o atraso
-// real de playout (medido em nº de frames bufferizados pelo player Tizen) cai
-// pela metade em tempo absoluto vs. 30fps — alavanca direta sobre o delay
-// percebido sem perder resolução. O bitrate sobe de 8 para 12Mbps porque a
-// 60fps há o dobro de frames dividindo o orçamento de bits; 12Mbps mantém a
-// qualidade por frame e ainda deixa folga no Wi-Fi (longe dos ~20Mbps que
-// saturam e fragmentam keyframes em excesso). GOP curto (em capture.go) mantém
-// os keyframes pequenos o bastante para resistir à perda de pacote.
+// Perfil padrão para TV browser: 1080p60 @ 8Mbps.
+//
+// Mantém Full HD para TV 4K, mas reduz o bitrate em relação a 12Mbps para aliviar
+// o decoder/browser da TV e diminuir bursts de pacotes em cenas complexas. O
+// ganho principal para input lag continua sendo preservar 60 frames/s.
 func Default() StreamConfig {
 	return StreamConfig{
 		Width:   1920,
 		Height:  1080,
 		FPS:     60,
-		Bitrate: 12000,
+		Bitrate: 8000,
 		Codec:   "h264",
 		Display: 0,
 	}

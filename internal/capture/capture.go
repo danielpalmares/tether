@@ -136,10 +136,10 @@ func (c *Capturer) startFFmpeg(ctx context.Context, mode pipelineMode) (*bufio.R
 }
 
 func (c *Capturer) ffmpegArgs(mode pipelineMode) []string {
-	// GOP de dois segundos: reduz os bursts de IDR que aparecem como gaps de
-	// 40-70ms no receiver da TV. Na LAN, NACK cobre perda pontual sem exigir um
-	// keyframe por segundo.
-	gop := fmt.Sprintf("%d", c.cfg.FPS*2)
+	// GOP de um segundo: mantém pontos de recuperação frequentes para o decoder
+	// da TV sem esperar demais por um IDR quando um frame de referência degrada.
+	// O bitrate padrão menor mantém o burst do keyframe controlado.
+	gop := fmt.Sprintf("%d", c.cfg.FPS)
 	if c.cfg.FPS == 0 {
 		gop = "60"
 	}

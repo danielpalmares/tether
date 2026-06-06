@@ -100,8 +100,9 @@ func TestAnswerAdvertisesNackPLI(t *testing.T) {
 	}
 }
 
-func TestAnswerOmitsVideoNackByDefault(t *testing.T) {
+func TestAnswerOmitsVideoNackWhenDisabled(t *testing.T) {
 	disableCaptureForTest(t)
+	t.Setenv("TETHER_VIDEO_NACK", "0")
 
 	clientPC, err := webrtc.NewPeerConnection(webrtc.Configuration{})
 	if err != nil {
@@ -141,7 +142,7 @@ func TestAnswerOmitsVideoNackByDefault(t *testing.T) {
 	}
 
 	if strings.Contains(answer.SDP, "nack") {
-		t.Fatalf("answer SDP should omit video NACK by default:\n%s", answer.SDP)
+		t.Fatalf("answer SDP should omit video NACK when disabled:\n%s", answer.SDP)
 	}
 	if !strings.Contains(answer.SDP, playoutDelayExtensionURI) {
 		t.Errorf("answer SDP não negocia playout-delay")

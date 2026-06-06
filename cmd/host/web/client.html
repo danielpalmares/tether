@@ -144,14 +144,20 @@ const log=(m,c='')=>{const e=document.getElementById('log'),l=document.createEle
 
 let hostAddr=null, padIndex=null, pc=null, dc=null, inputTimer=null, remoteVideoStream=null, remoteAudioStream=null, controlHandlers=null;
 let lastVideoStats=null;
+let lastDecodeProgressAt=0;
+let decoderStallLogged=false;
+let lastVideoReattachAt=0;
 let latencyHintLogged=false;
 let keysDown=new Set();
 const urlParams = new URLSearchParams(location.search);
-const audioMode = urlParams.has('audio') && !urlParams.has('noaudio');
+const audioMode = !urlParams.has('noaudio');
 const videoOnlyMode = !audioMode;
 
 function resetVideoStats(){
   lastVideoStats=null;
+  lastDecodeProgressAt=0;
+  decoderStallLogged=false;
+  lastVideoReattachAt=0;
 }
 
 function numberStat(report, field){
@@ -195,6 +201,14 @@ function perEmittedDelayMs(now, prev, delayField){
     if(delayDelta>=0 && emittedDelta>0) return delayDelta/emittedDelta*1000;
   }
   return now[delayField]/now.jitterBufferEmittedCount*1000;
+}
+
+function reattachVideoStream(){
+  const videoEl=document.getElementById('video');
+  if(!videoEl || !remoteVideoStream) return;
+  videoEl.srcObject=null;
+  videoEl.srcObject=remoteVideoStream;
+  videoEl.play().catch(e=>log('reattach de vídeo aguardando interação: '+e.message,'warn'));
 }
 
 /* ---------- 01 · vincular host ---------- */
@@ -487,9 +501,9 @@ function minimizeReceiverLatency(recv, shouldLog=false){
     const kind = recv.track.kind;
     // LAN local: alvo mínimo. jitterBufferTarget é em MILISSEGUNDOS (não segundos)
     // na spec do W3C — valores como 0.001 eram interpretados como 0 e deixavam o
-    // buffer no adaptativo (~160ms). Áudio precisa de uma folga mínima para não
-    // dar underrun a 20ms/pacote; vídeo pode ir ao chão.
-    const target = kind === 'audio' ? 40 : 0;
+    // buffer no adaptativo (~160ms). Áudio usa 20ms porque os pacotes Opus saem
+    // nesse ritmo; vídeo pode ir ao chão.
+    const target = kind === 'audio' ? 20 : 0;
     if ('jitterBufferTarget' in recv) {
       recv.jitterBufferTarget = target; applied.push('jitterBufferTarget');
     }
@@ -648,6 +662,26 @@ setInterval(async () => {
     const fps=nowStats.framesPerSecond!=null ? nowStats.framesPerSecond : decodedRate;
     if(fps!==null){
       parts.push('fps '+fps.toFixed(0));
+    }
+    const decodedDelta=counterDelta(nowStats, lastVideoStats, 'framesDecoded');
+    const receivedDelta=counterDelta(nowStats, lastVideoStats, 'framesReceived');
+    const wallNow=Date.now();
+    if(!lastVideoStats || decodedDelta>0){
+      lastDecodeProgressAt=wallNow;
+      decoderStallLogged=false;
+    } else if(receivedDelta>0 && lastDecodeProgressAt>0) {
+      const stallMs=wallNow-lastDecodeProgressAt;
+      if(stallMs>2500){
+        parts.push('decode stall '+(stallMs/1000).toFixed(0)+'s');
+        if(!decoderStallLogged){
+          log('decoder de vídeo sem avanço; tentando reanexar stream','warn');
+          decoderStallLogged=true;
+        }
+        if(stallMs>3000 && wallNow-lastVideoReattachAt>8000){
+          lastVideoReattachAt=wallNow;
+          reattachVideoStream();
+        }
+      }
     }
     if(nowStats.frameWidth && nowStats.frameHeight){
       parts.push(nowStats.frameWidth+'x'+nowStats.frameHeight);

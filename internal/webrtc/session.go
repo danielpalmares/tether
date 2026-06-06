@@ -102,9 +102,9 @@ func NewSession(cfg config.StreamConfig, injector input.Injector, onClose func()
 		return nil, err
 	}
 
-	// RTCP Reports. NACK genérico é opcional: em streaming interativo na LAN, a TV
-	// pode aumentar o jitter target para esperar retransmissões. O padrão aqui é
-	// não negociar NACK para priorizar input lag; TETHER_VIDEO_NACK=1 religa.
+	// RTCP Reports. NACK evita que uma perda pontual em frame de referência deixe
+	// o decoder da TV preso enquanto o áudio continua. Se algum firmware voltar a
+	// inflar o jitter target por causa de retransmissão, TETHER_VIDEO_NACK=0 desliga.
 	ir := &interceptor.Registry{}
 	if videoNack {
 		if err := webrtc.ConfigureNack(m, ir); err != nil {
@@ -258,10 +258,10 @@ func NewSession(cfg config.StreamConfig, injector input.Injector, onClose func()
 
 func videoNackEnabled() bool {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("TETHER_VIDEO_NACK"))) {
-	case "1", "true", "yes", "on":
-		return true
-	default:
+	case "0", "false", "no", "off":
 		return false
+	default:
+		return true
 	}
 }
 
