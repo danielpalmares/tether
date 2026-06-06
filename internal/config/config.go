@@ -67,29 +67,15 @@ func (c StreamConfig) Is4K() bool {
 	return c.Width >= 3840 || c.Height >= 2160
 }
 
+// H264GOPFrames e H264VBVBufferKbps delegam ao Tuning() — fonte única de verdade
+// para a derivação adaptativa. Mantidos como wrappers por compatibilidade dos
+// chamadores e logs existentes.
 func (c StreamConfig) H264GOPFrames() int {
-	c = c.Normalize()
-	gop := c.FPS
-	if gop <= 0 {
-		gop = 60
-	}
-	if c.Is4K() {
-		return gop * 2
-	}
-	return gop
+	return c.Tuning().GOPFrames
 }
 
 func (c StreamConfig) H264VBVBufferKbps() int {
-	c = c.Normalize()
-	divisor := 8
-	if c.Is4K() {
-		divisor = 16
-	}
-	buf := c.Bitrate / divisor
-	if buf <= 0 {
-		return c.Bitrate
-	}
-	return buf
+	return c.Tuning().VBVBufferKb
 }
 
 // Normalize preenche campos inválidos com o perfil padrão 1080p60.

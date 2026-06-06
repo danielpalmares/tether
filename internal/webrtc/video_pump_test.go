@@ -78,7 +78,7 @@ func TestWriteVideoFramesDoesNotBacklogBurst(t *testing.T) {
 	// em relação ao relógio de parede, todos devem sair quase imediatamente. Se o
 	// pacer estivesse dormindo frameDur por frame (o bug de 1s), levaria ~166ms.
 	start := time.Now()
-	if err := writeVideoFrames(frames, writer, frameDur, &stats); err != nil {
+	if err := writeVideoFrames(frames, writer, frameDur, frameDur/2, &stats); err != nil {
 		t.Fatalf("write frames: %v", err)
 	}
 	if elapsed := time.Since(start); elapsed > 5*frameDur {

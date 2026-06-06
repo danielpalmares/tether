@@ -89,16 +89,19 @@ func logPipeline(mode pipelineMode) {
 
 func logEncodingTuning(cfg config.StreamConfig) {
 	cfg = cfg.Normalize()
+	t := cfg.Tuning()
 	fmt.Fprintf(
 		os.Stderr,
-		"[capture] h264 %dx%d@%d %dkbps level=%s gop=%d vbv=%dk\n",
+		"[capture] h264 %dx%d@%d %dkbps level=%s gop=%d vbv=%dk surfaces=%d aq=%t\n",
 		cfg.Width,
 		cfg.Height,
 		cfg.FPS,
 		cfg.Bitrate,
-		cfg.H264Level(),
-		cfg.H264GOPFrames(),
-		cfg.H264VBVBufferKbps(),
+		t.Level,
+		t.GOPFrames,
+		t.VBVBufferKb,
+		t.Surfaces,
+		t.SpatialAQ,
 	)
 }
 
@@ -152,13 +155,16 @@ func (c *Capturer) startFFmpeg(ctx context.Context, mode pipelineMode) (*bufio.R
 }
 
 func (c *Capturer) ffmpegArgs(mode pipelineMode) []string {
-	gop := c.cfg.H264GOPFrames()
+	// Todos os ajustes finos vêm do TuningProfile adaptativo (função de
+	// bitrate × resolução × fps), não de constantes. Ver internal/config/tuning.go.
+	tune := c.cfg.Tuning()
+	gop := tune.GOPFrames
 
-	// VBV buffer mínimo. Quanto menor o bufsize,
-	// menos o encoder "guarda" antes de emitir — reduz a latência de saída do
-	// NVENC além de eliminar o ramp-up inicial. 4K usa um VBV ainda mais curto
-	// para impedir IDRs muito grandes em 40Mbps+.
-	bufsize := c.cfg.H264VBVBufferKbps()
+	// VBV em milissegundos de bitrate: janela temporal estável para o rate
+	// control AMORTIZAR o IDR ao longo de alguns frames em vez de despejá-lo num
+	// lote (a rajada periódica que inflava o jitter buffer da TV). Curto o
+	// bastante para manter a latência de saída baixa.
+	bufsize := tune.VBVBufferKb
 
 	input := fmt.Sprintf(
 		"ddagrab=output_idx=%d:framerate=%d:video_size=%dx%d:dup_frames=1",
@@ -201,8 +207,8 @@ func (c *Capturer) ffmpegArgs(mode pipelineMode) []string {
 		// imagem quando o stream diverge do profile/level anunciado no SDP.
 		// Baseline (sem CABAC, sem B-frames) é o denominador comum compatível.
 		"-profile:v", "baseline",
-		"-level", c.cfg.H264Level(),
-		"-rc", "cbr",
+		"-level", tune.Level,
+		"-rc", tune.RateControl,
 		"-b:v", fmt.Sprintf("%dk", c.cfg.Bitrate),
 		"-maxrate", fmt.Sprintf("%dk", c.cfg.Bitrate),
 		"-bufsize", fmt.Sprintf("%dk", bufsize),
@@ -210,7 +216,18 @@ func (c *Capturer) ffmpegArgs(mode pipelineMode) []string {
 		"-bf", "0", // sem B-frames (latência)
 		"-delay", "0", // sem reordenação/atraso de saída do encoder
 		"-rc-lookahead", "0", // NVENC não segura frames analisando o futuro
-		"-surfaces", "2", // limita a fila interna do NVENC
+		// surfaces escalado pela carga (pixels×fps). 2 fixas estrangulavam o
+		// pipeline em bitrate/resolução alto e geravam rajada de saída; mais
+		// surfaces suavizam a SAÍDA do encoder sem latência de reordenação
+		// (continuamos -bf 0 / -delay 0).
+		"-surfaces", fmt.Sprintf("%d", tune.Surfaces),
+		// spatial-aq: redistribui bits dentro do frame para regiões complexas,
+		// achatando os picos de tamanho que viram rajada em cenas movimentadas.
+		"-spatial-aq", boolFlag(tune.SpatialAQ),
+		// temporal-aq: redistribui bits ENTRE frames, suavizando o pico de
+		// tamanho do IDR (medido ~50% maior que o P-frame médio) — é o pico que
+		// estoura o gap de envio a cada keyframe.
+		"-temporal-aq", boolFlag(tune.TemporalAQ),
 		"-multipass", "disabled",
 		"-strict_gop", "1",
 		// zerolatency: desliga o atraso interno de 1 quadro do rate control do
@@ -237,6 +254,13 @@ func (c *Capturer) ffmpegArgs(mode pipelineMode) []string {
 	)
 
 	return args
+}
+
+func boolFlag(b bool) string {
+	if b {
+		return "1"
+	}
+	return "0"
 }
 
 // Stop encerra o FFmpeg.

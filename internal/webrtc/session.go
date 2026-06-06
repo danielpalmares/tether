@@ -508,11 +508,10 @@ const annexBStartCode = "\x00\x00\x00\x01"
 // do browser congela na primeira imagem. O Duration só pode ser contado uma vez
 // por frame, e todas as NALs do mesmo frame compartilham o mesmo timestamp.
 //
-// Pacing: o FFmpeg/ddagrab já entrega frames cadenciados em tempo real. O host
-// não deve dormir entre frames aqui; qualquer atraso artificial vira backlog e
-// empurra o jitter buffer do client. Mantemos só uma fila curta para absorver
-// travadas breves do writer RTP sem acumular latência silenciosa.
-const videoFrameQueueDepth = 2
+// Pacing: o FFmpeg/ddagrab entrega frames em RAJADA (gap de chegada medido
+// 28-72ms num alvo de 16.6ms). A profundidade da fila e o teto de hold do pacer
+// agora vêm do TuningProfile (config.Tuning), derivados do fps — regra única que
+// escala para todas as resoluções. Ver internal/config/tuning.go.
 
 type videoPumpStats struct {
 	readFrames      atomic.Int64
@@ -530,8 +529,9 @@ type videoPumpStats struct {
 func (s *Session) pumpVideo(stream io.ReadCloser, track sampleWriter) {
 	defer stream.Close()
 
+	tune := s.cfg.Tuning()
 	frameDur := time.Second / time.Duration(s.cfg.FPS)
-	frames := make(chan encodedFrame, videoFrameQueueDepth)
+	frames := make(chan encodedFrame, tune.FrameQueueDepth)
 	var stats videoPumpStats
 
 	go func() {
@@ -541,7 +541,7 @@ func (s *Session) pumpVideo(stream io.ReadCloser, track sampleWriter) {
 		}
 	}()
 
-	if err := writeVideoFrames(frames, track, frameDur, &stats); err != nil {
+	if err := writeVideoFrames(frames, track, frameDur, tune.PacerMaxHold, &stats); err != nil {
 		log.Printf("[video] WriteSample: %v", err)
 	}
 }
@@ -633,7 +633,7 @@ func readH264AccessUnits(stream io.Reader, frameDur time.Duration, out chan enco
 	}
 }
 
-func writeVideoFrames(frames <-chan encodedFrame, track sampleWriter, frameDur time.Duration, stats *videoPumpStats) error {
+func writeVideoFrames(frames <-chan encodedFrame, track sampleWriter, frameDur, maxHold time.Duration, stats *videoPumpStats) error {
 	logTicker := time.NewTicker(time.Second)
 	defer logTicker.Stop()
 
@@ -657,29 +657,24 @@ func writeVideoFrames(frames <-chan encodedFrame, track sampleWriter, frameDur t
 	}
 
 	// Anti-jitter de saída (NÃO é o pacing de atraso fixo de [[no-pacing-immediate-send]]):
-	// o caminho ddagrab(dup_frames)->hwdownload->NVENC entrega frames em RAJADA —
-	// metade chega <16ms (colados) e ~16% chega com gap 2-4x (medido: p50=8ms,
-	// p99=64ms). A TV vê essa irregularidade e dimensiona o jitter buffer pro pior
-	// caso (buf 200ms/tgt 150ms, com jit real de só 8ms). Suavizar a CHEGADA faz a
-	// TV relaxar o buffer.
+	// o ddagrab entrega frames com chegada irregular. O pacer SÓ apara frames que
+	// chegaram ADIANTADOS em relação ao relógio de saída, e por no máximo meio
+	// frameDur (maxHold). NUNCA impõe cadência — tentar impor cadência somava
+	// espera em cima do jitter natural do WriteSample (picos de ~50ms medidos) e
+	// PIOROU o engasgo, além de adicionar lag de input.
 	//
-	// A diferença crucial para o pacer que causou 1s de lag: aqui SÓ seguramos
-	// frames ADIANTADOS, e por no máximo um frame. Frame atrasado vai imediato e
-	// o relógio realinha ao agora — nunca acumula backlog. Latência adicionada em
-	// regime: zero quando o pipeline está em dia; no pior caso, < frameDur.
+	// Invariante anti-backlog: se a fila tem outros frames esperando (backlog>0),
+	// o pipeline está em rajada — drenamos imediato e realinhamos o relógio ao
+	// agora. Frame atrasado nunca espera. Latência adicionada em regime: zero
+	// quando em dia; no pior caso < maxHold (meio frame).
 	var nextSlot time.Time
-	maxHold := frameDur // nunca segura mais que um frame
 
 	paced := func(frame encodedFrame, backlog int) error {
 		now := time.Now()
 		if nextSlot.IsZero() {
 			nextSlot = now
 		}
-		// REGRA ANTI-BACKLOG: só suavizamos quando a fila está VAZIA (regime de
-		// tempo real, este é o último frame disponível). Se há outros frames
-		// esperando (backlog>0), o pipeline está atrasado/em rajada — drenamos
-		// imediato e realinhamos o relógio. Sem isto, segurar cada frame da rajada
-		// vira pacing puro e reintroduz o lag de [[no-pacing-immediate-send]].
+
 		wait := nextSlot.Sub(now)
 		if backlog == 0 && wait > 0 {
 			if wait > maxHold {
@@ -688,6 +683,7 @@ func writeVideoFrames(frames <-chan encodedFrame, track sampleWriter, frameDur t
 			time.Sleep(wait)
 			nextSlot = time.Now().Add(frameDur)
 		} else {
+			// Rajada (backlog>0) ou frame atrasado: vai imediato, relógio realinha.
 			nextSlot = now.Add(frameDur)
 		}
 		return send(frame)
@@ -751,8 +747,8 @@ func logVideoPumpStats(stats *videoPumpStats) {
 		return
 	}
 
-	log.Printf("[video] lidos=%d fps enviados=%d fps keyframes=%d taxa=%d KB/s frameMax=%d KB gapMax leitura/envio=%s/%s writeMax=%s filaMax=%d/%d filaBloqMax=%s",
-		read, sent, keyframes, bytes/1024, maxFrameBytes/1024, maxReadGap, maxSendGap, maxWrite, maxQueueDepth, videoFrameQueueDepth, maxQueueBlock)
+	log.Printf("[video] lidos=%d fps enviados=%d fps keyframes=%d taxa=%d KB/s frameMax=%d KB gapMax leitura/envio=%s/%s writeMax=%s filaPicoMax=%d filaBloqMax=%s",
+		read, sent, keyframes, bytes/1024, maxFrameBytes/1024, maxReadGap, maxSendGap, maxWrite, maxQueueDepth, maxQueueBlock)
 }
 
 // HandleOffer processa a SDP offer do client e devolve a answer.
