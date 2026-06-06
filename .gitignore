@@ -6,6 +6,11 @@
 *.so
 *.dylib
 
+# Backups com til (~) que o Windows cria ao substituir um .exe em execução
+# durante rebuild — não casam o padrão *.exe acima.
+*.exe~
+*~
+
 # Exceções: dependências distribuídas com o app DEVEM ser versionadas.
 !libs/*.exe
 
