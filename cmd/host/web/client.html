@@ -13,6 +13,19 @@
   }
   #stage.show { display: flex; }
   #stage video { width: 100%; height: 100%; object-fit: contain; }
+  html.streaming, body.streaming {
+    overflow: hidden;
+    scrollbar-width: none;
+    -ms-overflow-style: none;
+  }
+  html.streaming::-webkit-scrollbar,
+  body.streaming::-webkit-scrollbar {
+    display: none;
+    width: 0;
+    height: 0;
+  }
+  body.streaming::after { display: none; }
+  body.cursor-idle, body.cursor-idle * { cursor: none !important; }
   #stageHud {
     position: fixed; top: 14px; left: 14px; z-index: 501;
     display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
@@ -148,6 +161,7 @@ let lastDecodeProgressAt=0;
 let decoderStallLogged=false;
 let lastVideoReattachAt=0;
 let latencyHintLogged=false;
+let cursorIdleTimer=null;
 let keysDown=new Set();
 const urlParams = new URLSearchParams(location.search);
 const audioMode = !urlParams.has('noaudio');
@@ -209,6 +223,32 @@ function reattachVideoStream(){
   videoEl.srcObject=null;
   videoEl.srcObject=remoteVideoStream;
   videoEl.play().catch(e=>log('reattach de vídeo aguardando interação: '+e.message,'warn'));
+}
+
+function enterFullscreen(el){
+  const fn=el.requestFullscreen || el.webkitRequestFullscreen || el.msRequestFullscreen;
+  if(fn) Promise.resolve(fn.call(el)).catch(()=>{});
+}
+
+function leaveFullscreen(){
+  const fn=document.exitFullscreen || document.webkitExitFullscreen || document.msExitFullscreen;
+  if(fn && (document.fullscreenElement || document.webkitFullscreenElement || document.msFullscreenElement)){
+    Promise.resolve(fn.call(document)).catch(()=>{});
+  }
+}
+
+function wakeCursor(){
+  document.body.classList.remove('cursor-idle');
+  if(cursorIdleTimer) clearTimeout(cursorIdleTimer);
+  if(document.getElementById('stage').classList.contains('show')){
+    cursorIdleTimer=setTimeout(()=>document.body.classList.add('cursor-idle'), 3000);
+  }
+}
+
+function stopCursorAutoHide(){
+  if(cursorIdleTimer) clearTimeout(cursorIdleTimer);
+  cursorIdleTimer=null;
+  document.body.classList.remove('cursor-idle');
 }
 
 /* ---------- 01 · vincular host ---------- */
@@ -377,6 +417,8 @@ async function startStream(){
   latencyHintLogged=false;
   document.getElementById('audioState').textContent=videoOnlyMode ? 'sem áudio' : 'aud —';
   if(videoOnlyMode) log('modo baixa latência: vídeo sem áudio','warn');
+  enterFullscreen(document.documentElement);
+  wakeCursor();
 
   pc=new RTCPeerConnection({iceServers:[]});
   remoteVideoStream=new MediaStream();
@@ -397,8 +439,11 @@ async function startStream(){
     const recv=ev.receiver || (pc.getReceivers && pc.getReceivers().find(r => r.track === ev.track));
     minimizeReceiverLatency(recv, true);
 
+    document.documentElement.classList.add('streaming');
+    document.body.classList.add('streaming');
     document.getElementById('stage').classList.add('show');
     document.getElementById('stage').focus({preventScroll:true});
+    wakeCursor();
     if(ev.track.kind==='video'){
       if(!remoteVideoStream.getTracks().some(t=>t.id===ev.track.id)){
         remoteVideoStream.addTrack(ev.track);
@@ -543,6 +588,7 @@ function installControlCapture(){
   };
   const mousemove=e=>{
     if(!active()) return;
+    wakeCursor();
     if(document.pointerLockElement!==video && document.pointerLockElement!==stage) return;
     const dx=Math.trunc(e.movementX||0), dy=Math.trunc(e.movementY||0);
     if(dx||dy) sendCommand({type:'mouseMove', dx, dy});
@@ -550,6 +596,7 @@ function installControlCapture(){
   const mousedown=e=>{
     if(!active() || fromUi(e)) return;
     e.preventDefault();
+    wakeCursor();
     sendCommand({type:'mouseButton', button:e.button, down:true});
   };
   const mouseup=e=>{
@@ -564,6 +611,7 @@ function installControlCapture(){
   };
   const click=e=>{
     if(!active() || fromUi(e)) return;
+    wakeCursor();
     if(document.pointerLockElement!==video && video.requestPointerLock) video.requestPointerLock();
   };
   const contextmenu=e=>{ if(active()) e.preventDefault(); };
@@ -595,6 +643,7 @@ function uninstallControlCapture(){
   stage.removeEventListener('click', controlHandlers.click, true);
   stage.removeEventListener('contextmenu', controlHandlers.contextmenu, true);
   if(document.pointerLockElement && document.exitPointerLock) document.exitPointerLock();
+  stopCursorAutoHide();
   controlHandlers=null;
 }
 
@@ -619,11 +668,15 @@ function endStream(){
   }
   resetVideoStats();
   latencyHintLogged=false;
+  stopCursorAutoHide();
+  document.documentElement.classList.remove('streaming');
+  document.body.classList.remove('streaming');
   document.getElementById('stage').classList.remove('show');
   document.getElementById('video').srcObject=null;
   document.getElementById('audio').srcObject=null;
   document.getElementById('audioState').textContent='aud —';
   document.getElementById('linkState').textContent='offline';
+  leaveFullscreen();
   log('sessão encerrada','warn');
 }
 document.getElementById('stageExit').onclick = endStream;
