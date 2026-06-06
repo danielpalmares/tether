@@ -62,6 +62,36 @@ func (c StreamConfig) H264ProfileLevelID() string {
 	}
 }
 
+func (c StreamConfig) Is4K() bool {
+	c = c.Normalize()
+	return c.Width >= 3840 || c.Height >= 2160
+}
+
+func (c StreamConfig) H264GOPFrames() int {
+	c = c.Normalize()
+	gop := c.FPS
+	if gop <= 0 {
+		gop = 60
+	}
+	if c.Is4K() {
+		return gop * 2
+	}
+	return gop
+}
+
+func (c StreamConfig) H264VBVBufferKbps() int {
+	c = c.Normalize()
+	divisor := 8
+	if c.Is4K() {
+		divisor = 16
+	}
+	buf := c.Bitrate / divisor
+	if buf <= 0 {
+		return c.Bitrate
+	}
+	return buf
+}
+
 // Normalize preenche campos inválidos com o perfil padrão 1080p60.
 func (c StreamConfig) Normalize() StreamConfig {
 	d := Default()

@@ -519,6 +519,7 @@ type videoPumpStats struct {
 	sentFrames      atomic.Int64
 	keyframes       atomic.Int64
 	bytes           atomic.Int64
+	maxFrameBytes   atomic.Int64
 	maxReadGapNs    atomic.Int64
 	maxSendGapNs    atomic.Int64
 	maxWriteNs      atomic.Int64
@@ -573,6 +574,7 @@ func readH264AccessUnits(stream io.Reader, frameDur time.Duration, out chan enco
 		if stats != nil {
 			stats.readFrames.Add(1)
 			stats.bytes.Add(int64(len(frame.data)))
+			recordMaxInt(&stats.maxFrameBytes, int64(len(frame.data)))
 			if frame.keyframe {
 				stats.keyframes.Add(1)
 			}
@@ -738,6 +740,7 @@ func logVideoPumpStats(stats *videoPumpStats) {
 	sent := stats.sentFrames.Swap(0)
 	keyframes := stats.keyframes.Swap(0)
 	bytes := stats.bytes.Swap(0)
+	maxFrameBytes := stats.maxFrameBytes.Swap(0)
 	maxReadGap := time.Duration(stats.maxReadGapNs.Swap(0))
 	maxSendGap := time.Duration(stats.maxSendGapNs.Swap(0))
 	maxWrite := time.Duration(stats.maxWriteNs.Swap(0))
@@ -748,8 +751,8 @@ func logVideoPumpStats(stats *videoPumpStats) {
 		return
 	}
 
-	log.Printf("[video] lidos=%d fps enviados=%d fps keyframes=%d taxa=%d KB/s gapMax leitura/envio=%s/%s writeMax=%s filaMax=%d/%d filaBloqMax=%s",
-		read, sent, keyframes, bytes/1024, maxReadGap, maxSendGap, maxWrite, maxQueueDepth, videoFrameQueueDepth, maxQueueBlock)
+	log.Printf("[video] lidos=%d fps enviados=%d fps keyframes=%d taxa=%d KB/s frameMax=%d KB gapMax leitura/envio=%s/%s writeMax=%s filaMax=%d/%d filaBloqMax=%s",
+		read, sent, keyframes, bytes/1024, maxFrameBytes/1024, maxReadGap, maxSendGap, maxWrite, maxQueueDepth, videoFrameQueueDepth, maxQueueBlock)
 }
 
 // HandleOffer processa a SDP offer do client e devolve a answer.

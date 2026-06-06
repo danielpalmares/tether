@@ -45,6 +45,7 @@ func (c *Capturer) Start(ctx context.Context) (io.ReadCloser, error) {
 		if err == nil {
 			c.cmd = cmd
 			logPipeline(mode)
+			logEncodingTuning(c.cfg)
 			return &procReader{Reader: reader, c: c}, nil
 		}
 		lastErr = err
@@ -84,6 +85,21 @@ func logPipeline(mode pipelineMode) {
 	case pipelineCPU:
 		fmt.Fprintln(os.Stderr, "[capture] usando fallback hwdownload->CPU->NVENC")
 	}
+}
+
+func logEncodingTuning(cfg config.StreamConfig) {
+	cfg = cfg.Normalize()
+	fmt.Fprintf(
+		os.Stderr,
+		"[capture] h264 %dx%d@%d %dkbps level=%s gop=%d vbv=%dk\n",
+		cfg.Width,
+		cfg.Height,
+		cfg.FPS,
+		cfg.Bitrate,
+		cfg.H264Level(),
+		cfg.H264GOPFrames(),
+		cfg.H264VBVBufferKbps(),
+	)
 }
 
 func (c *Capturer) startFFmpeg(ctx context.Context, mode pipelineMode) (*bufio.Reader, *exec.Cmd, error) {
@@ -136,22 +152,13 @@ func (c *Capturer) startFFmpeg(ctx context.Context, mode pipelineMode) (*bufio.R
 }
 
 func (c *Capturer) ffmpegArgs(mode pipelineMode) []string {
-	// GOP de um segundo: mantém pontos de recuperação frequentes para o decoder
-	// da TV sem esperar demais por um IDR quando um frame de referência degrada.
-	// O bitrate padrão menor mantém o burst do keyframe controlado.
-	gop := fmt.Sprintf("%d", c.cfg.FPS)
-	if c.cfg.FPS == 0 {
-		gop = "60"
-	}
+	gop := c.cfg.H264GOPFrames()
 
-	// VBV buffer mínimo: ~1/8 de segundo de bitrate. Quanto menor o bufsize,
+	// VBV buffer mínimo. Quanto menor o bufsize,
 	// menos o encoder "guarda" antes de emitir — reduz a latência de saída do
-	// NVENC além de eliminar o ramp-up inicial. Em CBR low-latency na LAN, um
-	// buffer enxuto não compromete a qualidade perceptível.
-	bufsize := c.cfg.Bitrate / 8
-	if bufsize == 0 {
-		bufsize = c.cfg.Bitrate
-	}
+	// NVENC além de eliminar o ramp-up inicial. 4K usa um VBV ainda mais curto
+	// para impedir IDRs muito grandes em 40Mbps+.
+	bufsize := c.cfg.H264VBVBufferKbps()
 
 	input := fmt.Sprintf(
 		"ddagrab=output_idx=%d:framerate=%d:video_size=%dx%d:dup_frames=1",
@@ -199,7 +206,7 @@ func (c *Capturer) ffmpegArgs(mode pipelineMode) []string {
 		"-b:v", fmt.Sprintf("%dk", c.cfg.Bitrate),
 		"-maxrate", fmt.Sprintf("%dk", c.cfg.Bitrate),
 		"-bufsize", fmt.Sprintf("%dk", bufsize),
-		"-g", gop, // GOP de ~1s
+		"-g", fmt.Sprintf("%d", gop),
 		"-bf", "0", // sem B-frames (latência)
 		"-delay", "0", // sem reordenação/atraso de saída do encoder
 		"-rc-lookahead", "0", // NVENC não segura frames analisando o futuro

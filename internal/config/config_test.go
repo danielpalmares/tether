@@ -31,3 +31,21 @@ func TestH264ProfileLevelIDByResolution(t *testing.T) {
 		})
 	}
 }
+
+func TestH264LowLatencyTuningByResolution(t *testing.T) {
+	fullHD := StreamConfig{Width: 1920, Height: 1080, FPS: 60, Bitrate: 8000}
+	if got := fullHD.H264GOPFrames(); got != 60 {
+		t.Fatalf("1080p GOP = %d, want 60", got)
+	}
+	if got := fullHD.H264VBVBufferKbps(); got != 1000 {
+		t.Fatalf("1080p VBV = %d, want 1000", got)
+	}
+
+	fourK := StreamConfig{Width: 3840, Height: 2160, FPS: 60, Bitrate: 42000}
+	if got := fourK.H264GOPFrames(); got != 120 {
+		t.Fatalf("4K GOP = %d, want 120", got)
+	}
+	if got := fourK.H264VBVBufferKbps(); got != 2625 {
+		t.Fatalf("4K VBV = %d, want 2625", got)
+	}
+}

@@ -13,7 +13,9 @@ import (
 )
 
 const (
-	rtpOutboundMTU           = 1200
+	// LAN local sem TURN: 1350 reduz a quantidade de pacotes por frame 4K sem
+	// encostar no limite prático de MTU Ethernet depois dos cabeçalhos RTP/SRTP.
+	rtpOutboundMTU           = 1350
 	playoutDelayExtensionURI = "http://www.webrtc.org/experiments/rtp-hdrext/playout-delay"
 	// playout-delay extension = min_delay (12 bits) + max_delay (12 bits), unidade
 	// de 10ms. min=0, max=1 -> teto rígido de 10ms de playout.
