@@ -28,18 +28,55 @@ func Default() StreamConfig {
 	}
 }
 
+type ResolutionPreset struct {
+	Width  int
+	Height int
+}
+
+var ResolutionPresets = []ResolutionPreset{
+	{Width: 1920, Height: 1080},
+	{Width: 2560, Height: 1440},
+	{Width: 3840, Height: 2160},
+}
+
+func (c StreamConfig) H264Level() string {
+	c = c.Normalize()
+	switch {
+	case c.Width >= 3840 || c.Height >= 2160:
+		return "5.2"
+	case c.Width >= 2560 || c.Height >= 1440:
+		return "5.1"
+	default:
+		return "4.2"
+	}
+}
+
+func (c StreamConfig) H264ProfileLevelID() string {
+	switch c.H264Level() {
+	case "5.2":
+		return "42c034"
+	case "5.1":
+		return "42c033"
+	default:
+		return "42c02a"
+	}
+}
+
 // Normalize preenche campos inválidos com o perfil padrão 1080p60.
 func (c StreamConfig) Normalize() StreamConfig {
 	d := Default()
-	if c.Width <= 0 {
-		c.Width = d.Width
+	validResolution := false
+	for _, preset := range ResolutionPresets {
+		if c.Width == preset.Width && c.Height == preset.Height {
+			validResolution = true
+			break
+		}
 	}
-	if c.Height <= 0 {
+	if !validResolution {
+		c.Width = d.Width
 		c.Height = d.Height
 	}
-	if c.FPS <= 0 {
-		c.FPS = d.FPS
-	}
+	c.FPS = 60
 	if c.Bitrate <= 0 {
 		c.Bitrate = d.Bitrate
 	}

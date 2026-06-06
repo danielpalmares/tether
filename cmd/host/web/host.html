@@ -39,24 +39,22 @@
       <div class="field">
         <label>resolução</label>
         <div class="seg" id="resSeg">
-          <button data-w="1280" data-h="720">720p</button>
-          <button data-w="1920" data-h="1080" class="active">1080p</button>
-          <button data-w="2560" data-h="1440">1440p</button>
+          <button data-w="1920" data-h="1080" class="active">Full HD</button>
+          <button data-w="2560" data-h="1440">2K</button>
+          <button data-w="3840" data-h="2160">4K</button>
         </div>
       </div>
 
       <div class="field">
         <label>taxa de quadros <span class="val" id="fpsVal">60 fps</span></label>
         <div class="seg" id="fpsSeg">
-          <button data-fps="30">30</button>
-          <button data-fps="60" class="active">60</button>
-          <button data-fps="120">120</button>
+          <button class="active" disabled>60 FPS fixo</button>
         </div>
       </div>
 
       <div class="field">
-        <label>bitrate <span class="val" id="brVal">12 Mbps</span></label>
-        <input type="range" id="bitrate" min="4000" max="50000" step="1000" value="12000">
+        <label>bitrate <span class="val" id="brVal">8 Mbps</span></label>
+        <input type="range" id="bitrate" min="4000" max="50000" step="1000" value="8000">
       </div>
     </div>
 
@@ -86,8 +84,9 @@
       </div>
 
       <div class="hint" style="margin-top:14px">
-        Requer GPU NVIDIA + FFmpeg no PATH. O Steam Big Picture abre
-        automaticamente quando um client conecta.
+        Monitor de origem é qual tela do Windows será capturada. Alterar a
+        configuração durante uma live reinicia a sessão para aplicar o novo
+        perfil. Requer GPU NVIDIA + FFmpeg no PATH.
       </div>
     </div>
   </div>
@@ -110,17 +109,37 @@ const log = (msg, cls='') => {
   el.appendChild(ln); el.scrollTop = el.scrollHeight;
 };
 
-let cfg = { width:1920, height:1080, fps:60, bitrate:12000, codec:'h264', display:0 };
+let cfg = { width:1920, height:1080, fps:60, bitrate:8000, codec:'h264', display:0 };
+
+function setResolutionActive(width, height){
+  let matched=false;
+  document.querySelectorAll('#resSeg button').forEach(b => {
+    const active=(+b.dataset.w===width && +b.dataset.h===height);
+    b.classList.toggle('active', active);
+    if(active) matched=true;
+  });
+  if(!matched){
+    const fallback=document.querySelector('#resSeg button[data-w="1920"][data-h="1080"]');
+    if(fallback) fallback.classList.add('active');
+  }
+}
+
+function syncControls(){
+  cfg.fps=60;
+  setResolutionActive(cfg.width, cfg.height);
+  document.getElementById('fpsVal').textContent = '60 fps';
+  document.getElementById('brVal').textContent = (cfg.bitrate/1000).toFixed(0)+' Mbps';
+  br.value = cfg.bitrate;
+  document.getElementById('display').value = String(cfg.display || 0);
+}
 
 // segmented controls
 document.querySelectorAll('#resSeg button').forEach(b => b.onclick = () => {
   document.querySelectorAll('#resSeg button').forEach(x=>x.classList.remove('active'));
-  b.classList.add('active'); cfg.width=+b.dataset.w; cfg.height=+b.dataset.h;
-});
-document.querySelectorAll('#fpsSeg button').forEach(b => b.onclick = () => {
-  document.querySelectorAll('#fpsSeg button').forEach(x=>x.classList.remove('active'));
-  b.classList.add('active'); cfg.fps=+b.dataset.fps;
-  document.getElementById('fpsVal').textContent = cfg.fps + ' fps';
+  b.classList.add('active');
+  cfg.width=+b.dataset.w;
+  cfg.height=+b.dataset.h;
+  cfg.fps=60;
 });
 const br = document.getElementById('bitrate');
 br.oninput = () => {
@@ -131,8 +150,15 @@ document.getElementById('display').onchange = e => cfg.display = +e.target.value
 
 document.getElementById('saveBtn').onclick = async () => {
   try {
+    cfg.fps=60;
+    const before = await fetch('/api/info').then(r=>r.json()).catch(()=>({streaming:false}));
     const r = await fetch('/api/config', {method:'POST', body: JSON.stringify(cfg)});
-    if (r.ok) log('configuração salva · ' + cfg.width+'x'+cfg.height+' @'+cfg.fps+'fps', 'ok');
+    if (r.ok) {
+      cfg = await r.json();
+      syncControls();
+      log('configuração salva · ' + cfg.width+'x'+cfg.height+' @60fps · '+(cfg.bitrate/1000).toFixed(0)+' Mbps', 'ok');
+      if(before.streaming) log('live reiniciada para aplicar o novo perfil', 'warn');
+    }
     else log('falha ao salvar config', 'err');
   } catch(e){ log('erro: '+e.message, 'err'); }
 };
@@ -148,8 +174,7 @@ document.getElementById('saveBtn').onclick = async () => {
   try {
     const c = await (await fetch('/api/config')).json();
     cfg = c;
-    document.getElementById('brVal').textContent = (cfg.bitrate/1000).toFixed(0)+' Mbps';
-    br.value = cfg.bitrate;
+    syncControls();
     log('config carregada do host', 'ok');
   } catch(e){}
   document.getElementById('lanaddr').textContent = location.host;

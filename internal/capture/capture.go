@@ -187,15 +187,14 @@ func (c *Capturer) ffmpegArgs(mode pipelineMode) []string {
 		"-c:v", "h264_nvenc",
 		"-preset", "p1", // mais rápido
 		"-tune", "ull", // ultra low latency
-		// Constrained Baseline + Level 4.2: casa com o SDP (profile-level-id
-		// 42c02a — profile-iop 0xc0, medido no SPS via trace_headers) e comporta
-		// 1920x1080@60. NVENC por padrão emite Main profile
+		// Constrained Baseline + level compatível com a resolução: casa com o SDP
+		// (profile-level-id dinâmico; profile-iop 0xc0 medido no SPS via
+		// trace_headers). NVENC por padrão emite Main profile
 		// (CABAC); decoders rígidos de TV (Tizen/webOS/Android TV) travam na
 		// imagem quando o stream diverge do profile/level anunciado no SDP.
-		// Baseline (sem CABAC, sem B-frames) é o denominador comum compatível
-		// com qualquer hardware de TV. Level 4.2 cobre 1080p60 (3.1 só dá 720p).
+		// Baseline (sem CABAC, sem B-frames) é o denominador comum compatível.
 		"-profile:v", "baseline",
-		"-level", "4.2",
+		"-level", c.cfg.H264Level(),
 		"-rc", "cbr",
 		"-b:v", fmt.Sprintf("%dk", c.cfg.Bitrate),
 		"-maxrate", fmt.Sprintf("%dk", c.cfg.Bitrate),

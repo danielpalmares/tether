@@ -62,17 +62,21 @@ func NewSession(cfg config.StreamConfig, injector input.Injector, onClose func()
 	// Codec H264 ÚNICO do host, definido uma vez e reusado em RegisterCodec, na
 	// track e no SetCodecPreferences — os três PRECISAM ser idênticos byte a byte.
 	//
-	// 42c02a = profile_idc 0x42 (Baseline) + profile-iop 0xc0 + level 0x2a (4.2).
+	// profile-level-id dinâmico:
+	// 42c02a = Baseline + profile-iop 0xc0 + level 4.2 (1080p60)
+	// 42c033 = Baseline + profile-iop 0xc0 + level 5.1 (1440p60)
+	// 42c034 = Baseline + profile-iop 0xc0 + level 5.2 (2160p60)
 	// O profile-iop reflete os constraint_set flags reais do SPS do NVENC, medidos
 	// com trace_headers: constraint_set0=1, set1=1, set2=0 -> 0b11000000 = 0xc0.
 	// Decoders de TV (Samsung Tizen) configuram o pipeline pelo profile-level-id da
 	// SDP; se o SPS diverge — ou se a SDP anuncia um LEVEL menor que o bitstream —
 	// o decoder de hardware estoura e congela. Chrome/Android toleram; a TV não.
+	profileLevelID := cfg.H264ProfileLevelID()
 	h264Codec := webrtc.RTPCodecParameters{
 		RTPCodecCapability: webrtc.RTPCodecCapability{
 			MimeType:     webrtc.MimeTypeH264,
 			ClockRate:    90000,
-			SDPFmtpLine:  "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=42c02a",
+			SDPFmtpLine:  "level-asymmetry-allowed=1;packetization-mode=1;profile-level-id=" + profileLevelID,
 			RTCPFeedback: videoRTCPFeedback(videoNack),
 		},
 		PayloadType: 102,

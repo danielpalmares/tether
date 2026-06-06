@@ -155,13 +155,14 @@
 <script>
 const log=(m,c='')=>{const e=document.getElementById('log'),l=document.createElement('div');l.className='ln '+c;l.textContent=m;e.appendChild(l);e.scrollTop=e.scrollHeight;};
 
-let hostAddr=null, padIndex=null, pc=null, dc=null, inputTimer=null, remoteVideoStream=null, remoteAudioStream=null, controlHandlers=null;
+let hostAddr=null, padIndex=null, pc=null, dc=null, signalWs=null, inputTimer=null, reconnectTimer=null, remoteVideoStream=null, remoteAudioStream=null, controlHandlers=null;
 let lastVideoStats=null;
 let lastDecodeProgressAt=0;
 let decoderStallLogged=false;
 let lastVideoReattachAt=0;
 let latencyHintLogged=false;
 let cursorIdleTimer=null;
+let manualEnd=false;
 let keysDown=new Set();
 const urlParams = new URLSearchParams(location.search);
 const audioMode = !urlParams.has('noaudio');
@@ -411,6 +412,8 @@ document.getElementById('startBtn').onclick = startStream;
 
 async function startStream(){
   if(!hostAddr) return;
+  if(reconnectTimer){ clearTimeout(reconnectTimer); reconnectTimer=null; }
+  manualEnd=false;
   log('estabelecendo link webrtc...','warn');
   if(padIndex===null) log('iniciando sem controle (somente vídeo)','warn');
   resetVideoStats();
@@ -461,8 +464,13 @@ async function startStream(){
     }
   };
   pc.onconnectionstatechange = () => {
-    log('conexão: '+pc.connectionState, pc.connectionState==='connected'?'ok':'');
-    if(['failed','disconnected','closed'].includes(pc.connectionState)) endStream();
+    const state=pc ? pc.connectionState : 'closed';
+    log('conexão: '+state, state==='connected'?'ok':'');
+    if(['failed','disconnected','closed'].includes(state)){
+      const reconnect=!manualEnd && hostAddr && document.getElementById('stage').classList.contains('show');
+      endStream({manual:false});
+      if(reconnect) scheduleReconnect();
+    }
   };
 
   // precisa receber vídeo
@@ -480,17 +488,17 @@ async function startStream(){
   };
 
   // signaling via websocket
-  const ws=new WebSocket('ws://'+hostAddr+'/ws');
-  ws.onopen = async () => {
+  signalWs=new WebSocket('ws://'+hostAddr+'/ws');
+  signalWs.onopen = async () => {
     const offer=await pc.createOffer();
     offer.sdp=enablePlayoutDelayExtension(offer.sdp);
     await pc.setLocalDescription(offer);
     await new Promise(r=>{ if(pc.iceGatheringState==='complete')return r();
       pc.onicegatheringstatechange=()=>pc.iceGatheringState==='complete'&&r(); });
-    ws.send(JSON.stringify({type:'offer', data: pc.localDescription}));
+    signalWs.send(JSON.stringify({type:'offer', data: pc.localDescription}));
     log('offer enviada','ok');
   };
-  ws.onmessage = async ev => {
+  signalWs.onmessage = async ev => {
     const msg=JSON.parse(ev.data);
     if(msg.type==='answer'){
       await pc.setRemoteDescription(msg.data);
@@ -498,7 +506,16 @@ async function startStream(){
       log('answer recebida · handshake completo','ok');
     }
   };
-  ws.onerror = () => log('erro no signaling websocket','err');
+  signalWs.onerror = () => log('erro no signaling websocket','err');
+}
+
+function scheduleReconnect(){
+  if(reconnectTimer || manualEnd || !hostAddr) return;
+  log('stream reiniciando para aplicar nova configuração...','warn');
+  reconnectTimer=setTimeout(()=>{
+    reconnectTimer=null;
+    if(!manualEnd && hostAddr) startStream();
+  }, 1200);
 }
 
 function enablePlayoutDelayExtension(sdp){
@@ -652,12 +669,18 @@ function sendCommand(cmd){
   dc.send(JSON.stringify(cmd));
 }
 
-function endStream(){
+function endStream(opts={}){
+  const manual=!!opts.manual;
+  if(manual){
+    manualEnd=true;
+    if(reconnectTimer){ clearTimeout(reconnectTimer); reconnectTimer=null; }
+  }
   if(inputTimer) clearInterval(inputTimer);
   uninstallControlCapture();
   if(dc) dc.close();
   if(pc) pc.close();
-  pc=null; dc=null;
+  if(signalWs) signalWs.close();
+  pc=null; dc=null; signalWs=null;
   if(remoteVideoStream){
     remoteVideoStream.getTracks().forEach(t=>t.stop());
     remoteVideoStream=null;
@@ -679,7 +702,7 @@ function endStream(){
   leaveFullscreen();
   log('sessão encerrada','warn');
 }
-document.getElementById('stageExit').onclick = endStream;
+document.getElementById('stageExit').onclick = () => endStream({manual:true});
 
 // medição de RTT
 setInterval(async () => {

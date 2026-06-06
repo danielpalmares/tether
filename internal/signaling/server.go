@@ -69,12 +69,13 @@ func (s *Server) HandleSignal(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleOffer(conn *websocket.Conn, offer pionwebrtc.SessionDescription) {
 	s.mu.Lock()
-	if s.active != nil {
-		s.active.Close()
-		s.active = nil
-	}
+	old := s.active
+	s.active = nil
 	cfg := s.cfg
 	s.mu.Unlock()
+	if old != nil {
+		old.Close()
+	}
 
 	injector, err := input.NewInjector()
 	if err != nil {
@@ -82,8 +83,10 @@ func (s *Server) handleOffer(conn *websocket.Conn, offer pionwebrtc.SessionDescr
 		return
 	}
 
-	sess, err := webrtc.NewSession(cfg, injector, func() {
+	var sess *webrtc.Session
+	sess, err = webrtc.NewSession(cfg, injector, func() {
 		_ = injector.Close()
+		s.clearActive(sess)
 	})
 	if err != nil {
 		log.Printf("[signal] nova sessão: %v", err)
@@ -105,14 +108,21 @@ func (s *Server) handleOffer(conn *websocket.Conn, offer pionwebrtc.SessionDescr
 	_ = conn.WriteJSON(wsMsg{Type: "answer", Data: data})
 }
 
-// HandleConfig expõe GET/POST da config de streaming (usado pelo painel host).
-func (s *Server) HandleConfig(w http.ResponseWriter, r *http.Request) {
+func (s *Server) clearActive(sess *webrtc.Session) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.active == sess {
+		s.active = nil
+	}
+}
 
+// HandleConfig expõe GET/POST da config de streaming (usado pelo painel host).
+func (s *Server) HandleConfig(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	switch r.Method {
 	case http.MethodGet:
+		s.mu.Lock()
+		defer s.mu.Unlock()
 		_ = json.NewEncoder(w).Encode(s.cfg)
 	case http.MethodPost:
 		var c config.StreamConfig
@@ -120,8 +130,20 @@ func (s *Server) HandleConfig(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		s.cfg = c.Normalize()
-		_ = json.NewEncoder(w).Encode(s.cfg)
+		c = c.Normalize()
+		s.mu.Lock()
+		active := s.active
+		s.active = nil
+		s.cfg = c
+		s.mu.Unlock()
+
+		if active != nil {
+			log.Printf("[config] alterada para %dx%d@%dfps %dkbps; reiniciando live ativa", c.Width, c.Height, c.FPS, c.Bitrate)
+			active.Close()
+		} else {
+			log.Printf("[config] alterada para %dx%d@%dfps %dkbps", c.Width, c.Height, c.FPS, c.Bitrate)
+		}
+		_ = json.NewEncoder(w).Encode(c)
 	default:
 		http.Error(w, "método não permitido", http.StatusMethodNotAllowed)
 	}

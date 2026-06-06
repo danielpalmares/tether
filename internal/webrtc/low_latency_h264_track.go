@@ -168,10 +168,11 @@ func writePacketToBindings(pkt *rtp.Packet, bindings []lowLatencyTrackBinding) e
 }
 
 func findCodec(want pionwebrtc.RTPCodecCapability, codecs []pionwebrtc.RTPCodecParameters) (pionwebrtc.RTPCodecParameters, bool) {
+	wantProfile := profileLevelID(want.SDPFmtpLine)
 	for _, codec := range codecs {
 		if strings.EqualFold(codec.MimeType, want.MimeType) &&
 			codec.ClockRate == want.ClockRate &&
-			strings.Contains(codec.SDPFmtpLine, "profile-level-id=42c02a") {
+			(wantProfile == "" || strings.Contains(codec.SDPFmtpLine, "profile-level-id="+wantProfile)) {
 			return codec, true
 		}
 	}
@@ -181,6 +182,16 @@ func findCodec(want pionwebrtc.RTPCodecCapability, codecs []pionwebrtc.RTPCodecP
 		}
 	}
 	return pionwebrtc.RTPCodecParameters{}, false
+}
+
+func profileLevelID(fmtp string) string {
+	for _, part := range strings.Split(fmtp, ";") {
+		part = strings.TrimSpace(part)
+		if strings.HasPrefix(part, "profile-level-id=") {
+			return strings.TrimPrefix(part, "profile-level-id=")
+		}
+	}
+	return ""
 }
 
 func findHeaderExtensionID(headers []pionwebrtc.RTPHeaderExtensionParameter, uri string) uint8 {
