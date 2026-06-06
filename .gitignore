@@ -6,6 +6,12 @@
 *.so
 *.dylib
 
+# Exceções: dependências distribuídas com o app DEVEM ser versionadas.
+!libs/*.exe
+
+# --- Pacotes de distribuição (gerados ao publicar release) ---
+/dist/
+
 # --- Artefatos de teste/cobertura Go ---
 *.test
 *.out

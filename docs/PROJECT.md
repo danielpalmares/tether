@@ -146,6 +146,10 @@ Documentadas em detalhe na memória do agente; resumo:
 
 ## 8. Build & Run
 
+> **Instalação para usuário final e empacotamento de release:** ver
+> [`docs/INSTALL.md`](INSTALL.md) — inclui o instalador one-line, distribuição
+> do `.exe`, assinatura de código e passos para a landing page.
+
 ### Launcher automatizado (recomendado para o usuário final) — `launch.ps1`
 Valida e instala as dependências do sistema, depois sobe o host:
 ```powershell
