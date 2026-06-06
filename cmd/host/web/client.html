@@ -146,7 +146,9 @@ let hostAddr=null, padIndex=null, pc=null, dc=null, inputTimer=null, remoteVideo
 let lastVideoStats=null;
 let latencyHintLogged=false;
 let keysDown=new Set();
-const videoOnlyMode = new URLSearchParams(location.search).has('noaudio');
+const urlParams = new URLSearchParams(location.search);
+const audioMode = urlParams.has('audio') && !urlParams.has('noaudio');
+const videoOnlyMode = !audioMode;
 
 function resetVideoStats(){
   lastVideoStats=null;
@@ -359,7 +361,8 @@ async function startStream(){
   if(padIndex===null) log('iniciando sem controle (somente vídeo)','warn');
   resetVideoStats();
   latencyHintLogged=false;
-  if(videoOnlyMode) log('modo teste: vídeo sem áudio','warn');
+  document.getElementById('audioState').textContent=videoOnlyMode ? 'sem áudio' : 'aud —';
+  if(videoOnlyMode) log('modo baixa latência: vídeo sem áudio','warn');
 
   pc=new RTCPeerConnection({iceServers:[]});
   remoteVideoStream=new MediaStream();

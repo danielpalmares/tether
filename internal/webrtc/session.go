@@ -126,7 +126,7 @@ func NewSession(cfg config.StreamConfig, injector input.Injector, onClose func()
 	if err != nil {
 		return nil, err
 	}
-	audioTrack, err := webrtc.NewTrackLocalStaticRTP(opusCodec.RTPCodecCapability, "audio", "tether-screen")
+	audioTrack, err := webrtc.NewTrackLocalStaticRTP(opusCodec.RTPCodecCapability, "audio", "tether-audio")
 	if err != nil {
 		return nil, err
 	}
@@ -139,7 +139,7 @@ func NewSession(cfg config.StreamConfig, injector input.Injector, onClose func()
 
 	// --- Track de vídeo ---
 	// A track carrega o MESMO capability do codec registrado.
-	videoTrack := newLowLatencyH264Track(h264Codec.RTPCodecCapability, "video", "tether-screen")
+	videoTrack := newLowLatencyH264Track(h264Codec.RTPCodecCapability, "video", "tether-video")
 	rtpSender, err := pc.AddTrack(videoTrack)
 	if err != nil {
 		return nil, err
