@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gamepad Debug</title>
+<style>
+  body{ background:#0a0e12; color:#cfe; font:14px ui-monospace,monospace; margin:0; padding:20px; }
+  h1{ font-size:16px; color:#9eff5a; }
+  .id{ color:#7cf; word-break:break-all; }
+  .grid{ display:grid; grid-template-columns:repeat(auto-fill,minmax(120px,1fr)); gap:6px; margin:10px 0; }
+  .cell{ background:#121821; border:1px solid #243; border-radius:6px; padding:6px 8px; }
+  .cell.on{ background:#9eff5a; color:#001; border-color:#9eff5a; font-weight:700; }
+  .lbl{ opacity:.6; font-size:11px; }
+  .val{ font-size:15px; }
+  #snap{ margin-top:16px; width:100%; min-height:120px; background:#000; color:#9eff5a; border:1px solid #243; border-radius:8px; padding:10px; font:12px ui-monospace,monospace; }
+  button{ background:#1a2430; color:#cfe; border:1px solid #356; border-radius:6px; padding:10px 16px; font:14px monospace; cursor:pointer; margin-right:8px; }
+  .hint{ opacity:.7; margin:8px 0; }
+</style>
+</head>
+<body>
+<h1>Gamepad Debug — Tether</h1>
+<div class="hint">1. Conecte o controle e <b>aperte qualquer botão</b> para ele aparecer.<br>
+2. Aperte/mova as teclas que falham (RT, LT, Start, Back, L3, R3). As que acenderem em verde = detectadas.<br>
+3. Clique <b>"copiar snapshot"</b> e cole o resultado aqui no chat.</div>
+<div>Dispositivo: <span class="id" id="padId">— (aperte um botão) —</span></div>
+<div>Mapping: <b id="mapping">—</b> &middot; botões: <b id="nbtn">0</b> &middot; eixos: <b id="naxes">0</b></div>
+
+<h2 style="font-size:13px;color:#7cf">BOTÕES</h2>
+<div class="grid" id="btnGrid"></div>
+<h2 style="font-size:13px;color:#7cf">EIXOS</h2>
+<div class="grid" id="axGrid"></div>
+
+<div style="margin-top:14px">
+  <button id="copyBtn">copiar snapshot</button>
+  <button id="recBtn">gravar 5s de atividade</button>
+</div>
+<pre id="snap">— snapshot aparecerá aqui —</pre>
+
+<script>
+let padIndex=null;
+let activity={}; // registra valores extremos vistos por botão/eixo durante gravação
+let recording=false;
+
+window.addEventListener('gamepadconnected', e=>{ padIndex=e.gamepad.index; });
+window.addEventListener('gamepaddisconnected', ()=>{ padIndex=null; });
+
+function el(t,c){ const e=document.createElement('div'); e.className=c; return e; }
+
+function render(gp){
+  document.getElementById('padId').textContent=gp.id;
+  document.getElementById('mapping').textContent=gp.mapping||'(vazio = não-standard)';
+  document.getElementById('nbtn').textContent=gp.buttons.length;
+  document.getElementById('naxes').textContent=gp.axes.length;
+
+  const bg=document.getElementById('btnGrid');
+  if(bg.children.length!==gp.buttons.length){
+    bg.innerHTML='';
+    gp.buttons.forEach((_,i)=>{ const c=el('cell',''); c.id='b'+i; c.innerHTML='<div class="lbl">botão '+i+'</div><div class="val">0.00</div>'; bg.appendChild(c); });
+  }
+  gp.buttons.forEach((b,i)=>{
+    const c=document.getElementById('b'+i);
+    c.classList.toggle('on', b.pressed||b.value>0.5);
+    c.querySelector('.val').textContent=b.value.toFixed(2);
+    if(recording){ activity['b'+i]=Math.max(activity['b'+i]||0, b.value); }
+  });
+
+  const ag=document.getElementById('axGrid');
+  if(ag.children.length!==gp.axes.length){
+    ag.innerHTML='';
+    gp.axes.forEach((_,i)=>{ const c=el('cell',''); c.id='a'+i; c.innerHTML='<div class="lbl">eixo '+i+'</div><div class="val">0.00</div>'; ag.appendChild(c); });
+  }
+  gp.axes.forEach((v,i)=>{
+    const c=document.getElementById('a'+i);
+    c.classList.toggle('on', Math.abs(v)>0.5);
+    c.querySelector('.val').textContent=v.toFixed(2);
+    if(recording){
+      const a=activity['a'+i]||{min:0,max:0};
+      a.min=Math.min(a.min,v); a.max=Math.max(a.max,v); activity['a'+i]=a;
+    }
+  });
+}
+
+function loop(){
+  const gp=padIndex!==null ? navigator.getGamepads()[padIndex] : null;
+  if(gp) render(gp);
+  requestAnimationFrame(loop);
+}
+loop();
+
+document.getElementById('copyBtn').onclick=()=>{
+  const gp=padIndex!==null ? navigator.getGamepads()[padIndex] : null;
+  if(!gp){ document.getElementById('snap').textContent='nenhum controle — aperte um botão'; return; }
+  const snap={
+    id:gp.id, mapping:gp.mapping, buttons:gp.buttons.length, axes:gp.axes.length,
+    buttonValues:gp.buttons.map(b=>+b.value.toFixed(2)),
+    axisValues:gp.axes.map(v=>+v.toFixed(2)),
+    activityDuringRecording:activity
+  };
+  const txt=JSON.stringify(snap,null,2);
+  document.getElementById('snap').textContent=txt;
+  if(navigator.clipboard) navigator.clipboard.writeText(txt).catch(()=>{});
+};
+
+document.getElementById('recBtn').onclick=()=>{
+  activity={}; recording=true;
+  document.getElementById('recBtn').textContent='GRAVANDO… aperte as teclas';
+  setTimeout(()=>{
+    recording=false;
+    document.getElementById('recBtn').textContent='gravar 5s de atividade';
+    const txt=JSON.stringify({note:'valores extremos vistos durante a gravação', activity},null,2);
+    document.getElementById('snap').textContent=txt;
+    if(navigator.clipboard) navigator.clipboard.writeText(txt).catch(()=>{});
+  },5000);
+};
+</script>
+</body>
+</html>

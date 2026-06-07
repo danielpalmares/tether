@@ -517,7 +517,7 @@ function normalizePadProfile(profile){
   for(let i=0;i<buttons.length;i++){
     const src=profile.buttons[i];
     if(!src || !Number.isInteger(src.index) || src.index<0) continue;
-    if(src.type==='button') buttons[i]={type:'button', index:src.index};
+    if(src.type==='button') buttons[i]={type:'button', index:src.index, rest:finiteNumber(src.rest, 0)};
     else if(src.type==='axis') buttons[i]={
       type:'axis',
       index:src.index,
@@ -584,9 +584,13 @@ function mapGamepad(gp){
   padProfile.buttons.forEach((src,slot)=>{
     if(!src) return;
     if(src.type==='button' && gp.buttons[src.index]){
-      const value=clamp(finiteNumber(gp.buttons[src.index].value, 0), 0, 1);
+      const raw=clamp(finiteNumber(gp.buttons[src.index].value, 0), 0, 1);
+      const rest=finiteNumber(src.rest, 0);
+      // valor relativo ao repouso: repousa baixo -> aciona alto; repousa alto -> aciona baixo
+      const value = rest>=0.5 ? clamp((rest-raw)/Math.max(0.001,rest), 0, 1)
+                              : clamp((raw-rest)/Math.max(0.001,1-rest), 0, 1);
       out.values[slot]=value;
-      out.buttons[slot]=gp.buttons[src.index].pressed || value>0.5;
+      out.buttons[slot]=value>0.5;
     } else if(src.type==='axis' && src.index<gp.axes.length){
       const value=axisButtonValue(gp, src);
       out.values[slot]=value;
@@ -870,6 +874,7 @@ function captureStepInput(signal, skipSignal){
     // auto-capturado e fazia o passo "pular sozinho" (RT/LT/Start/Back/L3/R3
     // pareciam não detectar porque o ruído avançava o passo antes do toque).
     let axisCand=-1, axisCandFrames=0, axisCandDir=0;
+    let btnCand=-1, btnCandFrames=0;
     const insp=document.getElementById('calibInspector');
     const tick=()=>{
       if(signal.cancelled){ finish(reject, new Error('cancelado')); return; }
@@ -884,12 +889,26 @@ function captureStepInput(signal, skipSignal){
         insp.textContent='botões: '+(ab.join(' ')||'—')+'\neixos:  '+(aa.join(' ')||'—');
       }
 
-      // PRIORIDADE 1: botão digital/analógico (gatilho que sobe partindo do repouso).
-      // CALIB_BUTTON_OFF compara com o BASELINE do botão (não com 0): cobre
-      // gatilho que repousa em valor != 0.
-      for(let i=0;i<gp.buttons.length;i++){
-        const v=gp.buttons[i].value, base=baseBtn[i]||0;
-        if(v>CALIB_BUTTON_ON && v-base>0.4){ finish(resolve, {type:'button', index:i}); return; }
+      // PRIORIDADE 1: botão cuja LEITURA MUDOU de forma significativa em relação
+      // ao baseline, sustentada por alguns frames. Detecta tanto o botão normal
+      // (repousa em 0, vai a 1) quanto o que repousa ALTO e é pressionado/solto
+      // (alguns gamepads reportam gatilhos/botões em repouso != 0) — antes a
+      // condição "v-base>0.4" exigia subir do repouso e por isso esses botões
+      // (RT/LT/Start/Back/L3/R3 deste controle) nunca avançavam o passo.
+      {
+        let bBest=-1, bDelta=0.4;
+        for(let i=0;i<gp.buttons.length;i++){
+          const d=Math.abs((gp.buttons[i].value)-(baseBtn[i]||0));
+          if(d>bDelta){ bDelta=d; bBest=i; }
+        }
+        if(bBest>=0){
+          if(bBest===btnCand){ btnCandFrames++; }
+          else { btnCand=bBest; btnCandFrames=1; }
+          if(btnCandFrames>=2){
+            // grava o repouso (baseline) p/ o mapGamepad saber qual extremo é "pressionado"
+            finish(resolve, {type:'button', index:bBest, rest:finiteNumber(baseBtn[bBest], 0)}); return;
+          }
+        } else { btnCand=-1; btnCandFrames=0; }
       }
       // PRIORIDADE 2: eixo sustentado (gatilho/HAT como eixo). Exige >=3 frames
       // no mesmo eixo e direção para não capturar drift momentâneo.
@@ -940,7 +959,10 @@ function waitInputReleased(src, signal){
       if(!gp){ resolve(); return; }
       let released=true;
       if(src.type==='button'){
-        released=!gp.buttons[src.index] || gp.buttons[src.index].value<CALIB_BUTTON_OFF;
+        // "solto" = voltou para perto do repouso capturado (cobre botão que
+        // repousa alto, onde "solto" é valor ALTO, não baixo)
+        const v=gp.buttons[src.index] ? gp.buttons[src.index].value : 0;
+        released=Math.abs(v-finiteNumber(src.rest,0))<0.3;
       } else if(src.type==='axis'){
         released=Math.abs(finiteNumber(gp.axes[src.index], 0)-finiteNumber(src.rest, 0))<0.25;
       }
