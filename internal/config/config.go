@@ -1,5 +1,11 @@
 package config
 
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+)
+
 // StreamConfig guarda as configurações de streaming definidas no painel do host.
 type StreamConfig struct {
 	Width   int    `json:"width"`
@@ -103,4 +109,49 @@ func (c StreamConfig) Normalize() StreamConfig {
 		c.Display = d.Display
 	}
 	return c
+}
+
+// Path retorna o caminho do arquivo de persistência da config.
+//
+// Prioriza %APPDATA%\tether\config.json (Windows) / ~/.config/tether/config.json;
+// se o diretório do usuário for inacessível, usa config.json ao lado do executável.
+func Path() string {
+	if dir, err := os.UserConfigDir(); err == nil && dir != "" {
+		return filepath.Join(dir, "tether", "config.json")
+	}
+	if exe, err := os.Executable(); err == nil {
+		return filepath.Join(filepath.Dir(exe), "config.json")
+	}
+	return "config.json"
+}
+
+// Load lê a config do disco. Se o arquivo não existir ou for inválido, retorna
+// o Default() normalizado — nunca falha o boot do host por config corrompida.
+func Load(path string) (StreamConfig, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return Default(), err
+	}
+	var c StreamConfig
+	if err := json.Unmarshal(raw, &c); err != nil {
+		return Default(), err
+	}
+	return c.Normalize(), nil
+}
+
+// Save grava a config no disco (cria o diretório se necessário), de forma
+// atômica via arquivo temporário + rename para não corromper em caso de crash.
+func Save(path string, c StreamConfig) error {
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+	data, err := json.MarshalIndent(c.Normalize(), "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
 }

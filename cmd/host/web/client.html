@@ -40,8 +40,152 @@
     display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
     max-width: calc(100% - 180px);
   }
-  #stageExit {
-    position: fixed; top: 14px; right: 14px; z-index: 501; width: auto; padding: 10px 18px;
+  /* menu de 3 pontos (substitui os botões soltos do HUD)
+     z-index acima do #vpad (505) — senão os controles do gamepad virtual
+     interceptam o toque nos itens do menu (bug: só "stats" clicava) */
+  #stageMenuWrap { position: fixed; top: 14px; right: 14px; z-index: 560; }
+  #stageMenuBtn {
+    width: 46px; height: 46px; padding: 0; border-radius: 12px;
+    display: flex; align-items: center; justify-content: center; font-size: 22px; line-height: 1;
+  }
+  #stageMenu {
+    position: absolute; top: 54px; right: 0; min-width: 248px;
+    background: color-mix(in srgb, var(--bg-2) 94%, #000);
+    border: 1px solid var(--line-2); border-radius: 12px;
+    box-shadow: 0 12px 34px rgba(0,0,0,.55); backdrop-filter: blur(8px);
+    padding: 8px; display: none; flex-direction: column; gap: 4px;
+    /* em celular deitado a altura é curta: limita e rola se faltar espaço */
+    max-height: calc(100vh - 68px); overflow-y: auto;
+  }
+  #stageMenu.open { display: flex; }
+  .menu-item {
+    display: flex; align-items: center; gap: 10px; width: 100%;
+    padding: 11px 12px; border-radius: 8px; cursor: pointer;
+    background: transparent; border: 1px solid transparent;
+    color: var(--txt); font: 13px var(--mono); text-align: left;
+  }
+  .menu-item:hover, .menu-item:focus-visible { background: color-mix(in srgb, var(--acid) 12%, transparent); border-color: var(--line-2); }
+  .menu-item .mi-ico { width: 18px; text-align: center; opacity: .85; }
+  .menu-item .mi-state { margin-left: auto; font-size: 11px; color: var(--txt-dim); letter-spacing: .5px; }
+  .menu-item.on .mi-state { color: var(--acid); }
+  .menu-item.danger { color: #e87a6f; }
+  .menu-item.danger:hover { background: color-mix(in srgb, #e05a4f 16%, transparent); border-color: #e05a4f; }
+  .menu-sep { height: 1px; background: var(--line); margin: 5px 4px; }
+  .menu-row { padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
+  .menu-row .mr-head { display: flex; align-items: center; gap: 10px; font: 13px var(--mono); color: var(--txt); }
+  .menu-row .mr-head .mr-val { margin-left: auto; font-size: 11px; color: var(--acid); }
+  .menu-row input[type=range] { width: 100%; accent-color: var(--acid); }
+  /* HUD de stats oculto: o jogo fica limpo */
+  #stageHud.hud-hidden { display: none; }
+
+  /* ===== controle Xbox virtual (touch) sobre o stream ===== */
+  #vpad {
+    position: fixed; inset: 0; z-index: 505; display: none;
+    pointer-events: none; /* só os controles capturam toque; o resto deixa passar */
+    touch-action: none; user-select: none; -webkit-user-select: none;
+    --vpad-opacity: 0.85; /* ajustável pelo slider do menu */
+    opacity: var(--vpad-opacity);
+  }
+  #vpad.show { display: block; }
+  #vpad * { pointer-events: auto; touch-action: none; }
+  /* o nub é puramente visual: não deve roubar o ponteiro do stick (causava
+     leitura de coordenada errada -> analógico "preso" numa direção) */
+  #vpad .nub { pointer-events: none; }
+  /* zona inferior segura, longe do conteúdo central do jogo */
+  .vp-cluster {
+    position: absolute; bottom: max(24px, env(safe-area-inset-bottom));
+    display: flex; align-items: flex-end; gap: 14px;
+  }
+  .vp-left  { left: max(24px, env(safe-area-inset-left)); }
+  .vp-right { right: max(24px, env(safe-area-inset-right)); flex-direction: row-reverse; }
+
+  /* analógicos */
+  .vp-stick {
+    position: relative; width: 124px; height: 124px; border-radius: 50%;
+    background: color-mix(in srgb, var(--bg-2) 78%, transparent);
+    border: 1.5px solid var(--line-2);
+    box-shadow: inset 0 0 22px rgba(0,0,0,.45);
+    backdrop-filter: blur(3px);
+  }
+  .vp-stick .nub {
+    position: absolute; left: 50%; top: 50%; width: 54px; height: 54px;
+    margin: -27px 0 0 -27px; border-radius: 50%;
+    background: color-mix(in srgb, var(--signal) 88%, #000);
+    border: 1.5px solid color-mix(in srgb, var(--acid) 60%, var(--line-2));
+    box-shadow: 0 3px 10px rgba(0,0,0,.5);
+    transition: transform .03s linear;
+  }
+  .vp-stick.active { border-color: var(--acid); }
+
+  /* d-pad */
+  .vp-dpad { position: relative; width: 132px; height: 132px; }
+  .vp-dpad .dbtn {
+    position: absolute; width: 44px; height: 44px;
+    display: flex; align-items: center; justify-content: center;
+    background: color-mix(in srgb, var(--bg-2) 80%, transparent);
+    border: 1.5px solid var(--line-2); color: var(--txt-dim);
+    backdrop-filter: blur(3px); font: 14px var(--mono);
+  }
+  .vp-dpad .dbtn.on { background: var(--acid); color: #001; border-color: var(--acid); }
+  .vp-dpad .du { top:0;    left:44px; border-radius: 8px 8px 0 0; }
+  .vp-dpad .dd { bottom:0; left:44px; border-radius: 0 0 8px 8px; }
+  .vp-dpad .dl { top:44px; left:0;    border-radius: 8px 0 0 8px; }
+  .vp-dpad .dr { top:44px; right:0;   border-radius: 0 8px 8px 0; }
+  .vp-dpad .dc { top:44px; left:44px; background: color-mix(in srgb, var(--bg-2) 60%, transparent); border-color: var(--line); }
+
+  /* botões de face ABXY */
+  .vp-face { position: relative; width: 150px; height: 150px; }
+  .vp-face .fbtn {
+    position: absolute; width: 50px; height: 50px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font: 700 18px var(--mono); color: var(--txt);
+    background: color-mix(in srgb, var(--bg-2) 80%, transparent);
+    border: 2px solid var(--line-2); backdrop-filter: blur(3px);
+  }
+  .vp-face .fbtn.on { transform: scale(.94); filter: brightness(1.5); }
+  .vp-face .fa { bottom:0;  left:50px; border-color:#6cc04a; color:#6cc04a; }
+  .vp-face .fb { top:50px;  right:0;   border-color:#e05a4f; color:#e05a4f; }
+  .vp-face .fx { top:50px;  left:0;    border-color:#3a8ee6; color:#3a8ee6; }
+  .vp-face .fy { top:0;     left:50px; border-color:#e0b13a; color:#e0b13a; }
+  .vp-face .fbtn.on.fa { background:#6cc04a; color:#001; }
+  .vp-face .fbtn.on.fb { background:#e05a4f; color:#100; }
+  .vp-face .fbtn.on.fx { background:#3a8ee6; color:#001; }
+  .vp-face .fbtn.on.fy { background:#e0b13a; color:#100; }
+
+  /* ombros e gatilhos (topo) */
+  .vp-shoulder { position: absolute; top: max(80px, calc(env(safe-area-inset-top) + 70px)); display: flex; gap: 10px; }
+  .vp-sl { left: max(24px, env(safe-area-inset-left)); }
+  /* desce os ombros direitos para não ficarem sob o botão de menu (⋮) */
+  .vp-sr { right: max(24px, env(safe-area-inset-right)); top: max(120px, calc(env(safe-area-inset-top) + 110px)); }
+  .vp-trig {
+    min-width: 64px; padding: 11px 0; text-align: center;
+    font: 700 13px var(--mono); color: var(--txt-dim);
+    background: color-mix(in srgb, var(--bg-2) 80%, transparent);
+    border: 1.5px solid var(--line-2); border-radius: 10px;
+    backdrop-filter: blur(3px);
+  }
+  .vp-trig.on { background: var(--acid); color:#001; border-color: var(--acid); }
+
+  /* meta: start/back centrais embaixo */
+  .vp-meta {
+    position: absolute; left: 50%; transform: translateX(-50%);
+    bottom: max(24px, env(safe-area-inset-bottom)); display: flex; gap: 16px;
+  }
+  .vp-meta .mbtn {
+    min-width: 56px; padding: 9px 0; text-align: center;
+    font: 700 11px var(--mono); letter-spacing:1px; color: var(--txt-dim);
+    background: color-mix(in srgb, var(--bg-2) 80%, transparent);
+    border: 1.5px solid var(--line-2); border-radius: 18px;
+    backdrop-filter: blur(3px);
+  }
+  .vp-meta .mbtn.on { background: var(--acid); color:#001; border-color: var(--acid); }
+
+  @media (max-width:720px){
+    .vp-stick{ width:104px; height:104px; } .vp-stick .nub{ width:46px; height:46px; margin:-23px 0 0 -23px; }
+    .vp-face{ width:130px; height:130px; } .vp-face .fbtn{ width:44px; height:44px; }
+    .vp-dpad{ width:114px; height:114px; } .vp-dpad .dbtn{ width:38px; height:38px; }
+    .vp-dpad .du,.vp-dpad .dd{ left:38px; } .vp-dpad .dl,.vp-dpad .dc{ top:38px; }
+    .vp-dpad .dc{ left:38px; } .vp-dpad .dr{ top:38px; }
   }
 
   /* gamepad tester */
@@ -187,8 +331,38 @@
       </svg>
       <div class="pad-status" id="padStatus">
         <div><span class="k">DISPOSITIVO</span> &middot; <span class="v off" id="padName">nenhum detectado</span></div>
-        <div class="hint" style="margin-top:10px">Conecte um controle Xbox e pressione qualquer botão para ativá-lo.</div>
+        <div class="hint" style="margin-top:10px">Conecte um controle e pressione qualquer botão. Controles genéricos podem ser calibrados abaixo.</div>
+        <div id="calibRow" style="margin-top:14px; display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+          <button class="btn" id="calibBtn" style="width:auto; padding:8px 14px" disabled>calibrar controle</button>
+          <button class="btn" id="calibClearBtn" style="width:auto; padding:8px 14px; display:none" title="Remover perfil salvo">limpar perfil</button>
+          <span class="hint" id="calibState" style="margin:0"></span>
+        </div>
       </div>
+    </div>
+  </div>
+
+  <!-- overlay de calibração de controle genérico -->
+  <div id="calibOverlay" style="display:none; position:fixed; inset:0; z-index:700;
+       background:rgba(0,0,0,.86); align-items:center; justify-content:center;">
+    <div style="max-width:420px; width:90%; background:var(--bg-2); border:1px solid var(--line-2);
+         border-radius:14px; padding:26px; text-align:center;">
+      <div class="hdr" style="justify-content:center">calibrar controle</div>
+      <div style="font:13px var(--mono,monospace); color:var(--txt-dim); margin:6px 0 20px">
+        Pressione no seu controle o botão/direção indicado. Pule o que não tiver.
+      </div>
+      <div id="calibPrompt" style="font:700 26px var(--mono,monospace); color:var(--acid); margin:10px 0">—</div>
+      <div id="calibProgress" class="hint" style="margin-bottom:20px">0 / 0</div>
+      <div style="display:flex; gap:10px; justify-content:center;">
+        <button class="btn" id="calibSkip" style="width:auto; padding:9px 16px">pular</button>
+        <button class="btn" id="calibCancel" style="width:auto; padding:9px 16px">cancelar</button>
+      </div>
+      <div class="hint" style="margin-top:16px">Dica: deixe os sticks/gatilhos em repouso entre os passos.</div>
+      <div id="calibInspector" style="margin-top:14px; font:10px var(--mono,monospace); color:var(--txt-dim);
+           text-align:left; white-space:pre-wrap; max-height:90px; overflow:auto; display:none;
+           border-top:1px solid var(--line); padding-top:10px"></div>
+      <div id="calibLogBox" style="margin-top:8px; font:10px var(--mono,monospace); color:var(--acid);
+           text-align:left; white-space:pre-wrap; max-height:90px; overflow:auto; display:none;
+           border-top:1px solid var(--line); padding-top:8px"></div>
     </div>
   </div>
 
@@ -215,13 +389,73 @@
     <span class="pill"><span class="dot" style="background:var(--cyan)"></span> <span id="hudRtt">— ms</span></span>
     <span class="pill"><span class="dot" style="background:var(--acid)"></span> <span id="audioState">aud —</span></span>
   </div>
-  <button class="btn" id="stageExit">⛒ encerrar</button>
+  <div id="stageMenuWrap">
+    <button class="btn" id="stageMenuBtn" title="Menu" aria-haspopup="true" aria-expanded="false">⋮</button>
+    <div id="stageMenu" role="menu">
+      <button class="menu-item on" id="toggleStats" role="menuitemcheckbox">
+        <span class="mi-ico">📊</span> estatísticas <span class="mi-state">EXIBINDO</span>
+      </button>
+      <button class="menu-item" id="toggleVpad" role="menuitemcheckbox">
+        <span class="mi-ico">🎮</span> controle na tela <span class="mi-state">OCULTO</span>
+      </button>
+      <div class="menu-row" id="opacityRow">
+        <div class="mr-head"><span class="mi-ico">🌓</span> transparência <span class="mr-val" id="opacityVal">85%</span></div>
+        <input type="range" id="opacityRange" min="20" max="100" step="5" value="85">
+      </div>
+      <div class="menu-sep"></div>
+      <button class="menu-item danger" id="stageExit" role="menuitem">
+        <span class="mi-ico">⛒</span> encerrar sessão
+      </button>
+    </div>
+  </div>
+
+  <!-- controle Xbox virtual (touch) -->
+  <div id="vpad" aria-hidden="true">
+    <!-- ombros / gatilhos -->
+    <div class="vp-shoulder vp-sl">
+      <div class="vp-trig" data-vbtn="4">LB</div>
+      <div class="vp-trig" data-vtrig="6">LT</div>
+    </div>
+    <div class="vp-shoulder vp-sr">
+      <div class="vp-trig" data-vtrig="7">RT</div>
+      <div class="vp-trig" data-vbtn="5">RB</div>
+    </div>
+
+    <!-- start / back -->
+    <div class="vp-meta">
+      <div class="mbtn" data-vbtn="8">BACK</div>
+      <div class="mbtn" data-vbtn="9">START</div>
+    </div>
+
+    <!-- canto esquerdo: stick L + d-pad -->
+    <div class="vp-cluster vp-left">
+      <div class="vp-stick" data-vstick="L"><div class="nub"></div></div>
+      <div class="vp-dpad">
+        <div class="dbtn du" data-vbtn="12">▲</div>
+        <div class="dbtn dl" data-vbtn="14">◀</div>
+        <div class="dbtn dc"></div>
+        <div class="dbtn dr" data-vbtn="15">▶</div>
+        <div class="dbtn dd" data-vbtn="13">▼</div>
+      </div>
+    </div>
+
+    <!-- canto direito: ABXY + stick R -->
+    <div class="vp-cluster vp-right">
+      <div class="vp-stick" data-vstick="R"><div class="nub"></div></div>
+      <div class="vp-face">
+        <div class="fbtn fy" data-vbtn="3">Y</div>
+        <div class="fbtn fx" data-vbtn="2">X</div>
+        <div class="fbtn fb" data-vbtn="1">B</div>
+        <div class="fbtn fa" data-vbtn="0">A</div>
+      </div>
+    </div>
+  </div>
 </div>
 
 <script>
 const log=(m,c='')=>{const e=document.getElementById('log'),l=document.createElement('div');l.className='ln '+c;l.textContent=m;e.appendChild(l);e.scrollTop=e.scrollHeight;};
 
-let hostAddr=null, padIndex=null, pc=null, dc=null, signalWs=null, inputTimer=null, reconnectTimer=null, remoteVideoStream=null, remoteAudioStream=null, controlHandlers=null;
+let hostAddr=null, padIndex=null, padId=null, padStandard=false, pc=null, dc=null, signalWs=null, inputTimer=null, reconnectTimer=null, remoteVideoStream=null, remoteAudioStream=null, controlHandlers=null;
 let lastVideoStats=null;
 let lastDecodeProgressAt=0;
 let decoderStallLogged=false;
@@ -230,6 +464,216 @@ let latencyHintLogged=false;
 let cursorIdleTimer=null;
 let manualEnd=false;
 let keysDown=new Set();
+let calibActive=false;
+const padKeyDown=new Set();
+let padKeyDirtyUntil=0;
+
+// estado do controle Xbox virtual (touch). buttons[0..16] e axes[0..3]
+// espelham o layout padrão do navigator.getGamepads(); os gatilhos LT/RT
+// ficam em vButtonsVal[6]/[7] (valor analógico 0..1) — sendInput() já lê
+// gp.buttons[6/7].value, então o virtual replica essa estrutura.
+const vpadState = {
+  active:false,
+  buttons:new Array(17).fill(false),
+  trig:[0,0],          // [LT, RT] analógicos
+  axes:[0,0,0,0],      // LX, LY, RX, RY
+};
+let vpadHandlersInstalled=false;
+// Mapa global de pointers ativos: pointerId -> descritor do controle que ele
+// segura. DEVE ser declarado aqui no topo: resetVpadState()/setupStageMenu()
+// rodam na inicialização e o acessam — se ficasse mais abaixo, a TDZ do const
+// lançava "Cannot access 'vpadPointers' before initialization" e abortava todo
+// o setup do controle no boot.
+const vpadPointers = new Map(); // id -> {kind:'stick'|'btn'|'trig', ...}
+
+// ---- remapeamento de controle genérico ----
+// Navegadores reportam mapping="standard" só para controles reconhecidos. Um
+// controle genérico (que conecta "como Xbox" mas com layout de HID próprio) vem
+// com mapping="" e ordem de botões/eixos arbitrária — daí "as teclas ficam
+// erradas". A calibração na tela grava, por dispositivo, qual índice físico
+// corresponde a cada entrada do layout padrão; mapGamepad() traduz de volta.
+//
+// Slots de saída no layout STANDARD (índice = posição no array enviado ao host):
+//   botões 0..16: A B X Y LB RB LT RT Back Start L3 R3 DpadUp DpadDown DpadLeft DpadRight Guide
+//   eixos 0..3:   LX LY RX RY   (LT/RT vão como buttons[6/7].value -> axes[4/5])
+const STANDARD_BUTTON_SLOTS = [
+  ['A',0],['B',1],['X',2],['Y',3],['LB',4],['RB',5],['LT',6],['RT',7],
+  ['Back',8],['Start',9],['L3',10],['R3',11],
+  ['Dpad ↑',12],['Dpad ↓',13],['Dpad ←',14],['Dpad →',15],['Guide',16],
+];
+const STANDARD_AXIS_SLOTS = [
+  ['Stick Esq. → (eixo X)',0],['Stick Esq. ↓ (eixo Y)',1],
+  ['Stick Dir. → (eixo X)',2],['Stick Dir. ↓ (eixo Y)',3],
+];
+const AXIS_AS_BUTTON_SLOTS = new Set([6,7,12,13,14,15]); // LT/RT + D-pad, quando o HID expõe como eixo/HAT
+const PAD_PROFILE_VERSION = 1;
+const CALIB_BUTTON_ON = 0.6;
+const CALIB_BUTTON_OFF = 0.3;
+const CALIB_AXIS_DELTA = 0.55;
+let padProfile = null; // perfil ativo do controle conectado (ou null = standard)
+
+function padProfileKey(id){ return 'tether.padmap.'+(id||'').replace(/\s+/g,'_').slice(0,80); }
+
+function clamp(v,min,max){ return Math.max(min, Math.min(max, v)); }
+function finiteNumber(v, fallback=0){ return Number.isFinite(v) ? v : fallback; }
+function nowMs(){ return (typeof performance!=='undefined' && performance.now) ? performance.now() : Date.now(); }
+function setPadKeyDown(code, down){
+  if(!code) return;
+  if(down) padKeyDown.add(code);
+  else padKeyDown.delete(code);
+  padKeyDirtyUntil=nowMs()+140; // envia pelo menos um frame de soltura
+}
+function profileHasKeySources(profile=padProfile){
+  return profileButtonSources(profile).some(src=>src && src.type==='key' && src.code);
+}
+function isMappedPadKeyCode(code, profile=padProfile){
+  return !!(code && profileButtonSources(profile).some(src=>src && src.type==='key' && src.code===code));
+}
+function hasMappedPadKeyActivity(){
+  if(!profileHasKeySources()) return false;
+  for(const code of padKeyDown){ if(isMappedPadKeyCode(code)) return true; }
+  return nowMs()<padKeyDirtyUntil;
+}
+function keyEventCode(e){
+  if(!e) return '';
+  if(typeof e.code==='string' && e.code) return e.code;
+  if(typeof e.key==='string' && e.key) return 'key:'+e.key;
+  return '';
+}
+function keyEventLabel(e){ return (e && (e.code || e.key)) || 'tecla'; }
+function profileButtonSources(profile=padProfile){
+  if(!profile || !Array.isArray(profile.buttons)) return [];
+  const out=[];
+  profile.buttons.forEach(src=>{
+    if(Array.isArray(src)) src.forEach(s=>{ if(s) out.push(s); });
+    else if(src) out.push(src);
+  });
+  return out;
+}
+
+function normalizePadProfile(profile){
+  if(!profile || !Array.isArray(profile.buttons) || !Array.isArray(profile.axes)) return null;
+  const buttons=new Array(17).fill(null);
+  const axes=new Array(4).fill(null);
+  const normalizeButtonSource=src=>{
+    if(!src) return null;
+    if(src.type==='key' && typeof src.code==='string' && src.code){
+      return {type:'key', code:src.code, label:typeof src.label==='string' ? src.label : src.code};
+    }
+    if(!Number.isInteger(src.index) || src.index<0) return null;
+    if(src.type==='button') return {
+      type:'button',
+      index:src.index,
+      rest:finiteNumber(src.rest, 0),
+      restPressed:!!src.restPressed,
+    };
+    if(src.type==='axis') return {
+      type:'axis',
+      index:src.index,
+      dir:src.dir<0 ? -1 : 1,
+      rest:finiteNumber(src.rest, 0),
+    };
+    return null;
+  };
+  for(let i=0;i<buttons.length;i++){
+    const src=profile.buttons[i];
+    if(!src) continue;
+    if(Array.isArray(src)){
+      const list=src.map(normalizeButtonSource).filter(Boolean);
+      if(list.length) buttons[i]=list;
+    } else {
+      buttons[i]=normalizeButtonSource(src);
+    }
+  }
+  for(let i=0;i<axes.length;i++){
+    const src=profile.axes[i];
+    if(!src || !Number.isInteger(src.index) || src.index<0) continue;
+    axes[i]={
+      index:src.index,
+      invert:!!src.invert,
+      center:finiteNumber(src.center, 0),
+    };
+  }
+  return {version:PAD_PROFILE_VERSION, id:profile.id||'', buttons, axes};
+}
+
+function loadPadProfile(id){
+  try{ const raw=localStorage.getItem(padProfileKey(id)); return raw ? normalizePadProfile(JSON.parse(raw)) : null; }
+  catch(_){ return null; }
+}
+function savePadProfile(id, profile){
+  const normalized=normalizePadProfile(profile);
+  try{ if(normalized) localStorage.setItem(padProfileKey(id), JSON.stringify(normalized)); }catch(_){}
+}
+
+function axisButtonValue(gp, src){
+  const raw=finiteNumber(gp.axes[src.index], 0);
+  const rest=finiteNumber(src.rest, 0);
+  const span=src.dir>0 ? (1-rest) : (rest+1);
+  const moved=src.dir>0 ? (raw-rest) : (rest-raw);
+  return clamp(moved/Math.max(0.001, span), 0, 1);
+}
+
+function stickAxisValue(gp, src){
+  const center=finiteNumber(src.center, 0);
+  let delta=finiteNumber(gp.axes[src.index], 0)-center;
+  const span=delta>=0 ? (1-center) : (center+1);
+  let v=delta/Math.max(0.001, span);
+  if(src.invert) v=-v;
+  return clamp(v, -1, 1);
+}
+function mappedButtonSourceValue(gp, src){
+  if(!src) return 0;
+  if(src.type==='key') return padKeyDown.has(src.code) ? 1 : 0;
+  if(src.type==='button' && gp && gp.buttons[src.index]){
+    const btn=gp.buttons[src.index];
+    const raw=clamp(finiteNumber(btn.value, 0), 0, 1);
+    const rest=finiteNumber(src.rest, 0);
+    let value = rest>=0.5 ? clamp((rest-raw)/Math.max(0.001,rest), 0, 1)
+                          : clamp((raw-rest)/Math.max(0.001,1-rest), 0, 1);
+    if((!!btn.pressed)!==!!src.restPressed) value=Math.max(value, 1);
+    return value;
+  }
+  if(src.type==='axis' && gp && src.index<gp.axes.length) return axisButtonValue(gp, src);
+  return 0;
+}
+
+// Traduz um Gamepad para o layout standard {buttons:bool[17], values:num[17], axes:num[6]}.
+// Sem perfil + mapping standard -> passa direto. Sem perfil + não-standard ->
+// também passa direto (melhor esforço), mas a UI avisa para calibrar.
+function mapGamepad(gp){
+  const out = { buttons:new Array(17).fill(false), values:new Array(17).fill(0), axes:[0,0,0,0,0,0] };
+  if(!gp && !padProfile) return out;
+
+  if(!padProfile){
+    // direto (standard ou melhor-esforço)
+    for(let i=0;i<17 && i<gp.buttons.length;i++){
+      out.buttons[i]=gp.buttons[i].pressed; out.values[i]=gp.buttons[i].value;
+    }
+    out.axes=[gp.axes[0]||0,gp.axes[1]||0,gp.axes[2]||0,gp.axes[3]||0,
+              gp.buttons[6]?gp.buttons[6].value:0, gp.buttons[7]?gp.buttons[7].value:0];
+    return out;
+  }
+
+  // com perfil: cada slot diz de onde vem (botão físico, ou eixo físico c/ direção)
+  padProfile.buttons.forEach((src,slot)=>{
+    if(!src) return;
+    const sources=Array.isArray(src) ? src : [src];
+    let value=0;
+    sources.forEach(source=>{ value=Math.max(value, mappedButtonSourceValue(gp, source)); });
+    out.values[slot]=value;
+    out.buttons[slot]=value>0.5;
+  });
+  // eixos analógicos dos sticks
+  padProfile.axes.forEach((src,slot)=>{
+    if(!src) return;
+    if(gp && src.index<gp.axes.length) out.axes[slot]=stickAxisValue(gp, src);
+  });
+  // gatilhos analógicos -> axes[4]/[5] a partir dos slots LT(6)/RT(7)
+  out.axes[4]=out.values[6]; out.axes[5]=out.values[7];
+  return out;
+}
+
 const urlParams = new URLSearchParams(location.search);
 const audioMode = !urlParams.has('noaudio');
 const videoOnlyMode = !audioMode;
@@ -435,17 +879,470 @@ async function autoDiscoverHosts(){
 /* ---------- 02 · gamepad ---------- */
 window.addEventListener('gamepadconnected', e => {
   padIndex=e.gamepad.index;
+  padId=e.gamepad.id;
+  padStandard=e.gamepad.mapping==='standard';
+  padKeyDown.clear();
+  padKeyDirtyUntil=0;
   document.getElementById('padName').textContent=e.gamepad.id.slice(0,28);
   document.getElementById('padName').className='v';
-  log('controle conectado: '+e.gamepad.id.slice(0,40),'ok');
+  // carrega perfil salvo p/ este controle; se não houver e o mapping não é
+  // "standard", avisa que pode precisar calibrar (teclas podem vir trocadas).
+  padProfile=loadPadProfile(padId);
+  if(padProfile){
+    log('controle conectado: '+e.gamepad.id.slice(0,40)+' (perfil calibrado)','ok');
+  } else if(!padStandard){
+    log('controle genérico detectado — botões podem vir trocados. Use "calibrar controle".','warn');
+  } else {
+    log('controle conectado: '+e.gamepad.id.slice(0,40),'ok');
+  }
+  updateCalibUi();
   refreshReady();
 });
-window.addEventListener('gamepaddisconnected', () => {
-  padIndex=null;
+window.addEventListener('gamepaddisconnected', e => {
+  if(padIndex!==null && e.gamepad.index!==padIndex) return;
+  padIndex=null; padId=null; padStandard=false; padProfile=null;
+  padKeyDown.clear();
+  padKeyDirtyUntil=0;
   document.getElementById('padName').textContent='nenhum detectado';
   document.getElementById('padName').className='v off';
+  updateCalibUi();
   refreshReady();
 });
+
+/* ---------- calibração de controle genérico ---------- */
+function updateCalibUi(){
+  const btn=document.getElementById('calibBtn');
+  const clr=document.getElementById('calibClearBtn');
+  const st=document.getElementById('calibState');
+  if(!btn) return;
+  const connected = padIndex!==null;
+  btn.disabled = !connected || calibActive;
+  clr.style.display = (connected && padProfile) ? '' : 'none';
+  st.textContent = !connected ? '' : (padProfile ? '✓ perfil calibrado ativo' : (padStandard ? 'layout padrão' : 'sem perfil calibrado'));
+  st.style.color = padProfile ? 'var(--acid)' : 'var(--txt-mute)';
+}
+
+// captura uma única entrada física: resolve com {type,index,dir,rest}
+// quando o usuário pressiona um botão, move um eixo ou clica em "pular".
+// Re-resolve o gamepad a cada leitura: no celular (controle Bluetooth) o índice
+// e o próprio array de getGamepads() podem oscilar entre frames. Procuramos pelo
+// id quando o índice falha, em vez de abortar a calibração.
+function currentPad(){
+  const pads=navigator.getGamepads ? navigator.getGamepads() : [];
+  if(padIndex!==null && pads[padIndex]) return pads[padIndex];
+  for(const p of pads){ if(p && (!padId || p.id===padId)){ padIndex=p.index; return p; } }
+  return null;
+}
+
+let padKeyTrackerInstalled=false;
+function installPadKeyTracker(){
+  if(padKeyTrackerInstalled) return;
+  const keydown=e=>{
+    const code=keyEventCode(e);
+    if(!code) return;
+    if(!calibActive && !isMappedPadKeyCode(code)) return;
+    setPadKeyDown(code, true);
+    e.preventDefault();
+  };
+  const keyup=e=>{
+    const code=keyEventCode(e);
+    if(!code) return;
+    if(!calibActive && !isMappedPadKeyCode(code)) return;
+    setPadKeyDown(code, false);
+    e.preventDefault();
+  };
+  window.addEventListener('keydown', keydown, true);
+  window.addEventListener('keyup', keyup, true);
+  padKeyTrackerInstalled=true;
+}
+installPadKeyTracker();
+
+function sourceKey(src){
+  if(!src) return '';
+  if(src.type==='button') return 'button:'+src.index;
+  if(src.type==='axis') return 'axis:'+src.index+':'+(src.dir<0?-1:1);
+  if(src.type==='key') return 'key:'+src.code;
+  return '';
+}
+function describeSource(src){
+  if(!src) return '—';
+  if(Array.isArray(src)) return src.map(describeSource).join(' + ');
+  if(src.type==='button') return 'btn '+src.index;
+  if(src.type==='axis') return 'eixo '+src.index+(src.dir<0?'−':'+');
+  if(src.type==='key') return 'tecla '+(src.label||src.code);
+  return '—';
+}
+function discoveredSummary(items, max=24){
+  if(!items || !items.length) return 'nenhuma entrada ainda';
+  const labels=items.map(describeSource);
+  const shown=labels.slice(0,max).join('  ');
+  return shown+(labels.length>max ? '  +'+(labels.length-max) : '');
+}
+function usedProfileAxisIndexes(profile){
+  const used=new Set();
+  if(profile && Array.isArray(profile.axes)){
+    profile.axes.forEach(src=>{ if(src && Number.isInteger(src.index)) used.add(src.index); });
+  }
+  return used;
+}
+
+function discoverPadInputs(signal, skipSignal, paint){
+  return new Promise((resolve,reject)=>{
+    const found=new Map();
+    let baseBtn=null, basePressed=null, baseAx=null;
+    let timer=null, done=false, frameCount=0, missing=0;
+    const add=src=>{
+      const k=sourceKey(src);
+      if(k && !found.has(k)){
+        found.set(k, src);
+      }
+    };
+    const finish=(fn,value)=>{
+      if(done) return;
+      done=true;
+      if(timer!==null) clearInterval(timer);
+      window.removeEventListener('keydown', keydown, true);
+      window.removeEventListener('keyup', keyup, true);
+      fn(value);
+    };
+    const keydown=e=>{
+      const code=keyEventCode(e);
+      if(!code || e.repeat) return;
+      e.preventDefault();
+      setPadKeyDown(code, true);
+      add({type:'key', code, label:keyEventLabel(e)});
+    };
+    const keyup=e=>{
+      const code=keyEventCode(e);
+      if(!code) return;
+      e.preventDefault();
+      setPadKeyDown(code, false);
+    };
+    window.addEventListener('keydown', keydown, true);
+    window.addEventListener('keyup', keyup, true);
+    const tick=()=>{
+      if(signal.cancelled){ finish(reject, new Error('cancelado')); return; }
+      if(skipSignal.skip){ finish(resolve, Array.from(found.values())); return; }
+      frameCount++;
+      const gp=currentPad();
+      if(gp){
+        missing=0;
+        if(!baseBtn){
+          baseBtn=gp.buttons.map(b=>b.value);
+          basePressed=gp.buttons.map(b=>!!b.pressed);
+          baseAx=gp.axes.slice();
+        }
+        for(let i=0;i<gp.buttons.length;i++){
+          const btn=gp.buttons[i];
+          const valueDelta=Math.abs(finiteNumber(btn.value,0)-finiteNumber(baseBtn[i],0));
+          const pressedChanged=(!!btn.pressed)!==(!!basePressed[i]);
+          if(pressedChanged || valueDelta>0.22){
+            add({type:'button', index:i, rest:finiteNumber(baseBtn[i],0), restPressed:!!basePressed[i]});
+          }
+        }
+        for(let i=0;i<gp.axes.length;i++){
+          const delta=finiteNumber(gp.axes[i],0)-finiteNumber(baseAx[i],0);
+          if(Math.abs(delta)>0.45){
+            add({type:'axis', index:i, dir:delta>0?1:-1, rest:finiteNumber(baseAx[i],0)});
+          }
+        }
+      } else {
+        missing++;
+      }
+      if(paint){
+        paint(
+          'descoberta: aperte os botões que quiser mapear e mova os sticks/gatilhos\n'+
+          'quando terminar, toque em "parar descoberta"\n'+
+          'frames:'+frameCount+'  sem leitura:'+missing+'\n'+
+          'entradas: '+discoveredSummary(Array.from(found.values())));
+      }
+    };
+    timer=setInterval(tick, 16);
+  });
+}
+
+function captureStepInput(signal, skipSignal, step, profile){
+  return new Promise((resolve,reject)=>{
+    const expectedKind=step.kind;
+    const allowAxisButton = expectedKind==='button' && AXIS_AS_BUTTON_SLOTS.has(step.slot);
+    const blockedButtonAxes = usedProfileAxisIndexes(profile);
+    let baseBtn=null, basePressed=null, baseAx=null; // baseline definido no 1º frame com leitura válida
+    let timer=null, done=false;
+    let keyCand='', keyCandFrames=0, keyCandLabel='';
+    const keydown=e=>{
+      const code=keyEventCode(e);
+      if(expectedKind!=='button' || !code || e.repeat) return;
+      e.preventDefault();
+      setPadKeyDown(code, true);
+      keyCand=code;
+      keyCandLabel=keyEventLabel(e);
+      keyCandFrames=1;
+    };
+    const keyup=e=>{
+      const code=keyEventCode(e);
+      if(expectedKind!=='button' || !code) return;
+      e.preventDefault();
+      setPadKeyDown(code, false);
+    };
+    window.addEventListener('keydown', keydown, true);
+    window.addEventListener('keyup', keyup, true);
+    // setInterval (não requestAnimationFrame): o rAF é PAUSADO/limitado em abas
+    // em segundo plano e em muitos navegadores de celular, o que congelava a
+    // calibração (inspetor preso em "aguardando…"). setInterval continua rodando.
+    const finish=(fn,value)=>{
+      if(done) return;
+      done=true;
+      if(timer!==null) clearInterval(timer);
+      window.removeEventListener('keydown', keydown, true);
+      window.removeEventListener('keyup', keyup, true);
+      fn(value);
+    };
+    // candidato de eixo precisa SE MANTER deslocado por vários frames: descarta
+    // drift/ruído instantâneo dos sticks de controles genéricos, que antes era
+    // auto-capturado e fazia o passo "pular sozinho" (RT/LT/Start/Back/L3/R3
+    // pareciam não detectar porque o ruído avançava o passo antes do toque).
+    let axisCand=-1, axisCandFrames=0, axisCandDir=0;
+    let btnCand=-1, btnCandFrames=0, frameCount=0;
+    const insp=document.getElementById('calibInspector');
+    let missing=0;
+    // atualiza a caixa do overlay TODO frame (inclusive sem leitura), para o
+    // diagnóstico no celular nunca ficar "congelado".
+    const paint=(extra)=>{ if(insp) insp.textContent=extra; };
+    const tick=()=>{
+      if(signal.cancelled){ finish(reject, new Error('cancelado')); return; }
+      if(skipSignal.skip){ finish(resolve, null); return; }
+      frameCount++;
+      const gp=currentPad();
+      if(!gp){
+        if(expectedKind==='button' && keyCand){
+          if(++keyCandFrames>=2){
+            finish(resolve, {type:'key', code:keyCand, label:keyCandLabel||keyCand}); return;
+          }
+        }
+        // tolera sumiço momentâneo (Bluetooth no celular pisca o array);
+        // só desiste após ~3s sem nenhuma leitura.
+        missing++;
+        paint('frames:'+frameCount+'  SEM LEITURA do controle ('+missing+')\n'+
+              'getGamepads: '+(navigator.getGamepads?navigator.getGamepads().length:'n/d')+' slots\n'+
+              'padIndex:'+padIndex+' padId:'+(padId||'?').slice(0,24));
+        if(missing>180){ finish(reject, new Error('controle não responde (sem leitura)')); return; }
+        return; // setInterval re-executa; não reagenda manualmente
+      }
+      missing=0;
+      if(!baseBtn){ baseBtn=gp.buttons.map(b=>b.value); basePressed=gp.buttons.map(b=>!!b.pressed); baseAx=gp.axes.slice(); }
+
+      // inspetor ao vivo: lista botões/eixos ativos + candidatos + frames.
+      {
+        const ab=[]; for(let i=0;i<gp.buttons.length;i++){ const v=gp.buttons[i].value; if(v>0.12 || gp.buttons[i].pressed) ab.push('b'+i+'='+v.toFixed(2)+(gp.buttons[i].pressed?'*':'')); }
+        const aa=[]; for(let i=0;i<gp.axes.length;i++){ const d=(gp.axes[i]||0)-(baseAx[i]||0); if(Math.abs(d)>0.12) aa.push('a'+i+'Δ'+d.toFixed(2)); }
+        paint(
+          'modo:'+(expectedKind==='axis'?'eixo':'botão')+(allowAxisButton?' (+eixo se gatilho/dpad)':'')+
+          '  frames:'+frameCount+' nbtn:'+gp.buttons.length+' nax:'+gp.axes.length+'\n'+
+          'btns ativos: '+(ab.join(' ')||'—')+'\n'+
+          'eixos mov.:  '+(aa.join(' ')||'—')+'\n'+
+          'tecla:       '+(keyCand||'—')+'\n'+
+          'cand btn:'+(btnCand>=0?('b'+btnCand+'×'+btnCandFrames):'—')+
+          '  cand eixo:'+(axisCand>=0?('a'+axisCand+'×'+axisCandFrames):'—')+
+          '  cand tecla:'+(keyCand?('×'+keyCandFrames):'—'));
+      }
+
+      // PRIORIDADE 1: botão cuja LEITURA MUDOU de forma significativa em relação
+      // ao baseline, sustentada por alguns frames. Detecta tanto o botão normal
+      // (repousa em 0, vai a 1) quanto o que repousa ALTO e é pressionado/solto
+      // (alguns gamepads reportam gatilhos/botões em repouso != 0) — antes a
+      // condição "v-base>0.4" exigia subir do repouso e por isso esses botões
+      // (RT/LT/Start/Back/L3/R3 deste controle) nunca avançavam o passo.
+      if(expectedKind==='button'){
+        let bBest=-1, bDelta=0.4;
+        const bSources=[];
+        for(let i=0;i<gp.buttons.length;i++){
+          const pressedChanged=(!!gp.buttons[i].pressed)!==(!!basePressed[i]);
+          const d=pressedChanged ? 1 : Math.abs((gp.buttons[i].value)-(baseBtn[i]||0));
+          if(d>0.4) bSources.push({type:'button', index:i, rest:finiteNumber(baseBtn[i], 0), restPressed:!!basePressed[i]});
+          if(d>bDelta){ bDelta=d; bBest=i; }
+        }
+        if(bBest>=0){
+          if(bBest===btnCand){ btnCandFrames++; }
+          else { btnCand=bBest; btnCandFrames=1; }
+          if(btnCandFrames>=2){
+            // grava o repouso (baseline) p/ o mapGamepad saber qual extremo é "pressionado"
+            const captured=bSources.slice();
+            if(keyCand) captured.push({type:'key', code:keyCand, label:keyCandLabel||keyCand});
+            finish(resolve, captured.length>1 ? captured : captured[0]); return;
+          }
+        } else { btnCand=-1; btnCandFrames=0; }
+      }
+      // Eixo só é aceito em passos de stick. Em botões, só LT/RT/D-pad podem
+      // usar eixo/HAT, e eixos já mapeados como sticks ficam bloqueados.
+      if(expectedKind==='axis' || allowAxisButton){
+        let best=-1, bestAbs=CALIB_AXIS_DELTA;
+        for(let i=0;i<gp.axes.length;i++){
+          if(expectedKind==='button' && blockedButtonAxes.has(i)) continue;
+          const d=Math.abs((gp.axes[i]||0)-(baseAx[i]||0));
+          if(d>bestAbs){ bestAbs=d; best=i; }
+        }
+        if(best>=0){
+          const dir=((gp.axes[best]||0)-(baseAx[best]||0))>0?1:-1;
+          if(best===axisCand && dir===axisCandDir){ axisCandFrames++; }
+          else { axisCand=best; axisCandDir=dir; axisCandFrames=1; }
+          if(axisCandFrames>=3){
+            finish(resolve, {type:'axis', index:best, dir, rest:finiteNumber(baseAx[best], 0)}); return;
+          }
+        } else { axisCand=-1; axisCandFrames=0; }
+      }
+      if(expectedKind==='button' && keyCand){
+        if(++keyCandFrames>=2){
+          finish(resolve, {type:'key', code:keyCand, label:keyCandLabel||keyCand}); return;
+        }
+      }
+    };
+    timer=setInterval(tick, 16); // ~60Hz, imune ao throttle de rAF em background
+  });
+}
+
+// Aguarda alguns frames para estabilizar a leitura. Não exige "tudo zerado":
+// alguns HIDs genéricos expõem entradas ruidosas ou gatilhos com repouso != 0.
+function waitInputSettle(signal){
+  return new Promise(resolve=>{
+    let frames=0;
+    const t=setInterval(()=>{
+      if(signal.cancelled || ++frames>=4){ clearInterval(t); resolve(); }
+    },16);
+  });
+}
+
+// Aguarda a entrada recém-capturada voltar ao repouso para não registrar a
+// soltura do stick/gatilho como o próximo passo da calibração.
+function waitInputReleased(src, signal){
+  return new Promise(resolve=>{
+    if(!src){ resolve(); return; }
+    let stable=0;
+    const t=setInterval(()=>{
+      if(signal.cancelled){ clearInterval(t); resolve(); return; }
+      const sources=Array.isArray(src) ? src : [src];
+      if(src.type==='key'){
+        stable = !padKeyDown.has(src.code) ? stable+1 : 0;
+        if(stable>=4){ clearInterval(t); resolve(); }
+        return;
+      }
+      const gp=currentPad();
+      const released=sources.every(source=>{
+        if(source.type==='key') return !padKeyDown.has(source.code);
+        if(!gp) return true;
+        if(source.type==='button'){
+          // "solto" = voltou para perto do repouso capturado (cobre botão que
+          // repousa alto, onde "solto" é valor ALTO, não baixo)
+          const btn=gp.buttons[source.index];
+          const v=btn ? btn.value : 0;
+          const nearValue=Math.abs(v-finiteNumber(source.rest,0))<0.3;
+          const samePressed=!btn || (!!btn.pressed)===!!source.restPressed;
+          return nearValue && samePressed;
+        }
+        if(source.type==='axis'){
+          return Math.abs(finiteNumber(gp.axes[source.index], 0)-finiteNumber(source.rest, 0))<0.25;
+        }
+        return true;
+      });
+      stable = released ? stable+1 : 0;
+      if(stable>=4){ clearInterval(t); resolve(); }
+    },16);
+  });
+}
+
+async function startCalibration(){
+  if(padIndex===null || calibActive) return;
+  calibActive=true; updateCalibUi();
+  padKeyDown.clear();
+  padKeyDirtyUntil=0;
+  const overlay=document.getElementById('calibOverlay');
+  const promptEl=document.getElementById('calibPrompt');
+  const progEl=document.getElementById('calibProgress');
+  const insp=document.getElementById('calibInspector');
+  const logBox=document.getElementById('calibLogBox');
+  // inspetor (estado ao vivo) e log (histórico de passos) SEMPRE visíveis na
+  // calibração — sem console no celular, é a única forma de diagnosticar.
+  if(insp){ insp.style.display='block'; insp.textContent='aguardando leitura do controle…'; }
+  if(logBox){ logBox.style.display='block'; logBox.textContent=''; }
+
+  // calibLog escreve numa área PRÓPRIA (a do inspetor é sobrescrita todo frame
+  // pelo tick, por isso as mensagens "sumiam" da caixa e só iam pro terminal).
+  const calibLog=(m)=>{ if(logBox) logBox.textContent=m+'\n'+logBox.textContent; log('[calib] '+m,'warn'); };
+  overlay.style.display='flex';
+  calibLog('controle idx='+padIndex+' id='+(padId||'?').slice(0,30));
+
+  const signal={cancelled:false};
+  const cancel=()=>{ signal.cancelled=true; };
+  const skipSignal={skip:false};
+  document.getElementById('calibCancel').onclick=cancel;
+  const skipBtn=document.getElementById('calibSkip');
+  const oldSkipText=skipBtn.textContent;
+  skipBtn.onclick=()=>{ skipSignal.skip=true; };
+
+  const steps=[
+    ...STANDARD_AXIS_SLOTS.map(([label,slot])=>({kind:'axis',label,slot})),
+    ...STANDARD_BUTTON_SLOTS.map(([label,slot])=>({kind:'button',label,slot})),
+  ];
+  const profile={ buttons:new Array(17).fill(null), axes:new Array(4).fill(null), id:padId };
+
+  try{
+    promptEl.textContent='descobrir entradas';
+    progEl.textContent='sem limite de tempo';
+    skipBtn.textContent='parar descoberta';
+    skipSignal.skip=false;
+    const discovered=await discoverPadInputs(signal, skipSignal, m=>{ if(insp) insp.textContent=m; });
+    if(signal.cancelled) throw new Error('cancelado');
+    calibLog('entradas descobertas: '+discoveredSummary(discovered, 32));
+    skipBtn.textContent=oldSkipText;
+
+    for(let s=0;s<steps.length;s++){
+      const step=steps[s];
+      promptEl.textContent=step.label;
+      progEl.textContent=(s+1)+' / '+steps.length;
+      skipSignal.skip=false;
+      await waitInputSettle(signal);
+      if(signal.cancelled) throw new Error('cancelado');
+
+      const captured=await captureStepInput(signal, skipSignal, step, profile);
+
+      if(captured){
+        const desc = describeSource(captured);
+        calibLog('passo "'+step.label+'" -> '+desc);
+        if(step.kind==='button') profile.buttons[step.slot]=captured;
+        else { // eixo de stick: guarda índice; invert se a direção "para a direita/baixo" deu negativa
+          profile.axes[step.slot]={ index:captured.index, invert: captured.dir<0, center:finiteNumber(captured.rest, 0) };
+        }
+        promptEl.textContent='✓';
+        await new Promise(r=>setTimeout(r,140));
+        promptEl.textContent='solte';
+        await waitInputReleased(captured, signal);
+      } else {
+        calibLog('passo "'+step.label+'" PULADO (skip)');
+      }
+    }
+    // grava e ativa
+    padProfile=profile;
+    savePadProfile(padId, profile);
+    calibLog('SALVO ✓ — perfil gravado');
+    log('controle calibrado e salvo ✓','ok');
+    await new Promise(r=>setTimeout(r,900)); // deixa ler o log final
+  }catch(e){
+    calibLog('ERRO/abortou: '+(e && e.message ? e.message : e));
+    await new Promise(r=>setTimeout(r,1500)); // mantém o erro visível na tela
+  }finally{
+    skipBtn.textContent=oldSkipText;
+    overlay.style.display='none';
+    if(insp) insp.style.display='none';
+    if(logBox) logBox.style.display='none';
+    calibActive=false;
+    updateCalibUi();
+  }
+}
+
+document.getElementById('calibBtn').onclick=startCalibration;
+document.getElementById('calibClearBtn').onclick=()=>{
+  if(padId){ localStorage.removeItem(padProfileKey(padId)); padProfile=null; log('perfil do controle removido','warn'); updateCalibUi(); }
+};
+updateCalibUi();
 
 const setBtn=(id,on)=>{const el=document.getElementById(id);if(el)el.classList.toggle('on',on);};
 
@@ -485,6 +1382,7 @@ function activateUiFocus(){
 let uiNavCooldown=0;
 function padUiNav(b, ax){
   // Desativa enquanto o streaming está no ar (lá o controle vai pro jogo).
+  if(calibActive) return;
   if(document.getElementById('stage').classList.contains('show')) return;
   const now=performance.now();
   if(now<uiNavCooldown) return;
@@ -499,19 +1397,19 @@ function padUiNav(b, ax){
 // loop de leitura/visualização do controle
 function padLoop(){
   if(padIndex!==null){
-    const gp=navigator.getGamepads()[padIndex];
-    if(gp){
-      const b=gp.buttons.map(x=>x.pressed);
-      const ax=gp.axes;
+    const gp=currentPad();
+    if(gp || hasMappedPadKeyActivity()){
+      const m=mapGamepad(gp);     // já no layout standard (aplica perfil se houver)
+      const b=m.buttons, ax=m.axes;
       padUiNav(b, ax);
       // visual
       setBtn('bA',b[0]);setBtn('bB',b[1]);setBtn('bX',b[2]);setBtn('bY',b[3]);
       setBtn('bLB',b[4]);setBtn('bRB',b[5]);
       setBtn('bBack',b[8]);setBtn('bStart',b[9]);setBtn('bGuide',b[16]);
       setBtn('bDV',b[12]||b[13]);setBtn('bDH',b[14]||b[15]);
-      // gatilhos analógicos (botões 6/7)
-      document.getElementById('tLT').setAttribute('width',(gp.buttons[6].value*40).toFixed(1));
-      document.getElementById('tRT').setAttribute('width',(gp.buttons[7].value*40).toFixed(1));
+      // gatilhos analógicos (slots 6/7)
+      document.getElementById('tLT').setAttribute('width',(m.values[6]*40).toFixed(1));
+      document.getElementById('tRT').setAttribute('width',(m.values[7]*40).toFixed(1));
       // sticks
       document.getElementById('sL').setAttribute('cx',78+(ax[0]||0)*11);
       document.getElementById('sL').setAttribute('cy',92+(ax[1]||0)*11);
@@ -678,12 +1576,28 @@ function enablePlayoutDelayExtension(sdp){
 }
 
 function sendInput(){
-  if(!dc || dc.readyState!=='open' || padIndex===null) return;
-  const gp=navigator.getGamepads()[padIndex];
-  if(!gp) return;
-  const buttons=gp.buttons.map(b=>b.pressed);
-  // anexa valores analógicos dos gatilhos como eixos 4 e 5
-  const axes=[...gp.axes.slice(0,4), gp.buttons[6].value, gp.buttons[7].value];
+  if(!dc || dc.readyState!=='open') return;
+  const gp = padIndex!==null ? currentPad() : null;
+  const useVirtual = vpadState.active;
+  const useMappedKeys = hasMappedPadKeyActivity();
+  if(!gp && !useVirtual && !useMappedKeys) return; // nada para enviar
+
+  // base: controle físico (já traduzido para o layout standard via perfil)
+  const m = mapGamepad(gp);
+  let buttons = m.buttons.slice();
+  let axes    = m.axes.slice();
+
+  // mescla o controle virtual (OR nos botões, soma saturada nos eixos/gatilhos)
+  if(useVirtual){
+    for(let i=0;i<17;i++) buttons[i] = buttons[i] || !!vpadState.buttons[i];
+    const clamp=v=>Math.max(-1,Math.min(1,v));
+    axes[0]=clamp(axes[0]+vpadState.axes[0]);
+    axes[1]=clamp(axes[1]+vpadState.axes[1]);
+    axes[2]=clamp(axes[2]+vpadState.axes[2]);
+    axes[3]=clamp(axes[3]+vpadState.axes[3]);
+    axes[4]=Math.max(axes[4], vpadState.trig[0]);
+    axes[5]=Math.max(axes[5], vpadState.trig[1]);
+  }
   dc.send(JSON.stringify({type:'gamepad', buttons, axes}));
 }
 
@@ -724,15 +1638,27 @@ function installControlCapture(){
   const keydown=e=>{
     if(!active() || fromUi(e)) return;
     e.preventDefault();
+    const code=keyEventCode(e);
+    if(!code) return;
+    if(isMappedPadKeyCode(code)){
+      setPadKeyDown(code, true);
+      return;
+    }
     if(e.repeat) return;
-    keysDown.add(e.code);
-    sendCommand({type:'key', code:e.code, down:true});
+    keysDown.add(code);
+    sendCommand({type:'key', code, down:true});
   };
   const keyup=e=>{
     if(!active()) return;
     e.preventDefault();
-    keysDown.delete(e.code);
-    sendCommand({type:'key', code:e.code, down:false});
+    const code=keyEventCode(e);
+    if(!code) return;
+    if(isMappedPadKeyCode(code)){
+      setPadKeyDown(code, false);
+      return;
+    }
+    keysDown.delete(code);
+    sendCommand({type:'key', code, down:false});
   };
   const mousemove=e=>{
     if(!active()) return;
@@ -780,6 +1706,8 @@ function uninstallControlCapture(){
   if(!controlHandlers) return;
   for(const code of keysDown) sendCommand({type:'key', code, down:false});
   keysDown.clear();
+  padKeyDown.clear();
+  padKeyDirtyUntil=0;
 
   const stage=document.getElementById('stage');
   window.removeEventListener('keydown', controlHandlers.keydown, true);
@@ -813,6 +1741,14 @@ function endStream(opts={}){
   }
   if(inputTimer) clearInterval(inputTimer);
   uninstallControlCapture();
+  resetVpadState(); // solta qualquer botão/stick virtual preso
+  if(manual){
+    // encerramento real: tira o overlay do controle e fecha o menu, para não
+    // ficarem órfãos sobre a tela de setup. No reconnect (manual=false) o
+    // overlay é preservado pois o palco volta sozinho.
+    document.getElementById('vpad').classList.remove('show');
+    document.getElementById('stageMenu').classList.remove('open');
+  }
   if(dc) dc.close();
   if(pc) pc.close();
   if(signalWs) signalWs.close();
@@ -844,6 +1780,229 @@ function endStream(opts={}){
   log(keepFullscreen ? 'sessão pausada para reconfigurar' : 'sessão encerrada','warn');
 }
 document.getElementById('stageExit').onclick = () => endStream({manual:true});
+
+/* ---------- menu de 3 pontos: stats / controle / transparência / encerrar ---------- */
+(function setupStageMenu(){
+  const hud=document.getElementById('stageHud');
+  const vpad=document.getElementById('vpad');
+  const menuBtn=document.getElementById('stageMenuBtn');
+  const menu=document.getElementById('stageMenu');
+  const tStats=document.getElementById('toggleStats');
+  const tVpad=document.getElementById('toggleVpad');
+  const opacityRow=document.getElementById('opacityRow');
+  const opacityRange=document.getElementById('opacityRange');
+  const opacityVal=document.getElementById('opacityVal');
+
+  // preferências persistem entre sessões
+  const statsHidden = localStorage.getItem('tether.hideStats')==='1';
+  const vpadOn      = localStorage.getItem('tether.showVpad')==='1';
+  const opacity     = parseInt(localStorage.getItem('tether.vpadOpacity')||'85', 10);
+
+  // ---- abrir/fechar menu ----
+  function openMenu(open){
+    menu.classList.toggle('open', open);
+    menuBtn.setAttribute('aria-expanded', open?'true':'false');
+  }
+  menuBtn.onclick=e=>{ e.stopPropagation(); openMenu(!menu.classList.contains('open')); };
+  // clicar fora fecha
+  document.addEventListener('pointerdown', e=>{
+    if(menu.classList.contains('open') && !menu.contains(e.target) && e.target!==menuBtn) openMenu(false);
+  }, true);
+
+  // ---- estatísticas ----
+  function applyStats(hidden){
+    hud.classList.toggle('hud-hidden', hidden);
+    tStats.classList.toggle('on', !hidden);
+    tStats.querySelector('.mi-state').textContent = hidden ? 'OCULTO' : 'EXIBINDO';
+    localStorage.setItem('tether.hideStats', hidden?'1':'0');
+  }
+  tStats.onclick=()=>applyStats(!hud.classList.contains('hud-hidden'));
+
+  // ---- controle na tela ----
+  function applyVpad(on){
+    vpad.classList.toggle('show', on);
+    vpad.setAttribute('aria-hidden', on?'false':'true');
+    tVpad.classList.toggle('on', on);
+    tVpad.querySelector('.mi-state').textContent = on ? 'EXIBINDO' : 'OCULTO';
+    opacityRow.style.display = on ? 'flex' : 'none'; // só faz sentido com o controle visível
+    vpadState.active=on;
+    if(on) installVpadCapture();
+    else resetVpadState();
+    localStorage.setItem('tether.showVpad', on?'1':'0');
+  }
+  tVpad.onclick=()=>applyVpad(!vpad.classList.contains('show'));
+
+  // ---- transparência do controle ----
+  function applyOpacity(pct){
+    pct=Math.max(20, Math.min(100, pct));
+    vpad.style.setProperty('--vpad-opacity', (pct/100).toFixed(2));
+    opacityVal.textContent=pct+'%';
+    opacityRange.value=pct;
+    localStorage.setItem('tether.vpadOpacity', String(pct));
+  }
+  opacityRange.oninput=()=>applyOpacity(parseInt(opacityRange.value,10));
+
+  // estado inicial
+  applyStats(statsHidden);
+  applyOpacity(opacity);
+  applyVpad(vpadOn);
+})();
+
+/* ---------- captura de toque do controle Xbox virtual ---------- */
+function resetVpadState(){
+  vpadPointers.clear(); // descarta pointers presos
+  vpadState.buttons.fill(false);
+  vpadState.trig=[0,0];
+  vpadState.axes=[0,0,0,0];
+  document.querySelectorAll('#vpad .on').forEach(el=>el.classList.remove('on'));
+  document.querySelectorAll('#vpad .vp-stick').forEach(s=>{
+    s.classList.remove('active');
+    const nub=s.querySelector('.nub'); if(nub) nub.style.transform='translate(0,0)';
+  });
+}
+
+// hook de diagnóstico (leve, sempre disponível): permite a um harness de teste
+// externo (CDP) ler o estado real do controle sob toque genuíno.
+window.__vpad = {
+  state: vpadState,
+  axes: () => vpadState.axes.slice(),
+  buttons: () => vpadState.buttons.slice(),
+  trig: () => vpadState.trig.slice(),
+  pointers: () => vpadPointers.size,
+};
+
+// Overlay de debug na tela (abra o client com ?debug=1). Mostra eixos, botões
+// pressionados e nº de toques ativos ao vivo — para diagnosticar no aparelho real.
+if(new URLSearchParams(location.search).has('debug')){
+  const dbg=document.createElement('div');
+  dbg.style.cssText='position:fixed;top:70px;left:14px;z-index:600;font:11px var(--mono,monospace);'
+    +'background:rgba(0,0,0,.8);color:#9eff5a;padding:8px 10px;border:1px solid #2a3;border-radius:8px;'
+    +'white-space:pre;pointer-events:none;line-height:1.5';
+  document.body.appendChild(dbg);
+  const fmt=v=>(v>=0?' ':'')+v.toFixed(2);
+  setInterval(()=>{
+    const a=vpadState.axes, t=vpadState.trig;
+    const pressed=vpadState.buttons.map((b,i)=>b?i:null).filter(x=>x!==null);
+    const ptrs=[...vpadPointers.entries()].map(([id,p])=>id+':'+p.kind).join(' ');
+    dbg.textContent=
+      'LX'+fmt(a[0])+' LY'+fmt(a[1])+'\n'+
+      'RX'+fmt(a[2])+' RY'+fmt(a[3])+'\n'+
+      'LT'+fmt(t[0])+' RT'+fmt(t[1])+'\n'+
+      'btns ['+pressed.join(',')+']\n'+
+      'ptrs('+vpadPointers.size+') '+ptrs+'\n'+
+      'mode '+(window.PointerEvent!==undefined?'pointer':'touch');
+  }, 80);
+}
+
+function vpadReleasePointer(id){
+  const p=vpadPointers.get(id);
+  if(!p) return;
+  if(p.kind==='stick'){
+    vpadState.axes[p.ax[0]]=0; vpadState.axes[p.ax[1]]=0;
+    p.stick.classList.remove('active');
+    if(p.nub) p.nub.style.transform='translate(0,0)';
+  } else if(p.kind==='btn'){
+    vpadState.buttons[p.idx]=false; p.el.classList.remove('on');
+  } else if(p.kind==='trig'){
+    vpadState.trig[p.i]=0; p.el.classList.remove('on');
+  }
+  vpadPointers.delete(id);
+}
+
+function vpadApplyStick(p, clientX, clientY){
+  let nx = p.radius>0 ? (clientX-p.cx)/p.radius : 0;
+  let ny = p.radius>0 ? (clientY-p.cy)/p.radius : 0;
+  const mag=Math.hypot(nx,ny);
+  if(mag>1){ nx/=mag; ny/=mag; }
+  vpadState.axes[p.ax[0]]=nx;
+  vpadState.axes[p.ax[1]]=ny;
+  if(p.nub) p.nub.style.transform='translate('+(nx*p.maxNub).toFixed(1)+'px,'+(ny*p.maxNub).toFixed(1)+'px)';
+}
+
+function vpadEngage(id, controlEl, clientX, clientY){
+  if(controlEl.classList.contains('vp-stick')){
+    const r=controlEl.getBoundingClientRect();
+    const p={kind:'stick', stick:controlEl, ax: controlEl.dataset.vstick==='L'?[0,1]:[2,3],
+             nub: controlEl.querySelector('.nub'),
+             cx:r.left+r.width/2, cy:r.top+r.height/2, radius:r.width/2,
+             maxNub: controlEl.clientWidth ? controlEl.clientWidth*0.35 : 36};
+    controlEl.classList.add('active');
+    vpadPointers.set(id, p);
+    vpadApplyStick(p, clientX, clientY);
+  } else if(controlEl.dataset.vbtn!==undefined){
+    const idx=+controlEl.dataset.vbtn;
+    vpadState.buttons[idx]=true; controlEl.classList.add('on');
+    vpadPointers.set(id, {kind:'btn', idx, el:controlEl});
+  } else if(controlEl.dataset.vtrig!==undefined){
+    const i = +controlEl.dataset.vtrig===6 ? 0 : 1;
+    vpadState.trig[i]=1; controlEl.classList.add('on');
+    vpadPointers.set(id, {kind:'trig', i, el:controlEl});
+  }
+}
+
+function vpadMove(id, clientX, clientY){
+  const p=vpadPointers.get(id);
+  if(p && p.kind==='stick') vpadApplyStick(p, clientX, clientY);
+}
+
+function installVpadCapture(){
+  if(vpadHandlersInstalled) return;
+  vpadHandlersInstalled=true;
+  const vpad=document.getElementById('vpad');
+
+  // POR QUE TOUCH EVENTS (e não Pointer Events / listeners no window):
+  // Em TVs (Tizen/WebOS) os eventos de move/up NÃO são entregues a listeners no
+  // window — o navegador da TV só continua mandando o gesto para o ELEMENTO onde
+  // o toque começou. Por isso o controle travava: o 'down' chegava, mas o 'move'
+  // e o 'up' globais nunca disparavam (stick preso, botão não soltava).
+  //
+  // Touch Events resolvem isso por design: depois do touchstart num elemento,
+  // TODOS os touchmove/touchend daquele dedo continuam indo para o MESMO
+  // elemento, mesmo que o dedo saia dele. Então registramos no próprio controle.
+  const hasTouch = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0);
+
+  if(hasTouch){
+    vpad.querySelectorAll('.vp-stick, [data-vbtn], [data-vtrig]').forEach(ctl=>{
+      ctl.addEventListener('touchstart', e=>{
+        e.preventDefault();
+        for(const t of e.changedTouches) vpadEngage('t'+t.identifier, ctl, t.clientX, t.clientY);
+      }, {passive:false});
+      // move/end ficam NO MESMO elemento — a TV entrega aqui de forma confiável
+      ctl.addEventListener('touchmove', e=>{
+        e.preventDefault();
+        for(const t of e.changedTouches) vpadMove('t'+t.identifier, t.clientX, t.clientY);
+      }, {passive:false});
+      const end=e=>{ for(const t of e.changedTouches) vpadReleasePointer('t'+t.identifier); };
+      ctl.addEventListener('touchend', end);
+      ctl.addEventListener('touchcancel', end);
+    });
+  } else {
+    // Desktop/mouse: Pointer Events target-based, com captura no elemento para
+    // receber move/up mesmo fora dele (aqui o capture funciona — ponteiro real).
+    vpad.querySelectorAll('.vp-stick, [data-vbtn], [data-vtrig]').forEach(ctl=>{
+      ctl.addEventListener('pointerdown', e=>{
+        e.preventDefault();
+        try{ ctl.setPointerCapture(e.pointerId); }catch(_){}
+        vpadEngage(e.pointerId, ctl, e.clientX, e.clientY);
+      });
+      ctl.addEventListener('pointermove', e=>{
+        if(vpadPointers.has(e.pointerId)){ e.preventDefault(); vpadMove(e.pointerId, e.clientX, e.clientY); }
+      });
+      const rel=e=>vpadReleasePointer(e.pointerId);
+      ctl.addEventListener('pointerup', rel);
+      ctl.addEventListener('pointercancel', rel);
+      ctl.addEventListener('lostpointercapture', rel);
+    });
+  }
+
+  // Backstop: a aba indo para segundo plano solta tudo. NÃO usamos 'blur' — o
+  // teclado do Big Picture / IME disparam blur sem o usuário sair.
+  document.addEventListener('visibilitychange', ()=>{
+    if(document.visibilityState==='hidden'){
+      for(const id of [...vpadPointers.keys()]) vpadReleasePointer(id);
+    }
+  });
+}
 
 // medição de RTT
 setInterval(async () => {
