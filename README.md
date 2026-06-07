@@ -1,6 +1,26 @@
 # Tether · Steam Link para navegador (LAN)
 
+[![Site](https://img.shields.io/badge/site-tether-b6ff3a)](https://tether-lan.netlify.app)
+[![Release](https://img.shields.io/github/v/release/danielpalmares/tether?color=2ad4ff)](https://github.com/danielpalmares/tether/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Platform](https://img.shields.io/badge/host-Windows%2010%2F11-informational)
+
 Streaming de jogos pela rede local com **app host nativo** (Go) e **client 100% no navegador** (WebRTC + Gamepad API). O host abre o **Steam Big Picture** automaticamente quando um client conecta, transmite a tela com baixa latência e recebe o input do controle Xbox de volta.
+
+> **O seu PC na TV da sala. Um clique e jogou.** Sem nuvem, sem mensalidade.
+> Conheça o projeto em **[tether-lan.netlify.app](https://tether-lan.netlify.app)**.
+
+## Instalação rápida (host)
+
+Abra o **PowerShell** e cole — baixa o app, instala FFmpeg + ViGEmBus e cria os atalhos:
+
+```powershell
+irm https://raw.githubusercontent.com/danielpalmares/tether/main/install.ps1 | iex
+```
+
+Depois abra o endereço LAN exibido (ex.: `http://192.168.0.10:8787/client.html`) no
+navegador da TV/celular e aperte **iniciar streaming**. Detalhes em
+[docs/INSTALL.md](docs/INSTALL.md).
 
 ```
 HOST (Go, nativo)                          CLIENT (browser puro)
