@@ -331,8 +331,35 @@
       </svg>
       <div class="pad-status" id="padStatus">
         <div><span class="k">DISPOSITIVO</span> &middot; <span class="v off" id="padName">nenhum detectado</span></div>
-        <div class="hint" style="margin-top:10px">Conecte um controle Xbox e pressione qualquer botão para ativá-lo.</div>
+        <div class="hint" style="margin-top:10px">Conecte um controle e pressione qualquer botão. Controles genéricos podem ser calibrados abaixo.</div>
+        <div id="calibRow" style="margin-top:14px; display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+          <button class="btn" id="calibBtn" style="width:auto; padding:8px 14px" disabled>calibrar controle</button>
+          <button class="btn" id="calibClearBtn" style="width:auto; padding:8px 14px; display:none" title="Remover perfil salvo">limpar perfil</button>
+          <span class="hint" id="calibState" style="margin:0"></span>
+        </div>
       </div>
+    </div>
+  </div>
+
+  <!-- overlay de calibração de controle genérico -->
+  <div id="calibOverlay" style="display:none; position:fixed; inset:0; z-index:700;
+       background:rgba(0,0,0,.86); align-items:center; justify-content:center;">
+    <div style="max-width:420px; width:90%; background:var(--bg-2); border:1px solid var(--line-2);
+         border-radius:14px; padding:26px; text-align:center;">
+      <div class="hdr" style="justify-content:center">calibrar controle</div>
+      <div style="font:13px var(--mono,monospace); color:var(--txt-dim); margin:6px 0 20px">
+        Pressione no seu controle o botão/direção indicado. Pule o que não tiver.
+      </div>
+      <div id="calibPrompt" style="font:700 26px var(--mono,monospace); color:var(--acid); margin:10px 0">—</div>
+      <div id="calibProgress" class="hint" style="margin-bottom:20px">0 / 0</div>
+      <div style="display:flex; gap:10px; justify-content:center;">
+        <button class="btn" id="calibSkip" style="width:auto; padding:9px 16px">pular</button>
+        <button class="btn" id="calibCancel" style="width:auto; padding:9px 16px">cancelar</button>
+      </div>
+      <div class="hint" style="margin-top:16px">Dica: deixe os sticks/gatilhos em repouso entre os passos.</div>
+      <div id="calibInspector" style="margin-top:14px; font:10px var(--mono,monospace); color:var(--txt-dim);
+           text-align:left; white-space:pre-wrap; max-height:120px; overflow:auto; display:none;
+           border-top:1px solid var(--line); padding-top:10px"></div>
     </div>
   </div>
 
@@ -425,7 +452,7 @@
 <script>
 const log=(m,c='')=>{const e=document.getElementById('log'),l=document.createElement('div');l.className='ln '+c;l.textContent=m;e.appendChild(l);e.scrollTop=e.scrollHeight;};
 
-let hostAddr=null, padIndex=null, pc=null, dc=null, signalWs=null, inputTimer=null, reconnectTimer=null, remoteVideoStream=null, remoteAudioStream=null, controlHandlers=null;
+let hostAddr=null, padIndex=null, padId=null, padStandard=false, pc=null, dc=null, signalWs=null, inputTimer=null, reconnectTimer=null, remoteVideoStream=null, remoteAudioStream=null, controlHandlers=null;
 let lastVideoStats=null;
 let lastDecodeProgressAt=0;
 let decoderStallLogged=false;
@@ -452,6 +479,130 @@ let vpadHandlersInstalled=false;
 // lançava "Cannot access 'vpadPointers' before initialization" e abortava todo
 // o setup do controle no boot.
 const vpadPointers = new Map(); // id -> {kind:'stick'|'btn'|'trig', ...}
+
+// ---- remapeamento de controle genérico ----
+// Navegadores reportam mapping="standard" só para controles reconhecidos. Um
+// controle genérico (que conecta "como Xbox" mas com layout de HID próprio) vem
+// com mapping="" e ordem de botões/eixos arbitrária — daí "as teclas ficam
+// erradas". A calibração na tela grava, por dispositivo, qual índice físico
+// corresponde a cada entrada do layout padrão; mapGamepad() traduz de volta.
+//
+// Slots de saída no layout STANDARD (índice = posição no array enviado ao host):
+//   botões 0..16: A B X Y LB RB LT RT Back Start L3 R3 DpadUp DpadDown DpadLeft DpadRight Guide
+//   eixos 0..3:   LX LY RX RY   (LT/RT vão como buttons[6/7].value -> axes[4/5])
+const STANDARD_BUTTON_SLOTS = [
+  ['A',0],['B',1],['X',2],['Y',3],['LB',4],['RB',5],['LT',6],['RT',7],
+  ['Back',8],['Start',9],['L3',10],['R3',11],
+  ['Dpad ↑',12],['Dpad ↓',13],['Dpad ←',14],['Dpad →',15],['Guide',16],
+];
+const STANDARD_AXIS_SLOTS = [
+  ['Stick Esq. → (eixo X)',0],['Stick Esq. ↓ (eixo Y)',1],
+  ['Stick Dir. → (eixo X)',2],['Stick Dir. ↓ (eixo Y)',3],
+];
+const PAD_PROFILE_VERSION = 1;
+const CALIB_BUTTON_ON = 0.6;
+const CALIB_BUTTON_OFF = 0.3;
+const CALIB_AXIS_DELTA = 0.55;
+let padProfile = null; // perfil ativo do controle conectado (ou null = standard)
+
+function padProfileKey(id){ return 'tether.padmap.'+(id||'').replace(/\s+/g,'_').slice(0,80); }
+
+function clamp(v,min,max){ return Math.max(min, Math.min(max, v)); }
+function finiteNumber(v, fallback=0){ return Number.isFinite(v) ? v : fallback; }
+
+function normalizePadProfile(profile){
+  if(!profile || !Array.isArray(profile.buttons) || !Array.isArray(profile.axes)) return null;
+  const buttons=new Array(17).fill(null);
+  const axes=new Array(4).fill(null);
+  for(let i=0;i<buttons.length;i++){
+    const src=profile.buttons[i];
+    if(!src || !Number.isInteger(src.index) || src.index<0) continue;
+    if(src.type==='button') buttons[i]={type:'button', index:src.index};
+    else if(src.type==='axis') buttons[i]={
+      type:'axis',
+      index:src.index,
+      dir:src.dir<0 ? -1 : 1,
+      rest:finiteNumber(src.rest, 0),
+    };
+  }
+  for(let i=0;i<axes.length;i++){
+    const src=profile.axes[i];
+    if(!src || !Number.isInteger(src.index) || src.index<0) continue;
+    axes[i]={
+      index:src.index,
+      invert:!!src.invert,
+      center:finiteNumber(src.center, 0),
+    };
+  }
+  return {version:PAD_PROFILE_VERSION, id:profile.id||'', buttons, axes};
+}
+
+function loadPadProfile(id){
+  try{ const raw=localStorage.getItem(padProfileKey(id)); return raw ? normalizePadProfile(JSON.parse(raw)) : null; }
+  catch(_){ return null; }
+}
+function savePadProfile(id, profile){
+  const normalized=normalizePadProfile(profile);
+  try{ if(normalized) localStorage.setItem(padProfileKey(id), JSON.stringify(normalized)); }catch(_){}
+}
+
+function axisButtonValue(gp, src){
+  const raw=finiteNumber(gp.axes[src.index], 0);
+  const rest=finiteNumber(src.rest, 0);
+  const span=src.dir>0 ? (1-rest) : (rest+1);
+  const moved=src.dir>0 ? (raw-rest) : (rest-raw);
+  return clamp(moved/Math.max(0.001, span), 0, 1);
+}
+
+function stickAxisValue(gp, src){
+  const center=finiteNumber(src.center, 0);
+  let delta=finiteNumber(gp.axes[src.index], 0)-center;
+  const span=delta>=0 ? (1-center) : (center+1);
+  let v=delta/Math.max(0.001, span);
+  if(src.invert) v=-v;
+  return clamp(v, -1, 1);
+}
+
+// Traduz um Gamepad para o layout standard {buttons:bool[17], values:num[17], axes:num[6]}.
+// Sem perfil + mapping standard -> passa direto. Sem perfil + não-standard ->
+// também passa direto (melhor esforço), mas a UI avisa para calibrar.
+function mapGamepad(gp){
+  const out = { buttons:new Array(17).fill(false), values:new Array(17).fill(0), axes:[0,0,0,0,0,0] };
+  if(!gp) return out;
+
+  if(!padProfile){
+    // direto (standard ou melhor-esforço)
+    for(let i=0;i<17 && i<gp.buttons.length;i++){
+      out.buttons[i]=gp.buttons[i].pressed; out.values[i]=gp.buttons[i].value;
+    }
+    out.axes=[gp.axes[0]||0,gp.axes[1]||0,gp.axes[2]||0,gp.axes[3]||0,
+              gp.buttons[6]?gp.buttons[6].value:0, gp.buttons[7]?gp.buttons[7].value:0];
+    return out;
+  }
+
+  // com perfil: cada slot diz de onde vem (botão físico, ou eixo físico c/ direção)
+  padProfile.buttons.forEach((src,slot)=>{
+    if(!src) return;
+    if(src.type==='button' && gp.buttons[src.index]){
+      const value=clamp(finiteNumber(gp.buttons[src.index].value, 0), 0, 1);
+      out.values[slot]=value;
+      out.buttons[slot]=gp.buttons[src.index].pressed || value>0.5;
+    } else if(src.type==='axis' && src.index<gp.axes.length){
+      const value=axisButtonValue(gp, src);
+      out.values[slot]=value;
+      out.buttons[slot]=value>0.5;
+    }
+  });
+  // eixos analógicos dos sticks
+  padProfile.axes.forEach((src,slot)=>{
+    if(!src) return;
+    if(src.index<gp.axes.length) out.axes[slot]=stickAxisValue(gp, src);
+  });
+  // gatilhos analógicos -> axes[4]/[5] a partir dos slots LT(6)/RT(7)
+  out.axes[4]=out.values[6]; out.axes[5]=out.values[7];
+  return out;
+}
+
 const urlParams = new URLSearchParams(location.search);
 const audioMode = !urlParams.has('noaudio');
 const videoOnlyMode = !audioMode;
@@ -657,17 +808,213 @@ async function autoDiscoverHosts(){
 /* ---------- 02 · gamepad ---------- */
 window.addEventListener('gamepadconnected', e => {
   padIndex=e.gamepad.index;
+  padId=e.gamepad.id;
+  padStandard=e.gamepad.mapping==='standard';
   document.getElementById('padName').textContent=e.gamepad.id.slice(0,28);
   document.getElementById('padName').className='v';
-  log('controle conectado: '+e.gamepad.id.slice(0,40),'ok');
+  // carrega perfil salvo p/ este controle; se não houver e o mapping não é
+  // "standard", avisa que pode precisar calibrar (teclas podem vir trocadas).
+  padProfile=loadPadProfile(padId);
+  if(padProfile){
+    log('controle conectado: '+e.gamepad.id.slice(0,40)+' (perfil calibrado)','ok');
+  } else if(!padStandard){
+    log('controle genérico detectado — botões podem vir trocados. Use "calibrar controle".','warn');
+  } else {
+    log('controle conectado: '+e.gamepad.id.slice(0,40),'ok');
+  }
+  updateCalibUi();
   refreshReady();
 });
-window.addEventListener('gamepaddisconnected', () => {
-  padIndex=null;
+window.addEventListener('gamepaddisconnected', e => {
+  if(padIndex!==null && e.gamepad.index!==padIndex) return;
+  padIndex=null; padId=null; padStandard=false; padProfile=null;
   document.getElementById('padName').textContent='nenhum detectado';
   document.getElementById('padName').className='v off';
+  updateCalibUi();
   refreshReady();
 });
+
+/* ---------- calibração de controle genérico ---------- */
+let calibActive=false;
+
+function updateCalibUi(){
+  const btn=document.getElementById('calibBtn');
+  const clr=document.getElementById('calibClearBtn');
+  const st=document.getElementById('calibState');
+  if(!btn) return;
+  const connected = padIndex!==null;
+  btn.disabled = !connected || calibActive;
+  clr.style.display = (connected && padProfile) ? '' : 'none';
+  st.textContent = !connected ? '' : (padProfile ? '✓ perfil calibrado ativo' : (padStandard ? 'layout padrão' : 'sem perfil calibrado'));
+  st.style.color = padProfile ? 'var(--acid)' : 'var(--txt-mute)';
+}
+
+// captura uma única entrada física: resolve com {type,index,dir,rest}
+// quando o usuário pressiona um botão, move um eixo ou clica em "pular".
+function captureStepInput(signal, skipSignal){
+  return new Promise((resolve,reject)=>{
+    const gp0=navigator.getGamepads()[padIndex];
+    if(!gp0){ reject(new Error('controle desconectado')); return; }
+    // baseline (estado de repouso) para detectar mudanças relativas
+    const baseBtn=gp0.buttons.map(b=>b.value);
+    const baseAx=gp0.axes.slice();
+    let raf=null, done=false;
+    const finish=(fn,value)=>{
+      if(done) return;
+      done=true;
+      if(raf!==null) cancelAnimationFrame(raf);
+      fn(value);
+    };
+    // candidato de eixo precisa SE MANTER deslocado por vários frames: descarta
+    // drift/ruído instantâneo dos sticks de controles genéricos, que antes era
+    // auto-capturado e fazia o passo "pular sozinho" (RT/LT/Start/Back/L3/R3
+    // pareciam não detectar porque o ruído avançava o passo antes do toque).
+    let axisCand=-1, axisCandFrames=0, axisCandDir=0;
+    const insp=document.getElementById('calibInspector');
+    const tick=()=>{
+      if(signal.cancelled){ finish(reject, new Error('cancelado')); return; }
+      if(skipSignal.skip){ finish(resolve, null); return; }
+      const gp=navigator.getGamepads()[padIndex];
+      if(!gp){ finish(reject, new Error('desconectado')); return; }
+
+      // inspetor ao vivo: lista botões/eixos atualmente ativos (cru, p/ diagnóstico)
+      if(insp && insp.style.display!=='none'){
+        const ab=[]; for(let i=0;i<gp.buttons.length;i++){ const v=gp.buttons[i].value; if(v>0.15) ab.push('b'+i+'='+v.toFixed(2)); }
+        const aa=[]; for(let i=0;i<gp.axes.length;i++){ const d=(gp.axes[i]||0)-(baseAx[i]||0); if(Math.abs(d)>0.15) aa.push('a'+i+'Δ'+d.toFixed(2)); }
+        insp.textContent='botões: '+(ab.join(' ')||'—')+'\neixos:  '+(aa.join(' ')||'—');
+      }
+
+      // PRIORIDADE 1: botão digital/analógico (gatilho que sobe partindo do repouso).
+      // CALIB_BUTTON_OFF compara com o BASELINE do botão (não com 0): cobre
+      // gatilho que repousa em valor != 0.
+      for(let i=0;i<gp.buttons.length;i++){
+        const v=gp.buttons[i].value, base=baseBtn[i]||0;
+        if(v>CALIB_BUTTON_ON && v-base>0.4){ finish(resolve, {type:'button', index:i}); return; }
+      }
+      // PRIORIDADE 2: eixo sustentado (gatilho/HAT como eixo). Exige >=3 frames
+      // no mesmo eixo e direção para não capturar drift momentâneo.
+      let best=-1, bestAbs=CALIB_AXIS_DELTA;
+      for(let i=0;i<gp.axes.length;i++){
+        const d=Math.abs((gp.axes[i]||0)-(baseAx[i]||0));
+        if(d>bestAbs){ bestAbs=d; best=i; }
+      }
+      if(best>=0){
+        const dir=((gp.axes[best]||0)-(baseAx[best]||0))>0?1:-1;
+        if(best===axisCand && dir===axisCandDir){ axisCandFrames++; }
+        else { axisCand=best; axisCandDir=dir; axisCandFrames=1; }
+        if(axisCandFrames>=3){
+          finish(resolve, {type:'axis', index:best, dir, rest:finiteNumber(baseAx[best], 0)}); return;
+        }
+      } else { axisCand=-1; axisCandFrames=0; }
+
+      raf=requestAnimationFrame(tick);
+    };
+    raf=requestAnimationFrame(tick);
+  });
+}
+
+// Aguarda alguns frames para estabilizar a leitura. Não exige "tudo zerado":
+// alguns HIDs genéricos expõem entradas ruidosas ou gatilhos com repouso != 0.
+function waitInputSettle(signal){
+  return new Promise(resolve=>{
+    let frames=0;
+    const tick=()=>{
+      if(signal.cancelled){ resolve(); return; }
+      if(!navigator.getGamepads()[padIndex]) resolve();
+      else if(++frames>=4) resolve();
+      else requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  });
+}
+
+// Aguarda a entrada recém-capturada voltar ao repouso para não registrar a
+// soltura do stick/gatilho como o próximo passo da calibração.
+function waitInputReleased(src, signal){
+  return new Promise(resolve=>{
+    if(!src){ resolve(); return; }
+    let stable=0;
+    const tick=()=>{
+      if(signal.cancelled){ resolve(); return; }
+      const gp=navigator.getGamepads()[padIndex];
+      if(!gp){ resolve(); return; }
+      let released=true;
+      if(src.type==='button'){
+        released=!gp.buttons[src.index] || gp.buttons[src.index].value<CALIB_BUTTON_OFF;
+      } else if(src.type==='axis'){
+        released=Math.abs(finiteNumber(gp.axes[src.index], 0)-finiteNumber(src.rest, 0))<0.25;
+      }
+      stable = released ? stable+1 : 0;
+      if(stable>=4) resolve();
+      else requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  });
+}
+
+async function startCalibration(){
+  if(padIndex===null || calibActive) return;
+  calibActive=true; updateCalibUi();
+  const overlay=document.getElementById('calibOverlay');
+  const promptEl=document.getElementById('calibPrompt');
+  const progEl=document.getElementById('calibProgress');
+  const insp=document.getElementById('calibInspector');
+  // inspetor cru ligado por ?debug=1 (ajuda a ver como o controle reporta cada tecla)
+  if(insp) insp.style.display = urlParams.has('debug') ? 'block' : 'none';
+  overlay.style.display='flex';
+
+  const signal={cancelled:false};
+  const cancel=()=>{ signal.cancelled=true; };
+  const skipSignal={skip:false};
+  document.getElementById('calibCancel').onclick=cancel;
+  document.getElementById('calibSkip').onclick=()=>{ skipSignal.skip=true; };
+
+  const steps=[
+    ...STANDARD_BUTTON_SLOTS.map(([label,slot])=>({kind:'button',label,slot})),
+    ...STANDARD_AXIS_SLOTS.map(([label,slot])=>({kind:'axis',label,slot})),
+  ];
+  const profile={ buttons:new Array(17).fill(null), axes:new Array(4).fill(null), id:padId };
+
+  try{
+    for(let s=0;s<steps.length;s++){
+      const step=steps[s];
+      promptEl.textContent=step.label;
+      progEl.textContent=(s+1)+' / '+steps.length;
+      skipSignal.skip=false;
+      await waitInputSettle(signal);
+      if(signal.cancelled) throw new Error('cancelado');
+
+      const captured=await captureStepInput(signal, skipSignal);
+
+      if(captured){
+        if(step.kind==='button') profile.buttons[step.slot]=captured;
+        else { // eixo de stick: guarda índice; invert se a direção "para a direita/baixo" deu negativa
+          profile.axes[step.slot]={ index:captured.index, invert: captured.dir<0, center:finiteNumber(captured.rest, 0) };
+        }
+        promptEl.textContent='✓';
+        await new Promise(r=>setTimeout(r,140));
+        promptEl.textContent='solte';
+        await waitInputReleased(captured, signal);
+      }
+    }
+    // grava e ativa
+    padProfile=profile;
+    savePadProfile(padId, profile);
+    log('controle calibrado e salvo ✓','ok');
+  }catch(e){
+    log('calibração cancelada','warn');
+  }finally{
+    overlay.style.display='none';
+    calibActive=false;
+    updateCalibUi();
+  }
+}
+
+document.getElementById('calibBtn').onclick=startCalibration;
+document.getElementById('calibClearBtn').onclick=()=>{
+  if(padId){ localStorage.removeItem(padProfileKey(padId)); padProfile=null; log('perfil do controle removido','warn'); updateCalibUi(); }
+};
+updateCalibUi();
 
 const setBtn=(id,on)=>{const el=document.getElementById(id);if(el)el.classList.toggle('on',on);};
 
@@ -707,6 +1054,7 @@ function activateUiFocus(){
 let uiNavCooldown=0;
 function padUiNav(b, ax){
   // Desativa enquanto o streaming está no ar (lá o controle vai pro jogo).
+  if(calibActive) return;
   if(document.getElementById('stage').classList.contains('show')) return;
   const now=performance.now();
   if(now<uiNavCooldown) return;
@@ -723,17 +1071,17 @@ function padLoop(){
   if(padIndex!==null){
     const gp=navigator.getGamepads()[padIndex];
     if(gp){
-      const b=gp.buttons.map(x=>x.pressed);
-      const ax=gp.axes;
+      const m=mapGamepad(gp);     // já no layout standard (aplica perfil se houver)
+      const b=m.buttons, ax=m.axes;
       padUiNav(b, ax);
       // visual
       setBtn('bA',b[0]);setBtn('bB',b[1]);setBtn('bX',b[2]);setBtn('bY',b[3]);
       setBtn('bLB',b[4]);setBtn('bRB',b[5]);
       setBtn('bBack',b[8]);setBtn('bStart',b[9]);setBtn('bGuide',b[16]);
       setBtn('bDV',b[12]||b[13]);setBtn('bDH',b[14]||b[15]);
-      // gatilhos analógicos (botões 6/7)
-      document.getElementById('tLT').setAttribute('width',(gp.buttons[6].value*40).toFixed(1));
-      document.getElementById('tRT').setAttribute('width',(gp.buttons[7].value*40).toFixed(1));
+      // gatilhos analógicos (slots 6/7)
+      document.getElementById('tLT').setAttribute('width',(m.values[6]*40).toFixed(1));
+      document.getElementById('tRT').setAttribute('width',(m.values[7]*40).toFixed(1));
       // sticks
       document.getElementById('sL').setAttribute('cx',78+(ax[0]||0)*11);
       document.getElementById('sL').setAttribute('cy',92+(ax[1]||0)*11);
@@ -905,10 +1253,10 @@ function sendInput(){
   const useVirtual = vpadState.active;
   if(!gp && !useVirtual) return; // nada para enviar
 
-  // base: controle físico, se houver
-  let buttons = gp ? gp.buttons.map(b=>b.pressed) : new Array(17).fill(false);
-  let axes    = gp ? [...gp.axes.slice(0,4), gp.buttons[6].value, gp.buttons[7].value]
-                   : [0,0,0,0,0,0];
+  // base: controle físico (já traduzido para o layout standard via perfil)
+  const m = mapGamepad(gp);
+  let buttons = m.buttons.slice();
+  let axes    = m.axes.slice();
 
   // mescla o controle virtual (OR nos botões, soma saturada nos eixos/gatilhos)
   if(useVirtual){
