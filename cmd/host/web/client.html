@@ -40,26 +40,37 @@
     display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
     max-width: calc(100% - 180px);
   }
-  #stageExit {
-    position: fixed; top: 14px; right: 14px; z-index: 501; width: auto; padding: 10px 18px;
+  /* menu de 3 pontos (substitui os botões soltos do HUD) */
+  #stageMenuWrap { position: fixed; top: 14px; right: 14px; z-index: 502; }
+  #stageMenuBtn {
+    width: 46px; height: 46px; padding: 0; border-radius: 12px;
+    display: flex; align-items: center; justify-content: center; font-size: 22px; line-height: 1;
   }
-  /* botões de toggle do HUD durante o streaming */
-  #stageTools {
-    position: fixed; top: 14px; right: 150px; z-index: 501;
-    display: flex; gap: 8px; align-items: center;
+  #stageMenu {
+    position: absolute; top: 54px; right: 0; min-width: 248px;
+    background: color-mix(in srgb, var(--bg-2) 94%, #000);
+    border: 1px solid var(--line-2); border-radius: 12px;
+    box-shadow: 0 12px 34px rgba(0,0,0,.55); backdrop-filter: blur(8px);
+    padding: 8px; display: none; flex-direction: column; gap: 4px;
   }
-  .stage-tool {
-    width: auto; padding: 10px 14px; font-size: 13px;
-    display: inline-flex; align-items: center; gap: 7px; white-space: nowrap;
+  #stageMenu.open { display: flex; }
+  .menu-item {
+    display: flex; align-items: center; gap: 10px; width: 100%;
+    padding: 11px 12px; border-radius: 8px; cursor: pointer;
+    background: transparent; border: 1px solid transparent;
+    color: var(--txt); font: 13px var(--mono); text-align: left;
   }
-  .stage-tool .tdot {
-    width: 8px; height: 8px; border-radius: 50%;
-    background: var(--txt-mute); transition: background .15s, box-shadow .15s;
-  }
-  .stage-tool.on .tdot {
-    background: var(--acid);
-    box-shadow: 0 0 8px color-mix(in srgb, var(--acid) 70%, transparent);
-  }
+  .menu-item:hover, .menu-item:focus-visible { background: color-mix(in srgb, var(--acid) 12%, transparent); border-color: var(--line-2); }
+  .menu-item .mi-ico { width: 18px; text-align: center; opacity: .85; }
+  .menu-item .mi-state { margin-left: auto; font-size: 11px; color: var(--txt-dim); letter-spacing: .5px; }
+  .menu-item.on .mi-state { color: var(--acid); }
+  .menu-item.danger { color: #e87a6f; }
+  .menu-item.danger:hover { background: color-mix(in srgb, #e05a4f 16%, transparent); border-color: #e05a4f; }
+  .menu-sep { height: 1px; background: var(--line); margin: 5px 4px; }
+  .menu-row { padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
+  .menu-row .mr-head { display: flex; align-items: center; gap: 10px; font: 13px var(--mono); color: var(--txt); }
+  .menu-row .mr-head .mr-val { margin-left: auto; font-size: 11px; color: var(--acid); }
+  .menu-row input[type=range] { width: 100%; accent-color: var(--acid); }
   /* HUD de stats oculto: o jogo fica limpo */
   #stageHud.hud-hidden { display: none; }
 
@@ -68,9 +79,14 @@
     position: fixed; inset: 0; z-index: 505; display: none;
     pointer-events: none; /* só os controles capturam toque; o resto deixa passar */
     touch-action: none; user-select: none; -webkit-user-select: none;
+    --vpad-opacity: 0.85; /* ajustável pelo slider do menu */
+    opacity: var(--vpad-opacity);
   }
   #vpad.show { display: block; }
   #vpad * { pointer-events: auto; touch-action: none; }
+  /* o nub é puramente visual: não deve roubar o ponteiro do stick (causava
+     leitura de coordenada errada -> analógico "preso" numa direção) */
+  #vpad .nub { pointer-events: none; }
   /* zona inferior segura, longe do conteúdo central do jogo */
   .vp-cluster {
     position: absolute; bottom: max(24px, env(safe-area-inset-bottom));
@@ -135,7 +151,8 @@
   /* ombros e gatilhos (topo) */
   .vp-shoulder { position: absolute; top: max(80px, calc(env(safe-area-inset-top) + 70px)); display: flex; gap: 10px; }
   .vp-sl { left: max(24px, env(safe-area-inset-left)); }
-  .vp-sr { right: max(24px, env(safe-area-inset-right)); }
+  /* desce os ombros direitos para não ficarem sob o botão de menu (⋮) */
+  .vp-sr { right: max(24px, env(safe-area-inset-right)); top: max(120px, calc(env(safe-area-inset-top) + 110px)); }
   .vp-trig {
     min-width: 64px; padding: 11px 0; text-align: center;
     font: 700 13px var(--mono); color: var(--txt-dim);
@@ -338,11 +355,25 @@
     <span class="pill"><span class="dot" style="background:var(--cyan)"></span> <span id="hudRtt">— ms</span></span>
     <span class="pill"><span class="dot" style="background:var(--acid)"></span> <span id="audioState">aud —</span></span>
   </div>
-  <div id="stageTools">
-    <button class="btn stage-tool on" id="toggleStats" title="Mostrar/ocultar estatísticas"><span class="tdot"></span> stats</button>
-    <button class="btn stage-tool" id="toggleVpad" title="Mostrar/ocultar controle na tela"><span class="tdot"></span> controle</button>
+  <div id="stageMenuWrap">
+    <button class="btn" id="stageMenuBtn" title="Menu" aria-haspopup="true" aria-expanded="false">⋮</button>
+    <div id="stageMenu" role="menu">
+      <button class="menu-item on" id="toggleStats" role="menuitemcheckbox">
+        <span class="mi-ico">📊</span> estatísticas <span class="mi-state">EXIBINDO</span>
+      </button>
+      <button class="menu-item" id="toggleVpad" role="menuitemcheckbox">
+        <span class="mi-ico">🎮</span> controle na tela <span class="mi-state">OCULTO</span>
+      </button>
+      <div class="menu-row" id="opacityRow">
+        <div class="mr-head"><span class="mi-ico">🌓</span> transparência <span class="mr-val" id="opacityVal">85%</span></div>
+        <input type="range" id="opacityRange" min="20" max="100" step="5" value="85">
+      </div>
+      <div class="menu-sep"></div>
+      <button class="menu-item danger" id="stageExit" role="menuitem">
+        <span class="mi-ico">⛒</span> encerrar sessão
+      </button>
+    </div>
   </div>
-  <button class="btn" id="stageExit">⛒ encerrar</button>
 
   <!-- controle Xbox virtual (touch) -->
   <div id="vpad" aria-hidden="true">
@@ -1042,36 +1073,70 @@ function endStream(opts={}){
 }
 document.getElementById('stageExit').onclick = () => endStream({manual:true});
 
-/* ---------- toggles do HUD: ocultar stats / mostrar controle virtual ---------- */
-(function setupStageToggles(){
+/* ---------- menu de 3 pontos: stats / controle / transparência / encerrar ---------- */
+(function setupStageMenu(){
   const hud=document.getElementById('stageHud');
+  const vpad=document.getElementById('vpad');
+  const menuBtn=document.getElementById('stageMenuBtn');
+  const menu=document.getElementById('stageMenu');
   const tStats=document.getElementById('toggleStats');
   const tVpad=document.getElementById('toggleVpad');
-  const vpad=document.getElementById('vpad');
+  const opacityRow=document.getElementById('opacityRow');
+  const opacityRange=document.getElementById('opacityRange');
+  const opacityVal=document.getElementById('opacityVal');
 
   // preferências persistem entre sessões
   const statsHidden = localStorage.getItem('tether.hideStats')==='1';
   const vpadOn      = localStorage.getItem('tether.showVpad')==='1';
+  const opacity     = parseInt(localStorage.getItem('tether.vpadOpacity')||'85', 10);
 
+  // ---- abrir/fechar menu ----
+  function openMenu(open){
+    menu.classList.toggle('open', open);
+    menuBtn.setAttribute('aria-expanded', open?'true':'false');
+  }
+  menuBtn.onclick=e=>{ e.stopPropagation(); openMenu(!menu.classList.contains('open')); };
+  // clicar fora fecha
+  document.addEventListener('pointerdown', e=>{
+    if(menu.classList.contains('open') && !menu.contains(e.target) && e.target!==menuBtn) openMenu(false);
+  }, true);
+
+  // ---- estatísticas ----
   function applyStats(hidden){
     hud.classList.toggle('hud-hidden', hidden);
     tStats.classList.toggle('on', !hidden);
+    tStats.querySelector('.mi-state').textContent = hidden ? 'OCULTO' : 'EXIBINDO';
     localStorage.setItem('tether.hideStats', hidden?'1':'0');
   }
+  tStats.onclick=()=>applyStats(!hud.classList.contains('hud-hidden'));
+
+  // ---- controle na tela ----
   function applyVpad(on){
     vpad.classList.toggle('show', on);
     vpad.setAttribute('aria-hidden', on?'false':'true');
     tVpad.classList.toggle('on', on);
+    tVpad.querySelector('.mi-state').textContent = on ? 'EXIBINDO' : 'OCULTO';
+    opacityRow.style.display = on ? 'flex' : 'none'; // só faz sentido com o controle visível
     vpadState.active=on;
     if(on) installVpadCapture();
     else resetVpadState();
     localStorage.setItem('tether.showVpad', on?'1':'0');
   }
+  tVpad.onclick=()=>applyVpad(!vpad.classList.contains('show'));
 
-  tStats.onclick=()=>applyStats(!hud.classList.contains('hud-hidden'));
-  tVpad.onclick =()=>applyVpad(!vpad.classList.contains('show'));
+  // ---- transparência do controle ----
+  function applyOpacity(pct){
+    pct=Math.max(20, Math.min(100, pct));
+    vpad.style.setProperty('--vpad-opacity', (pct/100).toFixed(2));
+    opacityVal.textContent=pct+'%';
+    opacityRange.value=pct;
+    localStorage.setItem('tether.vpadOpacity', String(pct));
+  }
+  opacityRange.oninput=()=>applyOpacity(parseInt(opacityRange.value,10));
 
+  // estado inicial
   applyStats(statsHidden);
+  applyOpacity(opacity);
   applyVpad(vpadOn);
 })();
 
@@ -1112,41 +1177,53 @@ function installVpadCapture(){
   });
 
   // analógicos (arrasto). axes: L->[0,1], R->[2,3]
+  // O rastreio do movimento usa listeners no window (não setPointerCapture no
+  // stick): o nub é pointer-events:none, e o centro é remedido a cada toque, o
+  // que elimina o bug em que o eixo "grudava" numa única direção.
   vpad.querySelectorAll('.vp-stick').forEach(stick=>{
     const isL = stick.dataset.vstick==='L';
     const ax = isL ? [0,1] : [2,3];
     const nub = stick.querySelector('.nub');
+    const maxNub = stick.clientWidth ? stick.clientWidth*0.35 : 36; // deslocamento visual do nub
     let pid=null, cx=0, cy=0, radius=0;
 
-    const start=e=>{
-      e.preventDefault();
-      pid=e.pointerId; stick.setPointerCapture(pid);
-      const r=stick.getBoundingClientRect();
-      cx=r.left+r.width/2; cy=r.top+r.height/2; radius=r.width/2;
-      stick.classList.add('active');
-      move(e);
-    };
-    const move=e=>{
-      if(e.pointerId!==pid) return;
+    const apply=e=>{
       let dx=e.clientX-cx, dy=e.clientY-cy;
-      const dist=Math.hypot(dx,dy)||1;
-      const max=radius;
-      if(dist>max){ dx=dx/dist*max; dy=dy/dist*max; }
-      vpadState.axes[ax[0]]=dx/max;
-      vpadState.axes[ax[1]]=dy/max;
-      nub.style.transform='translate('+dx.toFixed(0)+'px,'+dy.toFixed(0)+'px)';
+      const dist=Math.hypot(dx,dy);
+      // valor normalizado -1..1 (raio do toque limitado ao raio do stick)
+      let nx = radius>0 ? dx/radius : 0;
+      let ny = radius>0 ? dy/radius : 0;
+      const mag=Math.hypot(nx,ny);
+      if(mag>1){ nx/=mag; ny/=mag; }
+      vpadState.axes[ax[0]]=nx;
+      vpadState.axes[ax[1]]=ny;
+      // nub segue o dedo, limitado ao seu raio visual
+      const visN = Math.min(1, mag);
+      nub.style.transform='translate('+(nx*maxNub).toFixed(1)+'px,'+(ny*maxNub).toFixed(1)+'px)';
+      void dist; void visN;
     };
-    const end=e=>{
+    const onMove=e=>{ if(e.pointerId===pid){ e.preventDefault(); apply(e); } };
+    const onUp=e=>{
       if(e.pointerId!==pid) return;
       pid=null;
       vpadState.axes[ax[0]]=0; vpadState.axes[ax[1]]=0;
       nub.style.transform='translate(0,0)';
       stick.classList.remove('active');
+      window.removeEventListener('pointermove', onMove, true);
+      window.removeEventListener('pointerup', onUp, true);
+      window.removeEventListener('pointercancel', onUp, true);
     };
-    stick.addEventListener('pointerdown', start);
-    stick.addEventListener('pointermove', move);
-    stick.addEventListener('pointerup', end);
-    stick.addEventListener('pointercancel', end);
+    stick.addEventListener('pointerdown', e=>{
+      e.preventDefault();
+      pid=e.pointerId;
+      const r=stick.getBoundingClientRect();
+      cx=r.left+r.width/2; cy=r.top+r.height/2; radius=r.width/2;
+      stick.classList.add('active');
+      window.addEventListener('pointermove', onMove, true);
+      window.addEventListener('pointerup', onUp, true);
+      window.addEventListener('pointercancel', onUp, true);
+      apply(e);
+    });
   });
 }
 
