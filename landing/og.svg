@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630">
+  <defs>
+    <radialGradient id="glow" cx="50%" cy="38%" r="60%">
+      <stop offset="0%" stop-color="#0d1416"/>
+      <stop offset="100%" stop-color="#07090a"/>
+    </radialGradient>
+    <filter id="acidGlow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="10" result="b"/>
+      <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
+    </filter>
+    <pattern id="grid" width="48" height="48" patternUnits="userSpaceOnUse">
+      <path d="M48 0H0V48" fill="none" stroke="#2c3a42" stroke-opacity="0.18" stroke-width="1"/>
+    </pattern>
+  </defs>
+
+  <rect width="1200" height="630" fill="url(#glow)"/>
+  <rect width="1200" height="630" fill="url(#grid)"/>
+
+  <!-- brand row -->
+  <g transform="translate(90,86)">
+    <g filter="url(#acidGlow)">
+      <circle cx="22" cy="22" r="20" fill="none" stroke="#b6ff3a" stroke-width="6"/>
+      <circle cx="22" cy="22" r="7" fill="#2ad4ff"/>
+    </g>
+    <text x="62" y="34" font-family="'Segoe UI',Arial,sans-serif" font-size="30" font-weight="700" letter-spacing="11" fill="#cfe3e0">TETHER</text>
+    <g transform="translate(300,8)">
+      <rect x="0" y="0" width="168" height="30" fill="none" stroke="#7aa827" stroke-width="1.5"/>
+      <text x="84" y="21" text-anchor="middle" font-family="'Courier New',monospace" font-size="14" letter-spacing="4" fill="#b6ff3a">LAN STREAM</text>
+    </g>
+  </g>
+
+  <!-- eyebrow -->
+  <text x="90" y="270" font-family="'Courier New',monospace" font-size="22" letter-spacing="6" fill="#b6ff3a">▍ STREAMING DE JOGOS · REDE LOCAL</text>
+
+  <!-- headline -->
+  <text x="86" y="372" font-family="'Segoe UI',Arial,sans-serif" font-size="86" font-weight="800" fill="#cfe3e0">O seu PC na TV da sala.</text>
+  <text x="86" y="468" font-family="'Segoe UI',Arial,sans-serif" font-size="86" font-weight="800" fill="#b6ff3a">Um clique e jogou.</text>
+
+  <!-- subline -->
+  <text x="90" y="540" font-family="'Segoe UI',Arial,sans-serif" font-size="27" fill="#6f8088">Steam Link para a rede local · TV, celular ou tablet · sem nuvem, sem mensalidade.</text>
+
+  <!-- footer chips -->
+  <g font-family="'Courier New',monospace" font-size="18" letter-spacing="2">
+    <text x="90" y="595" fill="#2ad4ff">tether-lan.netlify.app</text>
+    <text x="1110" y="595" text-anchor="end" fill="#44545c">H.264 · LATÊNCIA &lt; 1 FRAME · 4K</text>
+  </g>
+</svg>

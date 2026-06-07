@@ -39,3 +39,6 @@ desktop.ini
 
 # vendor/ é versionado de propósito (build offline e reprodutível).
 /test/
+
+# Local Netlify folder
+.netlify

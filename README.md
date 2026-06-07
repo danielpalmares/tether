@@ -2,7 +2,7 @@
 
 [![Site](https://img.shields.io/badge/site-tether-b6ff3a)](https://tether-lan.netlify.app)
 [![Release](https://img.shields.io/github/v/release/danielpalmares/tether?color=2ad4ff)](https://github.com/danielpalmares/tether/releases/latest)
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![License: AGPL v3](https://img.shields.io/badge/license-AGPL--3.0-blue.svg)](LICENSE)
 ![Platform](https://img.shields.io/badge/host-Windows%2010%2F11-informational)
 
 Streaming de jogos pela rede local com **app host nativo** (Go) e **client 100% no navegador** (WebRTC + Gamepad API). O host abre o **Steam Big Picture** automaticamente quando um client conecta, transmite a tela com baixa latência e recebe o input do controle Xbox de volta.
@@ -123,3 +123,11 @@ internal/steam/             dispara steam://open/bigpicture
 2. Descoberta mDNS (`_tether._tcp.local`) para listar hosts automaticamente
 3. Captura/encode nativos (DXGI + NVENC via cgo) para cortar o overhead do FFmpeg
 4. H.265/AV1 quando o browser do client suportar
+
+## Licença
+
+[GNU AGPL-3.0](LICENSE). Software livre e de código aberto: você pode usar,
+estudar, modificar e redistribuir. Em contrapartida, qualquer trabalho derivado
+— inclusive quando oferecido pela rede como serviço — **deve permanecer aberto
+sob a mesma licença AGPL-3.0**. Não é permitido fechar o código nem revender
+como produto proprietário.
