@@ -1250,9 +1250,18 @@ function installVpadCapture(){
   const release=e=>vpadReleasePointer(e.pointerId);
   window.addEventListener('pointerup', release, true);
   window.addEventListener('pointercancel', release, true);
-  // rede de segurança: pointer perdido sem up (saiu da janela / SO descartou)
+  // rede de segurança: pointer genuinamente perdido (dedo saiu da tela, SO
+  // descartou). setPointerCapture garante que isto chegue ao elemento certo.
   window.addEventListener('lostpointercapture', release, true);
-  window.addEventListener('blur', ()=>{ for(const id of [...vpadPointers.keys()]) vpadReleasePointer(id); });
+  // NÃO usar 'blur' para soltar: o teclado virtual do Big Picture / IME / overlays
+  // disparam blur SEM o usuário sair, e zeravam o stick com o dedo ainda na tela
+  // (travava ao buscar jogo no Big Picture). Só soltamos quando a aba some de
+  // fato (vai para segundo plano) — aí não há mais toque possível.
+  document.addEventListener('visibilitychange', ()=>{
+    if(document.visibilityState==='hidden'){
+      for(const id of [...vpadPointers.keys()]) vpadReleasePointer(id);
+    }
+  });
 }
 
 // medição de RTT
