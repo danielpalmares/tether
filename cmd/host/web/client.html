@@ -1153,6 +1153,7 @@ document.getElementById('stageExit').onclick = () => endStream({manual:true});
 
 /* ---------- captura de toque do controle Xbox virtual ---------- */
 function resetVpadState(){
+  if(typeof vpadPointers!=='undefined') vpadPointers.clear(); // descarta pointers presos
   vpadState.buttons.fill(false);
   vpadState.trig=[0,0];
   vpadState.axes=[0,0,0,0];
@@ -1163,79 +1164,95 @@ function resetVpadState(){
   });
 }
 
+// Mapa global de pointers ativos: pointerId -> descritor do que ele controla.
+// Um único conjunto de listeners no window (instalado uma vez) processa move/up
+// para TODOS os toques. Isso evita o vazamento de listeners por toque que prendia
+// o controle "depois de segundos" quando um pointerup se perdia (multi-toque,
+// dedo saindo da tela). Cada pointer é dono exclusivo do seu controle.
+const vpadPointers = new Map(); // id -> {kind:'stick'|'btn'|'trig', ...}
+
+function vpadReleasePointer(id){
+  const p=vpadPointers.get(id);
+  if(!p) return;
+  if(p.kind==='stick'){
+    vpadState.axes[p.ax[0]]=0; vpadState.axes[p.ax[1]]=0;
+    p.stick.classList.remove('active');
+    if(p.nub) p.nub.style.transform='translate(0,0)';
+  } else if(p.kind==='btn'){
+    vpadState.buttons[p.idx]=false; p.el.classList.remove('on');
+  } else if(p.kind==='trig'){
+    vpadState.trig[p.i]=0; p.el.classList.remove('on');
+  }
+  vpadPointers.delete(id);
+}
+
+function vpadApplyStick(p, clientX, clientY){
+  let nx = p.radius>0 ? (clientX-p.cx)/p.radius : 0;
+  let ny = p.radius>0 ? (clientY-p.cy)/p.radius : 0;
+  const mag=Math.hypot(nx,ny);
+  if(mag>1){ nx/=mag; ny/=mag; }
+  vpadState.axes[p.ax[0]]=nx;
+  vpadState.axes[p.ax[1]]=ny;
+  if(p.nub) p.nub.style.transform='translate('+(nx*p.maxNub).toFixed(1)+'px,'+(ny*p.maxNub).toFixed(1)+'px)';
+}
+
 function installVpadCapture(){
   if(vpadHandlersInstalled) return;
   vpadHandlersInstalled=true;
   const vpad=document.getElementById('vpad');
 
+  // setPointerCapture no elemento que iniciou o toque GARANTE que o navegador
+  // entregue pointerup/pointercancel/lostpointercapture a ele mesmo se o dedo
+  // sair da tela — é o que impede o pointer órfão de prender o controle. O
+  // capture é seguro aqui porque o nub é pointer-events:none (não rouba o toque).
+  const capture=(el,e)=>{ try{ el.setPointerCapture(e.pointerId); }catch(_){} };
+
+  // ---- pointerdown nos controles: registra o dono do pointer ----
   // botões digitais (face, dpad, ombros, meta)
   vpad.querySelectorAll('[data-vbtn]').forEach(el=>{
     const idx=+el.dataset.vbtn;
-    const press=on=>{ vpadState.buttons[idx]=on; el.classList.toggle('on',on); };
-    el.addEventListener('pointerdown', e=>{ e.preventDefault(); el.setPointerCapture(e.pointerId); press(true); });
-    el.addEventListener('pointerup',   e=>{ e.preventDefault(); press(false); });
-    el.addEventListener('pointercancel', ()=>press(false));
-    el.addEventListener('pointerleave', e=>{ if(e.buttons) press(false); });
-  });
-
-  // gatilhos analógicos LT/RT (mapeados como pressão total ao tocar)
-  vpad.querySelectorAll('[data-vtrig]').forEach(el=>{
-    const i = +el.dataset.vtrig===6 ? 0 : 1; // LT->0, RT->1
-    const set=v=>{ vpadState.trig[i]=v; el.classList.toggle('on',v>0); };
-    el.addEventListener('pointerdown', e=>{ e.preventDefault(); el.setPointerCapture(e.pointerId); set(1); });
-    el.addEventListener('pointerup',   e=>{ e.preventDefault(); set(0); });
-    el.addEventListener('pointercancel', ()=>set(0));
-  });
-
-  // analógicos (arrasto). axes: L->[0,1], R->[2,3]
-  // O rastreio do movimento usa listeners no window (não setPointerCapture no
-  // stick): o nub é pointer-events:none, e o centro é remedido a cada toque, o
-  // que elimina o bug em que o eixo "grudava" numa única direção.
-  vpad.querySelectorAll('.vp-stick').forEach(stick=>{
-    const isL = stick.dataset.vstick==='L';
-    const ax = isL ? [0,1] : [2,3];
-    const nub = stick.querySelector('.nub');
-    const maxNub = stick.clientWidth ? stick.clientWidth*0.35 : 36; // deslocamento visual do nub
-    let pid=null, cx=0, cy=0, radius=0;
-
-    const apply=e=>{
-      let dx=e.clientX-cx, dy=e.clientY-cy;
-      const dist=Math.hypot(dx,dy);
-      // valor normalizado -1..1 (raio do toque limitado ao raio do stick)
-      let nx = radius>0 ? dx/radius : 0;
-      let ny = radius>0 ? dy/radius : 0;
-      const mag=Math.hypot(nx,ny);
-      if(mag>1){ nx/=mag; ny/=mag; }
-      vpadState.axes[ax[0]]=nx;
-      vpadState.axes[ax[1]]=ny;
-      // nub segue o dedo, limitado ao seu raio visual
-      const visN = Math.min(1, mag);
-      nub.style.transform='translate('+(nx*maxNub).toFixed(1)+'px,'+(ny*maxNub).toFixed(1)+'px)';
-      void dist; void visN;
-    };
-    const onMove=e=>{ if(e.pointerId===pid){ e.preventDefault(); apply(e); } };
-    const onUp=e=>{
-      if(e.pointerId!==pid) return;
-      pid=null;
-      vpadState.axes[ax[0]]=0; vpadState.axes[ax[1]]=0;
-      nub.style.transform='translate(0,0)';
-      stick.classList.remove('active');
-      window.removeEventListener('pointermove', onMove, true);
-      window.removeEventListener('pointerup', onUp, true);
-      window.removeEventListener('pointercancel', onUp, true);
-    };
-    stick.addEventListener('pointerdown', e=>{
-      e.preventDefault();
-      pid=e.pointerId;
-      const r=stick.getBoundingClientRect();
-      cx=r.left+r.width/2; cy=r.top+r.height/2; radius=r.width/2;
-      stick.classList.add('active');
-      window.addEventListener('pointermove', onMove, true);
-      window.addEventListener('pointerup', onUp, true);
-      window.addEventListener('pointercancel', onUp, true);
-      apply(e);
+    el.addEventListener('pointerdown', e=>{
+      e.preventDefault(); capture(el,e);
+      vpadState.buttons[idx]=true; el.classList.add('on');
+      vpadPointers.set(e.pointerId, {kind:'btn', idx, el});
     });
   });
+  // gatilhos analógicos LT/RT (pressão total ao tocar)
+  vpad.querySelectorAll('[data-vtrig]').forEach(el=>{
+    const i = +el.dataset.vtrig===6 ? 0 : 1; // LT->0, RT->1
+    el.addEventListener('pointerdown', e=>{
+      e.preventDefault(); capture(el,e);
+      vpadState.trig[i]=1; el.classList.add('on');
+      vpadPointers.set(e.pointerId, {kind:'trig', i, el});
+    });
+  });
+  // analógicos (arrasto). axes: L->[0,1], R->[2,3]
+  vpad.querySelectorAll('.vp-stick').forEach(stick=>{
+    const ax = stick.dataset.vstick==='L' ? [0,1] : [2,3];
+    const nub = stick.querySelector('.nub');
+    stick.addEventListener('pointerdown', e=>{
+      e.preventDefault(); capture(stick,e);
+      const r=stick.getBoundingClientRect();
+      const p={kind:'stick', stick, ax, nub,
+               cx:r.left+r.width/2, cy:r.top+r.height/2, radius:r.width/2,
+               maxNub: stick.clientWidth ? stick.clientWidth*0.35 : 36};
+      stick.classList.add('active');
+      vpadPointers.set(e.pointerId, p);
+      vpadApplyStick(p, e.clientX, e.clientY);
+    });
+  });
+
+  // ---- listeners GLOBAIS únicos: roteiam move/up pelo mapa de pointers ----
+  window.addEventListener('pointermove', e=>{
+    const p=vpadPointers.get(e.pointerId);
+    if(p && p.kind==='stick'){ e.preventDefault(); vpadApplyStick(p, e.clientX, e.clientY); }
+  }, true);
+  const release=e=>vpadReleasePointer(e.pointerId);
+  window.addEventListener('pointerup', release, true);
+  window.addEventListener('pointercancel', release, true);
+  // rede de segurança: pointer perdido sem up (saiu da janela / SO descartou)
+  window.addEventListener('lostpointercapture', release, true);
+  window.addEventListener('blur', ()=>{ for(const id of [...vpadPointers.keys()]) vpadReleasePointer(id); });
 }
 
 // medição de RTT
