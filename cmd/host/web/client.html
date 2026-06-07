@@ -446,6 +446,12 @@ const vpadState = {
   axes:[0,0,0,0],      // LX, LY, RX, RY
 };
 let vpadHandlersInstalled=false;
+// Mapa global de pointers ativos: pointerId -> descritor do controle que ele
+// segura. DEVE ser declarado aqui no topo: resetVpadState()/setupStageMenu()
+// rodam na inicialização e o acessam — se ficasse mais abaixo, a TDZ do const
+// lançava "Cannot access 'vpadPointers' before initialization" e abortava todo
+// o setup do controle no boot.
+const vpadPointers = new Map(); // id -> {kind:'stick'|'btn'|'trig', ...}
 const urlParams = new URLSearchParams(location.search);
 const audioMode = !urlParams.has('noaudio');
 const videoOnlyMode = !audioMode;
@@ -1153,7 +1159,7 @@ document.getElementById('stageExit').onclick = () => endStream({manual:true});
 
 /* ---------- captura de toque do controle Xbox virtual ---------- */
 function resetVpadState(){
-  if(typeof vpadPointers!=='undefined') vpadPointers.clear(); // descarta pointers presos
+  vpadPointers.clear(); // descarta pointers presos
   vpadState.buttons.fill(false);
   vpadState.trig=[0,0];
   vpadState.axes=[0,0,0,0];
@@ -1164,12 +1170,38 @@ function resetVpadState(){
   });
 }
 
-// Mapa global de pointers ativos: pointerId -> descritor do que ele controla.
-// Um único conjunto de listeners no window (instalado uma vez) processa move/up
-// para TODOS os toques. Isso evita o vazamento de listeners por toque que prendia
-// o controle "depois de segundos" quando um pointerup se perdia (multi-toque,
-// dedo saindo da tela). Cada pointer é dono exclusivo do seu controle.
-const vpadPointers = new Map(); // id -> {kind:'stick'|'btn'|'trig', ...}
+// hook de diagnóstico (leve, sempre disponível): permite a um harness de teste
+// externo (CDP) ler o estado real do controle sob toque genuíno.
+window.__vpad = {
+  state: vpadState,
+  axes: () => vpadState.axes.slice(),
+  buttons: () => vpadState.buttons.slice(),
+  trig: () => vpadState.trig.slice(),
+  pointers: () => vpadPointers.size,
+};
+
+// Overlay de debug na tela (abra o client com ?debug=1). Mostra eixos, botões
+// pressionados e nº de toques ativos ao vivo — para diagnosticar no aparelho real.
+if(new URLSearchParams(location.search).has('debug')){
+  const dbg=document.createElement('div');
+  dbg.style.cssText='position:fixed;top:70px;left:14px;z-index:600;font:11px var(--mono,monospace);'
+    +'background:rgba(0,0,0,.8);color:#9eff5a;padding:8px 10px;border:1px solid #2a3;border-radius:8px;'
+    +'white-space:pre;pointer-events:none;line-height:1.5';
+  document.body.appendChild(dbg);
+  const fmt=v=>(v>=0?' ':'')+v.toFixed(2);
+  setInterval(()=>{
+    const a=vpadState.axes, t=vpadState.trig;
+    const pressed=vpadState.buttons.map((b,i)=>b?i:null).filter(x=>x!==null);
+    const ptrs=[...vpadPointers.entries()].map(([id,p])=>id+':'+p.kind).join(' ');
+    dbg.textContent=
+      'LX'+fmt(a[0])+' LY'+fmt(a[1])+'\n'+
+      'RX'+fmt(a[2])+' RY'+fmt(a[3])+'\n'+
+      'LT'+fmt(t[0])+' RT'+fmt(t[1])+'\n'+
+      'btns ['+pressed.join(',')+']\n'+
+      'ptrs('+vpadPointers.size+') '+ptrs+'\n'+
+      'mode '+(window.PointerEvent!==undefined?'pointer':'touch');
+  }, 80);
+}
 
 function vpadReleasePointer(id){
   const p=vpadPointers.get(id);
@@ -1196,67 +1228,90 @@ function vpadApplyStick(p, clientX, clientY){
   if(p.nub) p.nub.style.transform='translate('+(nx*p.maxNub).toFixed(1)+'px,'+(ny*p.maxNub).toFixed(1)+'px)';
 }
 
+// Resolve qual controle está sob uma coordenada de tela (para o caminho Touch
+// Events, que não tem "currentTarget" por toque como o Pointer Events).
+function vpadControlAt(clientX, clientY){
+  const el=document.elementFromPoint(clientX, clientY);
+  if(!el) return null;
+  return el.closest('.vp-stick, [data-vbtn], [data-vtrig]');
+}
+
+function vpadEngage(id, controlEl, clientX, clientY){
+  if(controlEl.classList.contains('vp-stick')){
+    const r=controlEl.getBoundingClientRect();
+    const p={kind:'stick', stick:controlEl, ax: controlEl.dataset.vstick==='L'?[0,1]:[2,3],
+             nub: controlEl.querySelector('.nub'),
+             cx:r.left+r.width/2, cy:r.top+r.height/2, radius:r.width/2,
+             maxNub: controlEl.clientWidth ? controlEl.clientWidth*0.35 : 36};
+    controlEl.classList.add('active');
+    vpadPointers.set(id, p);
+    vpadApplyStick(p, clientX, clientY);
+  } else if(controlEl.dataset.vbtn!==undefined){
+    const idx=+controlEl.dataset.vbtn;
+    vpadState.buttons[idx]=true; controlEl.classList.add('on');
+    vpadPointers.set(id, {kind:'btn', idx, el:controlEl});
+  } else if(controlEl.dataset.vtrig!==undefined){
+    const i = +controlEl.dataset.vtrig===6 ? 0 : 1;
+    vpadState.trig[i]=1; controlEl.classList.add('on');
+    vpadPointers.set(id, {kind:'trig', i, el:controlEl});
+  }
+}
+
+function vpadMove(id, clientX, clientY){
+  const p=vpadPointers.get(id);
+  if(p && p.kind==='stick') vpadApplyStick(p, clientX, clientY);
+}
+
 function installVpadCapture(){
   if(vpadHandlersInstalled) return;
   vpadHandlersInstalled=true;
   const vpad=document.getElementById('vpad');
 
-  // setPointerCapture no elemento que iniciou o toque GARANTE que o navegador
-  // entregue pointerup/pointercancel/lostpointercapture a ele mesmo se o dedo
-  // sair da tela — é o que impede o pointer órfão de prender o controle. O
-  // capture é seguro aqui porque o nub é pointer-events:none (não rouba o toque).
-  const capture=(el,e)=>{ try{ el.setPointerCapture(e.pointerId); }catch(_){} };
+  // O controle suporta DOIS mecanismos de entrada. Muitos navegadores de TV
+  // (Tizen/WebOS) têm Pointer Events incompletos ou bugados; Touch Events são
+  // universais. Detectamos e usamos só UM caminho para não duplicar toques.
+  const usePointer = window.PointerEvent !== undefined;
 
-  // ---- pointerdown nos controles: registra o dono do pointer ----
-  // botões digitais (face, dpad, ombros, meta)
-  vpad.querySelectorAll('[data-vbtn]').forEach(el=>{
-    const idx=+el.dataset.vbtn;
-    el.addEventListener('pointerdown', e=>{
-      e.preventDefault(); capture(el,e);
-      vpadState.buttons[idx]=true; el.classList.add('on');
-      vpadPointers.set(e.pointerId, {kind:'btn', idx, el});
-    });
-  });
-  // gatilhos analógicos LT/RT (pressão total ao tocar)
-  vpad.querySelectorAll('[data-vtrig]').forEach(el=>{
-    const i = +el.dataset.vtrig===6 ? 0 : 1; // LT->0, RT->1
-    el.addEventListener('pointerdown', e=>{
-      e.preventDefault(); capture(el,e);
-      vpadState.trig[i]=1; el.classList.add('on');
-      vpadPointers.set(e.pointerId, {kind:'trig', i, el});
-    });
-  });
-  // analógicos (arrasto). axes: L->[0,1], R->[2,3]
-  vpad.querySelectorAll('.vp-stick').forEach(stick=>{
-    const ax = stick.dataset.vstick==='L' ? [0,1] : [2,3];
-    const nub = stick.querySelector('.nub');
-    stick.addEventListener('pointerdown', e=>{
-      e.preventDefault(); capture(stick,e);
-      const r=stick.getBoundingClientRect();
-      const p={kind:'stick', stick, ax, nub,
-               cx:r.left+r.width/2, cy:r.top+r.height/2, radius:r.width/2,
-               maxNub: stick.clientWidth ? stick.clientWidth*0.35 : 36};
-      stick.classList.add('active');
-      vpadPointers.set(e.pointerId, p);
-      vpadApplyStick(p, e.clientX, e.clientY);
-    });
-  });
+  if(usePointer){
+    // ---- caminho Pointer Events ----
+    vpad.addEventListener('pointerdown', e=>{
+      const ctl=e.target.closest && e.target.closest('.vp-stick, [data-vbtn], [data-vtrig]');
+      if(!ctl) return;
+      e.preventDefault();
+      vpadEngage(e.pointerId, ctl, e.clientX, e.clientY);
+    }, true);
+    window.addEventListener('pointermove', e=>{
+      if(vpadPointers.has(e.pointerId)){ e.preventDefault(); vpadMove(e.pointerId, e.clientX, e.clientY); }
+    }, true);
+    const release=e=>vpadReleasePointer(e.pointerId);
+    window.addEventListener('pointerup', release, true);
+    window.addEventListener('pointercancel', release, true);
+  } else {
+    // ---- caminho Touch Events (fallback p/ TVs sem Pointer Events) ----
+    // changedTouches traz só os toques que mudaram; identifier é o id estável.
+    vpad.addEventListener('touchstart', e=>{
+      let handled=false;
+      for(const t of e.changedTouches){
+        const ctl=vpadControlAt(t.clientX, t.clientY);
+        if(ctl){ vpadEngage('t'+t.identifier, ctl, t.clientX, t.clientY); handled=true; }
+      }
+      if(handled) e.preventDefault();
+    }, {capture:true, passive:false});
+    window.addEventListener('touchmove', e=>{
+      let handled=false;
+      for(const t of e.changedTouches){
+        if(vpadPointers.has('t'+t.identifier)){ vpadMove('t'+t.identifier, t.clientX, t.clientY); handled=true; }
+      }
+      if(handled) e.preventDefault();
+    }, {capture:true, passive:false});
+    const tend=e=>{ for(const t of e.changedTouches) vpadReleasePointer('t'+t.identifier); };
+    window.addEventListener('touchend', tend, true);
+    window.addEventListener('touchcancel', tend, true);
+  }
 
-  // ---- listeners GLOBAIS únicos: roteiam move/up pelo mapa de pointers ----
-  window.addEventListener('pointermove', e=>{
-    const p=vpadPointers.get(e.pointerId);
-    if(p && p.kind==='stick'){ e.preventDefault(); vpadApplyStick(p, e.clientX, e.clientY); }
-  }, true);
-  const release=e=>vpadReleasePointer(e.pointerId);
-  window.addEventListener('pointerup', release, true);
-  window.addEventListener('pointercancel', release, true);
-  // rede de segurança: pointer genuinamente perdido (dedo saiu da tela, SO
-  // descartou). setPointerCapture garante que isto chegue ao elemento certo.
-  window.addEventListener('lostpointercapture', release, true);
-  // NÃO usar 'blur' para soltar: o teclado virtual do Big Picture / IME / overlays
-  // disparam blur SEM o usuário sair, e zeravam o stick com o dedo ainda na tela
-  // (travava ao buscar jogo no Big Picture). Só soltamos quando a aba some de
-  // fato (vai para segundo plano) — aí não há mais toque possível.
+  // Backstop comum: a aba indo para segundo plano solta tudo (não há mais toque
+  // possível). NÃO usamos 'blur' — o teclado do Big Picture / IME disparam blur
+  // sem o usuário sair, e isso travava o stick com o dedo ainda na tela.
   document.addEventListener('visibilitychange', ()=>{
     if(document.visibilityState==='hidden'){
       for(const id of [...vpadPointers.keys()]) vpadReleasePointer(id);
