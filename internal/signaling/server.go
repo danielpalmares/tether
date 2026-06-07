@@ -21,14 +21,29 @@ var upgrader = websocket.Upgrader{
 
 // Server mantém o estado do host e a config corrente.
 type Server struct {
-	mu     sync.Mutex
-	cfg    config.StreamConfig
-	active *webrtc.Session
-	hostNm string
+	mu      sync.Mutex
+	cfg     config.StreamConfig
+	cfgPath string
+	active  *webrtc.Session
+	hostNm  string
 }
 
 func NewServer(hostName string) *Server {
-	return &Server{cfg: config.Default(), hostNm: hostName}
+	path := config.Path()
+	cfg, err := config.Load(path)
+	if err != nil {
+		// arquivo ausente/inválido no primeiro boot: usa o default e tenta
+		// persistir já, para a próxima execução carregar do disco.
+		cfg = config.Default()
+		if saveErr := config.Save(path, cfg); saveErr != nil {
+			log.Printf("[config] não foi possível criar %s: %v", path, saveErr)
+		} else {
+			log.Printf("[config] criado %s com perfil padrão", path)
+		}
+	} else {
+		log.Printf("[config] carregada de %s: %dx%d@%dfps %dkbps", path, cfg.Width, cfg.Height, cfg.FPS, cfg.Bitrate)
+	}
+	return &Server{cfg: cfg, cfgPath: path, hostNm: hostName}
 }
 
 type wsMsg struct {
@@ -135,7 +150,13 @@ func (s *Server) HandleConfig(w http.ResponseWriter, r *http.Request) {
 		active := s.active
 		s.active = nil
 		s.cfg = c
+		path := s.cfgPath
 		s.mu.Unlock()
+
+		// persiste no disco para sobreviver a reinícios/rebuilds do host
+		if err := config.Save(path, c); err != nil {
+			log.Printf("[config] falha ao salvar em %s: %v", path, err)
+		}
 
 		if active != nil {
 			log.Printf("[config] alterada para %dx%d@%dfps %dkbps; reiniciando live ativa", c.Width, c.Height, c.FPS, c.Bitrate)

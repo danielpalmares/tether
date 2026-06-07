@@ -43,6 +43,129 @@
   #stageExit {
     position: fixed; top: 14px; right: 14px; z-index: 501; width: auto; padding: 10px 18px;
   }
+  /* botões de toggle do HUD durante o streaming */
+  #stageTools {
+    position: fixed; top: 14px; right: 150px; z-index: 501;
+    display: flex; gap: 8px; align-items: center;
+  }
+  .stage-tool {
+    width: auto; padding: 10px 14px; font-size: 13px;
+    display: inline-flex; align-items: center; gap: 7px; white-space: nowrap;
+  }
+  .stage-tool .tdot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: var(--txt-mute); transition: background .15s, box-shadow .15s;
+  }
+  .stage-tool.on .tdot {
+    background: var(--acid);
+    box-shadow: 0 0 8px color-mix(in srgb, var(--acid) 70%, transparent);
+  }
+  /* HUD de stats oculto: o jogo fica limpo */
+  #stageHud.hud-hidden { display: none; }
+
+  /* ===== controle Xbox virtual (touch) sobre o stream ===== */
+  #vpad {
+    position: fixed; inset: 0; z-index: 505; display: none;
+    pointer-events: none; /* só os controles capturam toque; o resto deixa passar */
+    touch-action: none; user-select: none; -webkit-user-select: none;
+  }
+  #vpad.show { display: block; }
+  #vpad * { pointer-events: auto; touch-action: none; }
+  /* zona inferior segura, longe do conteúdo central do jogo */
+  .vp-cluster {
+    position: absolute; bottom: max(24px, env(safe-area-inset-bottom));
+    display: flex; align-items: flex-end; gap: 14px;
+  }
+  .vp-left  { left: max(24px, env(safe-area-inset-left)); }
+  .vp-right { right: max(24px, env(safe-area-inset-right)); flex-direction: row-reverse; }
+
+  /* analógicos */
+  .vp-stick {
+    position: relative; width: 124px; height: 124px; border-radius: 50%;
+    background: color-mix(in srgb, var(--bg-2) 78%, transparent);
+    border: 1.5px solid var(--line-2);
+    box-shadow: inset 0 0 22px rgba(0,0,0,.45);
+    backdrop-filter: blur(3px);
+  }
+  .vp-stick .nub {
+    position: absolute; left: 50%; top: 50%; width: 54px; height: 54px;
+    margin: -27px 0 0 -27px; border-radius: 50%;
+    background: color-mix(in srgb, var(--signal) 88%, #000);
+    border: 1.5px solid color-mix(in srgb, var(--acid) 60%, var(--line-2));
+    box-shadow: 0 3px 10px rgba(0,0,0,.5);
+    transition: transform .03s linear;
+  }
+  .vp-stick.active { border-color: var(--acid); }
+
+  /* d-pad */
+  .vp-dpad { position: relative; width: 132px; height: 132px; }
+  .vp-dpad .dbtn {
+    position: absolute; width: 44px; height: 44px;
+    display: flex; align-items: center; justify-content: center;
+    background: color-mix(in srgb, var(--bg-2) 80%, transparent);
+    border: 1.5px solid var(--line-2); color: var(--txt-dim);
+    backdrop-filter: blur(3px); font: 14px var(--mono);
+  }
+  .vp-dpad .dbtn.on { background: var(--acid); color: #001; border-color: var(--acid); }
+  .vp-dpad .du { top:0;    left:44px; border-radius: 8px 8px 0 0; }
+  .vp-dpad .dd { bottom:0; left:44px; border-radius: 0 0 8px 8px; }
+  .vp-dpad .dl { top:44px; left:0;    border-radius: 8px 0 0 8px; }
+  .vp-dpad .dr { top:44px; right:0;   border-radius: 0 8px 8px 0; }
+  .vp-dpad .dc { top:44px; left:44px; background: color-mix(in srgb, var(--bg-2) 60%, transparent); border-color: var(--line); }
+
+  /* botões de face ABXY */
+  .vp-face { position: relative; width: 150px; height: 150px; }
+  .vp-face .fbtn {
+    position: absolute; width: 50px; height: 50px; border-radius: 50%;
+    display: flex; align-items: center; justify-content: center;
+    font: 700 18px var(--mono); color: var(--txt);
+    background: color-mix(in srgb, var(--bg-2) 80%, transparent);
+    border: 2px solid var(--line-2); backdrop-filter: blur(3px);
+  }
+  .vp-face .fbtn.on { transform: scale(.94); filter: brightness(1.5); }
+  .vp-face .fa { bottom:0;  left:50px; border-color:#6cc04a; color:#6cc04a; }
+  .vp-face .fb { top:50px;  right:0;   border-color:#e05a4f; color:#e05a4f; }
+  .vp-face .fx { top:50px;  left:0;    border-color:#3a8ee6; color:#3a8ee6; }
+  .vp-face .fy { top:0;     left:50px; border-color:#e0b13a; color:#e0b13a; }
+  .vp-face .fbtn.on.fa { background:#6cc04a; color:#001; }
+  .vp-face .fbtn.on.fb { background:#e05a4f; color:#100; }
+  .vp-face .fbtn.on.fx { background:#3a8ee6; color:#001; }
+  .vp-face .fbtn.on.fy { background:#e0b13a; color:#100; }
+
+  /* ombros e gatilhos (topo) */
+  .vp-shoulder { position: absolute; top: max(80px, calc(env(safe-area-inset-top) + 70px)); display: flex; gap: 10px; }
+  .vp-sl { left: max(24px, env(safe-area-inset-left)); }
+  .vp-sr { right: max(24px, env(safe-area-inset-right)); }
+  .vp-trig {
+    min-width: 64px; padding: 11px 0; text-align: center;
+    font: 700 13px var(--mono); color: var(--txt-dim);
+    background: color-mix(in srgb, var(--bg-2) 80%, transparent);
+    border: 1.5px solid var(--line-2); border-radius: 10px;
+    backdrop-filter: blur(3px);
+  }
+  .vp-trig.on { background: var(--acid); color:#001; border-color: var(--acid); }
+
+  /* meta: start/back centrais embaixo */
+  .vp-meta {
+    position: absolute; left: 50%; transform: translateX(-50%);
+    bottom: max(24px, env(safe-area-inset-bottom)); display: flex; gap: 16px;
+  }
+  .vp-meta .mbtn {
+    min-width: 56px; padding: 9px 0; text-align: center;
+    font: 700 11px var(--mono); letter-spacing:1px; color: var(--txt-dim);
+    background: color-mix(in srgb, var(--bg-2) 80%, transparent);
+    border: 1.5px solid var(--line-2); border-radius: 18px;
+    backdrop-filter: blur(3px);
+  }
+  .vp-meta .mbtn.on { background: var(--acid); color:#001; border-color: var(--acid); }
+
+  @media (max-width:720px){
+    .vp-stick{ width:104px; height:104px; } .vp-stick .nub{ width:46px; height:46px; margin:-23px 0 0 -23px; }
+    .vp-face{ width:130px; height:130px; } .vp-face .fbtn{ width:44px; height:44px; }
+    .vp-dpad{ width:114px; height:114px; } .vp-dpad .dbtn{ width:38px; height:38px; }
+    .vp-dpad .du,.vp-dpad .dd{ left:38px; } .vp-dpad .dl,.vp-dpad .dc{ top:38px; }
+    .vp-dpad .dc{ left:38px; } .vp-dpad .dr{ top:38px; }
+  }
 
   /* gamepad tester */
   .pad-wrap { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; align-items: center; }
@@ -215,7 +338,53 @@
     <span class="pill"><span class="dot" style="background:var(--cyan)"></span> <span id="hudRtt">— ms</span></span>
     <span class="pill"><span class="dot" style="background:var(--acid)"></span> <span id="audioState">aud —</span></span>
   </div>
+  <div id="stageTools">
+    <button class="btn stage-tool on" id="toggleStats" title="Mostrar/ocultar estatísticas"><span class="tdot"></span> stats</button>
+    <button class="btn stage-tool" id="toggleVpad" title="Mostrar/ocultar controle na tela"><span class="tdot"></span> controle</button>
+  </div>
   <button class="btn" id="stageExit">⛒ encerrar</button>
+
+  <!-- controle Xbox virtual (touch) -->
+  <div id="vpad" aria-hidden="true">
+    <!-- ombros / gatilhos -->
+    <div class="vp-shoulder vp-sl">
+      <div class="vp-trig" data-vbtn="4">LB</div>
+      <div class="vp-trig" data-vtrig="6">LT</div>
+    </div>
+    <div class="vp-shoulder vp-sr">
+      <div class="vp-trig" data-vtrig="7">RT</div>
+      <div class="vp-trig" data-vbtn="5">RB</div>
+    </div>
+
+    <!-- start / back -->
+    <div class="vp-meta">
+      <div class="mbtn" data-vbtn="8">BACK</div>
+      <div class="mbtn" data-vbtn="9">START</div>
+    </div>
+
+    <!-- canto esquerdo: stick L + d-pad -->
+    <div class="vp-cluster vp-left">
+      <div class="vp-stick" data-vstick="L"><div class="nub"></div></div>
+      <div class="vp-dpad">
+        <div class="dbtn du" data-vbtn="12">▲</div>
+        <div class="dbtn dl" data-vbtn="14">◀</div>
+        <div class="dbtn dc"></div>
+        <div class="dbtn dr" data-vbtn="15">▶</div>
+        <div class="dbtn dd" data-vbtn="13">▼</div>
+      </div>
+    </div>
+
+    <!-- canto direito: ABXY + stick R -->
+    <div class="vp-cluster vp-right">
+      <div class="vp-stick" data-vstick="R"><div class="nub"></div></div>
+      <div class="vp-face">
+        <div class="fbtn fy" data-vbtn="3">Y</div>
+        <div class="fbtn fx" data-vbtn="2">X</div>
+        <div class="fbtn fb" data-vbtn="1">B</div>
+        <div class="fbtn fa" data-vbtn="0">A</div>
+      </div>
+    </div>
+  </div>
 </div>
 
 <script>
@@ -230,6 +399,18 @@ let latencyHintLogged=false;
 let cursorIdleTimer=null;
 let manualEnd=false;
 let keysDown=new Set();
+
+// estado do controle Xbox virtual (touch). buttons[0..16] e axes[0..3]
+// espelham o layout padrão do navigator.getGamepads(); os gatilhos LT/RT
+// ficam em vButtonsVal[6]/[7] (valor analógico 0..1) — sendInput() já lê
+// gp.buttons[6/7].value, então o virtual replica essa estrutura.
+const vpadState = {
+  active:false,
+  buttons:new Array(17).fill(false),
+  trig:[0,0],          // [LT, RT] analógicos
+  axes:[0,0,0,0],      // LX, LY, RX, RY
+};
+let vpadHandlersInstalled=false;
 const urlParams = new URLSearchParams(location.search);
 const audioMode = !urlParams.has('noaudio');
 const videoOnlyMode = !audioMode;
@@ -678,12 +859,27 @@ function enablePlayoutDelayExtension(sdp){
 }
 
 function sendInput(){
-  if(!dc || dc.readyState!=='open' || padIndex===null) return;
-  const gp=navigator.getGamepads()[padIndex];
-  if(!gp) return;
-  const buttons=gp.buttons.map(b=>b.pressed);
-  // anexa valores analógicos dos gatilhos como eixos 4 e 5
-  const axes=[...gp.axes.slice(0,4), gp.buttons[6].value, gp.buttons[7].value];
+  if(!dc || dc.readyState!=='open') return;
+  const gp = padIndex!==null ? navigator.getGamepads()[padIndex] : null;
+  const useVirtual = vpadState.active;
+  if(!gp && !useVirtual) return; // nada para enviar
+
+  // base: controle físico, se houver
+  let buttons = gp ? gp.buttons.map(b=>b.pressed) : new Array(17).fill(false);
+  let axes    = gp ? [...gp.axes.slice(0,4), gp.buttons[6].value, gp.buttons[7].value]
+                   : [0,0,0,0,0,0];
+
+  // mescla o controle virtual (OR nos botões, soma saturada nos eixos/gatilhos)
+  if(useVirtual){
+    for(let i=0;i<17;i++) buttons[i] = buttons[i] || !!vpadState.buttons[i];
+    const clamp=v=>Math.max(-1,Math.min(1,v));
+    axes[0]=clamp(axes[0]+vpadState.axes[0]);
+    axes[1]=clamp(axes[1]+vpadState.axes[1]);
+    axes[2]=clamp(axes[2]+vpadState.axes[2]);
+    axes[3]=clamp(axes[3]+vpadState.axes[3]);
+    axes[4]=Math.max(axes[4], vpadState.trig[0]);
+    axes[5]=Math.max(axes[5], vpadState.trig[1]);
+  }
   dc.send(JSON.stringify({type:'gamepad', buttons, axes}));
 }
 
@@ -813,6 +1009,7 @@ function endStream(opts={}){
   }
   if(inputTimer) clearInterval(inputTimer);
   uninstallControlCapture();
+  resetVpadState(); // solta qualquer botão/stick virtual preso
   if(dc) dc.close();
   if(pc) pc.close();
   if(signalWs) signalWs.close();
@@ -844,6 +1041,114 @@ function endStream(opts={}){
   log(keepFullscreen ? 'sessão pausada para reconfigurar' : 'sessão encerrada','warn');
 }
 document.getElementById('stageExit').onclick = () => endStream({manual:true});
+
+/* ---------- toggles do HUD: ocultar stats / mostrar controle virtual ---------- */
+(function setupStageToggles(){
+  const hud=document.getElementById('stageHud');
+  const tStats=document.getElementById('toggleStats');
+  const tVpad=document.getElementById('toggleVpad');
+  const vpad=document.getElementById('vpad');
+
+  // preferências persistem entre sessões
+  const statsHidden = localStorage.getItem('tether.hideStats')==='1';
+  const vpadOn      = localStorage.getItem('tether.showVpad')==='1';
+
+  function applyStats(hidden){
+    hud.classList.toggle('hud-hidden', hidden);
+    tStats.classList.toggle('on', !hidden);
+    localStorage.setItem('tether.hideStats', hidden?'1':'0');
+  }
+  function applyVpad(on){
+    vpad.classList.toggle('show', on);
+    vpad.setAttribute('aria-hidden', on?'false':'true');
+    tVpad.classList.toggle('on', on);
+    vpadState.active=on;
+    if(on) installVpadCapture();
+    else resetVpadState();
+    localStorage.setItem('tether.showVpad', on?'1':'0');
+  }
+
+  tStats.onclick=()=>applyStats(!hud.classList.contains('hud-hidden'));
+  tVpad.onclick =()=>applyVpad(!vpad.classList.contains('show'));
+
+  applyStats(statsHidden);
+  applyVpad(vpadOn);
+})();
+
+/* ---------- captura de toque do controle Xbox virtual ---------- */
+function resetVpadState(){
+  vpadState.buttons.fill(false);
+  vpadState.trig=[0,0];
+  vpadState.axes=[0,0,0,0];
+  document.querySelectorAll('#vpad .on').forEach(el=>el.classList.remove('on'));
+  document.querySelectorAll('#vpad .vp-stick').forEach(s=>{
+    s.classList.remove('active');
+    const nub=s.querySelector('.nub'); if(nub) nub.style.transform='translate(0,0)';
+  });
+}
+
+function installVpadCapture(){
+  if(vpadHandlersInstalled) return;
+  vpadHandlersInstalled=true;
+  const vpad=document.getElementById('vpad');
+
+  // botões digitais (face, dpad, ombros, meta)
+  vpad.querySelectorAll('[data-vbtn]').forEach(el=>{
+    const idx=+el.dataset.vbtn;
+    const press=on=>{ vpadState.buttons[idx]=on; el.classList.toggle('on',on); };
+    el.addEventListener('pointerdown', e=>{ e.preventDefault(); el.setPointerCapture(e.pointerId); press(true); });
+    el.addEventListener('pointerup',   e=>{ e.preventDefault(); press(false); });
+    el.addEventListener('pointercancel', ()=>press(false));
+    el.addEventListener('pointerleave', e=>{ if(e.buttons) press(false); });
+  });
+
+  // gatilhos analógicos LT/RT (mapeados como pressão total ao tocar)
+  vpad.querySelectorAll('[data-vtrig]').forEach(el=>{
+    const i = +el.dataset.vtrig===6 ? 0 : 1; // LT->0, RT->1
+    const set=v=>{ vpadState.trig[i]=v; el.classList.toggle('on',v>0); };
+    el.addEventListener('pointerdown', e=>{ e.preventDefault(); el.setPointerCapture(e.pointerId); set(1); });
+    el.addEventListener('pointerup',   e=>{ e.preventDefault(); set(0); });
+    el.addEventListener('pointercancel', ()=>set(0));
+  });
+
+  // analógicos (arrasto). axes: L->[0,1], R->[2,3]
+  vpad.querySelectorAll('.vp-stick').forEach(stick=>{
+    const isL = stick.dataset.vstick==='L';
+    const ax = isL ? [0,1] : [2,3];
+    const nub = stick.querySelector('.nub');
+    let pid=null, cx=0, cy=0, radius=0;
+
+    const start=e=>{
+      e.preventDefault();
+      pid=e.pointerId; stick.setPointerCapture(pid);
+      const r=stick.getBoundingClientRect();
+      cx=r.left+r.width/2; cy=r.top+r.height/2; radius=r.width/2;
+      stick.classList.add('active');
+      move(e);
+    };
+    const move=e=>{
+      if(e.pointerId!==pid) return;
+      let dx=e.clientX-cx, dy=e.clientY-cy;
+      const dist=Math.hypot(dx,dy)||1;
+      const max=radius;
+      if(dist>max){ dx=dx/dist*max; dy=dy/dist*max; }
+      vpadState.axes[ax[0]]=dx/max;
+      vpadState.axes[ax[1]]=dy/max;
+      nub.style.transform='translate('+dx.toFixed(0)+'px,'+dy.toFixed(0)+'px)';
+    };
+    const end=e=>{
+      if(e.pointerId!==pid) return;
+      pid=null;
+      vpadState.axes[ax[0]]=0; vpadState.axes[ax[1]]=0;
+      nub.style.transform='translate(0,0)';
+      stick.classList.remove('active');
+    };
+    stick.addEventListener('pointerdown', start);
+    stick.addEventListener('pointermove', move);
+    stick.addEventListener('pointerup', end);
+    stick.addEventListener('pointercancel', end);
+  });
+}
 
 // medição de RTT
 setInterval(async () => {
