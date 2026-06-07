@@ -1228,14 +1228,6 @@ function vpadApplyStick(p, clientX, clientY){
   if(p.nub) p.nub.style.transform='translate('+(nx*p.maxNub).toFixed(1)+'px,'+(ny*p.maxNub).toFixed(1)+'px)';
 }
 
-// Resolve qual controle está sob uma coordenada de tela (para o caminho Touch
-// Events, que não tem "currentTarget" por toque como o Pointer Events).
-function vpadControlAt(clientX, clientY){
-  const el=document.elementFromPoint(clientX, clientY);
-  if(!el) return null;
-  return el.closest('.vp-stick, [data-vbtn], [data-vtrig]');
-}
-
 function vpadEngage(id, controlEl, clientX, clientY){
   if(controlEl.classList.contains('vp-stick')){
     const r=controlEl.getBoundingClientRect();
@@ -1267,51 +1259,53 @@ function installVpadCapture(){
   vpadHandlersInstalled=true;
   const vpad=document.getElementById('vpad');
 
-  // O controle suporta DOIS mecanismos de entrada. Muitos navegadores de TV
-  // (Tizen/WebOS) têm Pointer Events incompletos ou bugados; Touch Events são
-  // universais. Detectamos e usamos só UM caminho para não duplicar toques.
-  const usePointer = window.PointerEvent !== undefined;
+  // POR QUE TOUCH EVENTS (e não Pointer Events / listeners no window):
+  // Em TVs (Tizen/WebOS) os eventos de move/up NÃO são entregues a listeners no
+  // window — o navegador da TV só continua mandando o gesto para o ELEMENTO onde
+  // o toque começou. Por isso o controle travava: o 'down' chegava, mas o 'move'
+  // e o 'up' globais nunca disparavam (stick preso, botão não soltava).
+  //
+  // Touch Events resolvem isso por design: depois do touchstart num elemento,
+  // TODOS os touchmove/touchend daquele dedo continuam indo para o MESMO
+  // elemento, mesmo que o dedo saia dele. Então registramos no próprio controle.
+  const hasTouch = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0);
 
-  if(usePointer){
-    // ---- caminho Pointer Events ----
-    vpad.addEventListener('pointerdown', e=>{
-      const ctl=e.target.closest && e.target.closest('.vp-stick, [data-vbtn], [data-vtrig]');
-      if(!ctl) return;
-      e.preventDefault();
-      vpadEngage(e.pointerId, ctl, e.clientX, e.clientY);
-    }, true);
-    window.addEventListener('pointermove', e=>{
-      if(vpadPointers.has(e.pointerId)){ e.preventDefault(); vpadMove(e.pointerId, e.clientX, e.clientY); }
-    }, true);
-    const release=e=>vpadReleasePointer(e.pointerId);
-    window.addEventListener('pointerup', release, true);
-    window.addEventListener('pointercancel', release, true);
+  if(hasTouch){
+    vpad.querySelectorAll('.vp-stick, [data-vbtn], [data-vtrig]').forEach(ctl=>{
+      ctl.addEventListener('touchstart', e=>{
+        e.preventDefault();
+        for(const t of e.changedTouches) vpadEngage('t'+t.identifier, ctl, t.clientX, t.clientY);
+      }, {passive:false});
+      // move/end ficam NO MESMO elemento — a TV entrega aqui de forma confiável
+      ctl.addEventListener('touchmove', e=>{
+        e.preventDefault();
+        for(const t of e.changedTouches) vpadMove('t'+t.identifier, t.clientX, t.clientY);
+      }, {passive:false});
+      const end=e=>{ for(const t of e.changedTouches) vpadReleasePointer('t'+t.identifier); };
+      ctl.addEventListener('touchend', end);
+      ctl.addEventListener('touchcancel', end);
+    });
   } else {
-    // ---- caminho Touch Events (fallback p/ TVs sem Pointer Events) ----
-    // changedTouches traz só os toques que mudaram; identifier é o id estável.
-    vpad.addEventListener('touchstart', e=>{
-      let handled=false;
-      for(const t of e.changedTouches){
-        const ctl=vpadControlAt(t.clientX, t.clientY);
-        if(ctl){ vpadEngage('t'+t.identifier, ctl, t.clientX, t.clientY); handled=true; }
-      }
-      if(handled) e.preventDefault();
-    }, {capture:true, passive:false});
-    window.addEventListener('touchmove', e=>{
-      let handled=false;
-      for(const t of e.changedTouches){
-        if(vpadPointers.has('t'+t.identifier)){ vpadMove('t'+t.identifier, t.clientX, t.clientY); handled=true; }
-      }
-      if(handled) e.preventDefault();
-    }, {capture:true, passive:false});
-    const tend=e=>{ for(const t of e.changedTouches) vpadReleasePointer('t'+t.identifier); };
-    window.addEventListener('touchend', tend, true);
-    window.addEventListener('touchcancel', tend, true);
+    // Desktop/mouse: Pointer Events target-based, com captura no elemento para
+    // receber move/up mesmo fora dele (aqui o capture funciona — ponteiro real).
+    vpad.querySelectorAll('.vp-stick, [data-vbtn], [data-vtrig]').forEach(ctl=>{
+      ctl.addEventListener('pointerdown', e=>{
+        e.preventDefault();
+        try{ ctl.setPointerCapture(e.pointerId); }catch(_){}
+        vpadEngage(e.pointerId, ctl, e.clientX, e.clientY);
+      });
+      ctl.addEventListener('pointermove', e=>{
+        if(vpadPointers.has(e.pointerId)){ e.preventDefault(); vpadMove(e.pointerId, e.clientX, e.clientY); }
+      });
+      const rel=e=>vpadReleasePointer(e.pointerId);
+      ctl.addEventListener('pointerup', rel);
+      ctl.addEventListener('pointercancel', rel);
+      ctl.addEventListener('lostpointercapture', rel);
+    });
   }
 
-  // Backstop comum: a aba indo para segundo plano solta tudo (não há mais toque
-  // possível). NÃO usamos 'blur' — o teclado do Big Picture / IME disparam blur
-  // sem o usuário sair, e isso travava o stick com o dedo ainda na tela.
+  // Backstop: a aba indo para segundo plano solta tudo. NÃO usamos 'blur' — o
+  // teclado do Big Picture / IME disparam blur sem o usuário sair.
   document.addEventListener('visibilitychange', ()=>{
     if(document.visibilityState==='hidden'){
       for(const id of [...vpadPointers.keys()]) vpadReleasePointer(id);
