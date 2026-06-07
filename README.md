@@ -67,6 +67,21 @@ go build -o tether-host.exe ./cmd/host
 5. Clique **iniciar streaming**. O Big Picture abre no host e o vídeo aparece
    em tela cheia no client.
 
+## Limitações conhecidas
+
+> ⚠️ **Jogo em tela preta no client.** A captura usa DXGI Desktop Duplication
+> (`ddagrab`), que só enxerga o que o compositor do Windows (DWM) desenha. Jogos
+> em **tela cheia exclusiva** desenham direto na GPU e a captura recebe um quadro
+> vazio → tela preta (o áudio continua, pois vem por outro caminho). **Solução:**
+> rode o jogo em **janela** ou **janela sem bordas (borderless)**.
+
+> ⚠️ **Travamento em jogos pesados.** Em títulos que saturam a GPU, ela não sobra
+> margem para a captura, e o desktop passa a ser composto de forma irregular — o
+> stream chega engasgado na TV mesmo com o jogo fluido no monitor do PC. É uma
+> **limitação de hardware** (contenção de GPU), não um bug. **Mitigação:** reduza
+> o **bitrate** no painel do host e/ou **limite o FPS do jogo** (ex.: 30), para
+> devolver folga à GPU.
+
 ## Estado do MVP
 
 | Componente | Status |
