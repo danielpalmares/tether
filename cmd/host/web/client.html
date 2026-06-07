@@ -464,6 +464,9 @@ let latencyHintLogged=false;
 let cursorIdleTimer=null;
 let manualEnd=false;
 let keysDown=new Set();
+let calibActive=false;
+const padKeyDown=new Set();
+let padKeyDirtyUntil=0;
 
 // estado do controle Xbox virtual (touch). buttons[0..16] e axes[0..3]
 // espelham o layout padrão do navigator.getGamepads(); os gatilhos LT/RT
@@ -502,6 +505,7 @@ const STANDARD_AXIS_SLOTS = [
   ['Stick Esq. → (eixo X)',0],['Stick Esq. ↓ (eixo Y)',1],
   ['Stick Dir. → (eixo X)',2],['Stick Dir. ↓ (eixo Y)',3],
 ];
+const AXIS_AS_BUTTON_SLOTS = new Set([6,7,12,13,14,15]); // LT/RT + D-pad, quando o HID expõe como eixo/HAT
 const PAD_PROFILE_VERSION = 1;
 const CALIB_BUTTON_ON = 0.6;
 const CALIB_BUTTON_OFF = 0.3;
@@ -512,21 +516,74 @@ function padProfileKey(id){ return 'tether.padmap.'+(id||'').replace(/\s+/g,'_')
 
 function clamp(v,min,max){ return Math.max(min, Math.min(max, v)); }
 function finiteNumber(v, fallback=0){ return Number.isFinite(v) ? v : fallback; }
+function nowMs(){ return (typeof performance!=='undefined' && performance.now) ? performance.now() : Date.now(); }
+function setPadKeyDown(code, down){
+  if(!code) return;
+  if(down) padKeyDown.add(code);
+  else padKeyDown.delete(code);
+  padKeyDirtyUntil=nowMs()+140; // envia pelo menos um frame de soltura
+}
+function profileHasKeySources(profile=padProfile){
+  return profileButtonSources(profile).some(src=>src && src.type==='key' && src.code);
+}
+function isMappedPadKeyCode(code, profile=padProfile){
+  return !!(code && profileButtonSources(profile).some(src=>src && src.type==='key' && src.code===code));
+}
+function hasMappedPadKeyActivity(){
+  if(!profileHasKeySources()) return false;
+  for(const code of padKeyDown){ if(isMappedPadKeyCode(code)) return true; }
+  return nowMs()<padKeyDirtyUntil;
+}
+function keyEventCode(e){
+  if(!e) return '';
+  if(typeof e.code==='string' && e.code) return e.code;
+  if(typeof e.key==='string' && e.key) return 'key:'+e.key;
+  return '';
+}
+function keyEventLabel(e){ return (e && (e.code || e.key)) || 'tecla'; }
+function profileButtonSources(profile=padProfile){
+  if(!profile || !Array.isArray(profile.buttons)) return [];
+  const out=[];
+  profile.buttons.forEach(src=>{
+    if(Array.isArray(src)) src.forEach(s=>{ if(s) out.push(s); });
+    else if(src) out.push(src);
+  });
+  return out;
+}
 
 function normalizePadProfile(profile){
   if(!profile || !Array.isArray(profile.buttons) || !Array.isArray(profile.axes)) return null;
   const buttons=new Array(17).fill(null);
   const axes=new Array(4).fill(null);
-  for(let i=0;i<buttons.length;i++){
-    const src=profile.buttons[i];
-    if(!src || !Number.isInteger(src.index) || src.index<0) continue;
-    if(src.type==='button') buttons[i]={type:'button', index:src.index, rest:finiteNumber(src.rest, 0)};
-    else if(src.type==='axis') buttons[i]={
+  const normalizeButtonSource=src=>{
+    if(!src) return null;
+    if(src.type==='key' && typeof src.code==='string' && src.code){
+      return {type:'key', code:src.code, label:typeof src.label==='string' ? src.label : src.code};
+    }
+    if(!Number.isInteger(src.index) || src.index<0) return null;
+    if(src.type==='button') return {
+      type:'button',
+      index:src.index,
+      rest:finiteNumber(src.rest, 0),
+      restPressed:!!src.restPressed,
+    };
+    if(src.type==='axis') return {
       type:'axis',
       index:src.index,
       dir:src.dir<0 ? -1 : 1,
       rest:finiteNumber(src.rest, 0),
     };
+    return null;
+  };
+  for(let i=0;i<buttons.length;i++){
+    const src=profile.buttons[i];
+    if(!src) continue;
+    if(Array.isArray(src)){
+      const list=src.map(normalizeButtonSource).filter(Boolean);
+      if(list.length) buttons[i]=list;
+    } else {
+      buttons[i]=normalizeButtonSource(src);
+    }
   }
   for(let i=0;i<axes.length;i++){
     const src=profile.axes[i];
@@ -565,13 +622,28 @@ function stickAxisValue(gp, src){
   if(src.invert) v=-v;
   return clamp(v, -1, 1);
 }
+function mappedButtonSourceValue(gp, src){
+  if(!src) return 0;
+  if(src.type==='key') return padKeyDown.has(src.code) ? 1 : 0;
+  if(src.type==='button' && gp && gp.buttons[src.index]){
+    const btn=gp.buttons[src.index];
+    const raw=clamp(finiteNumber(btn.value, 0), 0, 1);
+    const rest=finiteNumber(src.rest, 0);
+    let value = rest>=0.5 ? clamp((rest-raw)/Math.max(0.001,rest), 0, 1)
+                          : clamp((raw-rest)/Math.max(0.001,1-rest), 0, 1);
+    if((!!btn.pressed)!==!!src.restPressed) value=Math.max(value, 1);
+    return value;
+  }
+  if(src.type==='axis' && gp && src.index<gp.axes.length) return axisButtonValue(gp, src);
+  return 0;
+}
 
 // Traduz um Gamepad para o layout standard {buttons:bool[17], values:num[17], axes:num[6]}.
 // Sem perfil + mapping standard -> passa direto. Sem perfil + não-standard ->
 // também passa direto (melhor esforço), mas a UI avisa para calibrar.
 function mapGamepad(gp){
   const out = { buttons:new Array(17).fill(false), values:new Array(17).fill(0), axes:[0,0,0,0,0,0] };
-  if(!gp) return out;
+  if(!gp && !padProfile) return out;
 
   if(!padProfile){
     // direto (standard ou melhor-esforço)
@@ -586,24 +658,16 @@ function mapGamepad(gp){
   // com perfil: cada slot diz de onde vem (botão físico, ou eixo físico c/ direção)
   padProfile.buttons.forEach((src,slot)=>{
     if(!src) return;
-    if(src.type==='button' && gp.buttons[src.index]){
-      const raw=clamp(finiteNumber(gp.buttons[src.index].value, 0), 0, 1);
-      const rest=finiteNumber(src.rest, 0);
-      // valor relativo ao repouso: repousa baixo -> aciona alto; repousa alto -> aciona baixo
-      const value = rest>=0.5 ? clamp((rest-raw)/Math.max(0.001,rest), 0, 1)
-                              : clamp((raw-rest)/Math.max(0.001,1-rest), 0, 1);
-      out.values[slot]=value;
-      out.buttons[slot]=value>0.5;
-    } else if(src.type==='axis' && src.index<gp.axes.length){
-      const value=axisButtonValue(gp, src);
-      out.values[slot]=value;
-      out.buttons[slot]=value>0.5;
-    }
+    const sources=Array.isArray(src) ? src : [src];
+    let value=0;
+    sources.forEach(source=>{ value=Math.max(value, mappedButtonSourceValue(gp, source)); });
+    out.values[slot]=value;
+    out.buttons[slot]=value>0.5;
   });
   // eixos analógicos dos sticks
   padProfile.axes.forEach((src,slot)=>{
     if(!src) return;
-    if(src.index<gp.axes.length) out.axes[slot]=stickAxisValue(gp, src);
+    if(gp && src.index<gp.axes.length) out.axes[slot]=stickAxisValue(gp, src);
   });
   // gatilhos analógicos -> axes[4]/[5] a partir dos slots LT(6)/RT(7)
   out.axes[4]=out.values[6]; out.axes[5]=out.values[7];
@@ -817,6 +881,8 @@ window.addEventListener('gamepadconnected', e => {
   padIndex=e.gamepad.index;
   padId=e.gamepad.id;
   padStandard=e.gamepad.mapping==='standard';
+  padKeyDown.clear();
+  padKeyDirtyUntil=0;
   document.getElementById('padName').textContent=e.gamepad.id.slice(0,28);
   document.getElementById('padName').className='v';
   // carrega perfil salvo p/ este controle; se não houver e o mapping não é
@@ -835,6 +901,8 @@ window.addEventListener('gamepadconnected', e => {
 window.addEventListener('gamepaddisconnected', e => {
   if(padIndex!==null && e.gamepad.index!==padIndex) return;
   padIndex=null; padId=null; padStandard=false; padProfile=null;
+  padKeyDown.clear();
+  padKeyDirtyUntil=0;
   document.getElementById('padName').textContent='nenhum detectado';
   document.getElementById('padName').className='v off';
   updateCalibUi();
@@ -842,8 +910,6 @@ window.addEventListener('gamepaddisconnected', e => {
 });
 
 /* ---------- calibração de controle genérico ---------- */
-let calibActive=false;
-
 function updateCalibUi(){
   const btn=document.getElementById('calibBtn');
   const clr=document.getElementById('calibClearBtn');
@@ -868,10 +934,158 @@ function currentPad(){
   return null;
 }
 
-function captureStepInput(signal, skipSignal){
+let padKeyTrackerInstalled=false;
+function installPadKeyTracker(){
+  if(padKeyTrackerInstalled) return;
+  const keydown=e=>{
+    const code=keyEventCode(e);
+    if(!code) return;
+    if(!calibActive && !isMappedPadKeyCode(code)) return;
+    setPadKeyDown(code, true);
+    e.preventDefault();
+  };
+  const keyup=e=>{
+    const code=keyEventCode(e);
+    if(!code) return;
+    if(!calibActive && !isMappedPadKeyCode(code)) return;
+    setPadKeyDown(code, false);
+    e.preventDefault();
+  };
+  window.addEventListener('keydown', keydown, true);
+  window.addEventListener('keyup', keyup, true);
+  padKeyTrackerInstalled=true;
+}
+installPadKeyTracker();
+
+function sourceKey(src){
+  if(!src) return '';
+  if(src.type==='button') return 'button:'+src.index;
+  if(src.type==='axis') return 'axis:'+src.index+':'+(src.dir<0?-1:1);
+  if(src.type==='key') return 'key:'+src.code;
+  return '';
+}
+function describeSource(src){
+  if(!src) return '—';
+  if(Array.isArray(src)) return src.map(describeSource).join(' + ');
+  if(src.type==='button') return 'btn '+src.index;
+  if(src.type==='axis') return 'eixo '+src.index+(src.dir<0?'−':'+');
+  if(src.type==='key') return 'tecla '+(src.label||src.code);
+  return '—';
+}
+function discoveredSummary(items, max=24){
+  if(!items || !items.length) return 'nenhuma entrada ainda';
+  const labels=items.map(describeSource);
+  const shown=labels.slice(0,max).join('  ');
+  return shown+(labels.length>max ? '  +'+(labels.length-max) : '');
+}
+function usedProfileAxisIndexes(profile){
+  const used=new Set();
+  if(profile && Array.isArray(profile.axes)){
+    profile.axes.forEach(src=>{ if(src && Number.isInteger(src.index)) used.add(src.index); });
+  }
+  return used;
+}
+
+function discoverPadInputs(signal, skipSignal, paint){
   return new Promise((resolve,reject)=>{
-    let baseBtn=null, baseAx=null; // baseline definido no 1º frame com leitura válida
+    const found=new Map();
+    let baseBtn=null, basePressed=null, baseAx=null;
+    let timer=null, done=false, frameCount=0, missing=0;
+    const add=src=>{
+      const k=sourceKey(src);
+      if(k && !found.has(k)){
+        found.set(k, src);
+      }
+    };
+    const finish=(fn,value)=>{
+      if(done) return;
+      done=true;
+      if(timer!==null) clearInterval(timer);
+      window.removeEventListener('keydown', keydown, true);
+      window.removeEventListener('keyup', keyup, true);
+      fn(value);
+    };
+    const keydown=e=>{
+      const code=keyEventCode(e);
+      if(!code || e.repeat) return;
+      e.preventDefault();
+      setPadKeyDown(code, true);
+      add({type:'key', code, label:keyEventLabel(e)});
+    };
+    const keyup=e=>{
+      const code=keyEventCode(e);
+      if(!code) return;
+      e.preventDefault();
+      setPadKeyDown(code, false);
+    };
+    window.addEventListener('keydown', keydown, true);
+    window.addEventListener('keyup', keyup, true);
+    const tick=()=>{
+      if(signal.cancelled){ finish(reject, new Error('cancelado')); return; }
+      if(skipSignal.skip){ finish(resolve, Array.from(found.values())); return; }
+      frameCount++;
+      const gp=currentPad();
+      if(gp){
+        missing=0;
+        if(!baseBtn){
+          baseBtn=gp.buttons.map(b=>b.value);
+          basePressed=gp.buttons.map(b=>!!b.pressed);
+          baseAx=gp.axes.slice();
+        }
+        for(let i=0;i<gp.buttons.length;i++){
+          const btn=gp.buttons[i];
+          const valueDelta=Math.abs(finiteNumber(btn.value,0)-finiteNumber(baseBtn[i],0));
+          const pressedChanged=(!!btn.pressed)!==(!!basePressed[i]);
+          if(pressedChanged || valueDelta>0.22){
+            add({type:'button', index:i, rest:finiteNumber(baseBtn[i],0), restPressed:!!basePressed[i]});
+          }
+        }
+        for(let i=0;i<gp.axes.length;i++){
+          const delta=finiteNumber(gp.axes[i],0)-finiteNumber(baseAx[i],0);
+          if(Math.abs(delta)>0.45){
+            add({type:'axis', index:i, dir:delta>0?1:-1, rest:finiteNumber(baseAx[i],0)});
+          }
+        }
+      } else {
+        missing++;
+      }
+      if(paint){
+        paint(
+          'descoberta: aperte os botões que quiser mapear e mova os sticks/gatilhos\n'+
+          'quando terminar, toque em "parar descoberta"\n'+
+          'frames:'+frameCount+'  sem leitura:'+missing+'\n'+
+          'entradas: '+discoveredSummary(Array.from(found.values())));
+      }
+    };
+    timer=setInterval(tick, 16);
+  });
+}
+
+function captureStepInput(signal, skipSignal, step, profile){
+  return new Promise((resolve,reject)=>{
+    const expectedKind=step.kind;
+    const allowAxisButton = expectedKind==='button' && AXIS_AS_BUTTON_SLOTS.has(step.slot);
+    const blockedButtonAxes = usedProfileAxisIndexes(profile);
+    let baseBtn=null, basePressed=null, baseAx=null; // baseline definido no 1º frame com leitura válida
     let timer=null, done=false;
+    let keyCand='', keyCandFrames=0, keyCandLabel='';
+    const keydown=e=>{
+      const code=keyEventCode(e);
+      if(expectedKind!=='button' || !code || e.repeat) return;
+      e.preventDefault();
+      setPadKeyDown(code, true);
+      keyCand=code;
+      keyCandLabel=keyEventLabel(e);
+      keyCandFrames=1;
+    };
+    const keyup=e=>{
+      const code=keyEventCode(e);
+      if(expectedKind!=='button' || !code) return;
+      e.preventDefault();
+      setPadKeyDown(code, false);
+    };
+    window.addEventListener('keydown', keydown, true);
+    window.addEventListener('keyup', keyup, true);
     // setInterval (não requestAnimationFrame): o rAF é PAUSADO/limitado em abas
     // em segundo plano e em muitos navegadores de celular, o que congelava a
     // calibração (inspetor preso em "aguardando…"). setInterval continua rodando.
@@ -879,6 +1093,8 @@ function captureStepInput(signal, skipSignal){
       if(done) return;
       done=true;
       if(timer!==null) clearInterval(timer);
+      window.removeEventListener('keydown', keydown, true);
+      window.removeEventListener('keyup', keyup, true);
       fn(value);
     };
     // candidato de eixo precisa SE MANTER deslocado por vários frames: descarta
@@ -898,6 +1114,11 @@ function captureStepInput(signal, skipSignal){
       frameCount++;
       const gp=currentPad();
       if(!gp){
+        if(expectedKind==='button' && keyCand){
+          if(++keyCandFrames>=2){
+            finish(resolve, {type:'key', code:keyCand, label:keyCandLabel||keyCand}); return;
+          }
+        }
         // tolera sumiço momentâneo (Bluetooth no celular pisca o array);
         // só desiste após ~3s sem nenhuma leitura.
         missing++;
@@ -908,18 +1129,21 @@ function captureStepInput(signal, skipSignal){
         return; // setInterval re-executa; não reagenda manualmente
       }
       missing=0;
-      if(!baseBtn){ baseBtn=gp.buttons.map(b=>b.value); baseAx=gp.axes.slice(); }
+      if(!baseBtn){ baseBtn=gp.buttons.map(b=>b.value); basePressed=gp.buttons.map(b=>!!b.pressed); baseAx=gp.axes.slice(); }
 
       // inspetor ao vivo: lista botões/eixos ativos + candidatos + frames.
       {
-        const ab=[]; for(let i=0;i<gp.buttons.length;i++){ const v=gp.buttons[i].value; if(v>0.12) ab.push('b'+i+'='+v.toFixed(2)); }
+        const ab=[]; for(let i=0;i<gp.buttons.length;i++){ const v=gp.buttons[i].value; if(v>0.12 || gp.buttons[i].pressed) ab.push('b'+i+'='+v.toFixed(2)+(gp.buttons[i].pressed?'*':'')); }
         const aa=[]; for(let i=0;i<gp.axes.length;i++){ const d=(gp.axes[i]||0)-(baseAx[i]||0); if(Math.abs(d)>0.12) aa.push('a'+i+'Δ'+d.toFixed(2)); }
         paint(
-          'frames:'+frameCount+' nbtn:'+gp.buttons.length+' nax:'+gp.axes.length+'\n'+
+          'modo:'+(expectedKind==='axis'?'eixo':'botão')+(allowAxisButton?' (+eixo se gatilho/dpad)':'')+
+          '  frames:'+frameCount+' nbtn:'+gp.buttons.length+' nax:'+gp.axes.length+'\n'+
           'btns ativos: '+(ab.join(' ')||'—')+'\n'+
           'eixos mov.:  '+(aa.join(' ')||'—')+'\n'+
+          'tecla:       '+(keyCand||'—')+'\n'+
           'cand btn:'+(btnCand>=0?('b'+btnCand+'×'+btnCandFrames):'—')+
-          '  cand eixo:'+(axisCand>=0?('a'+axisCand+'×'+axisCandFrames):'—'));
+          '  cand eixo:'+(axisCand>=0?('a'+axisCand+'×'+axisCandFrames):'—')+
+          '  cand tecla:'+(keyCand?('×'+keyCandFrames):'—'));
       }
 
       // PRIORIDADE 1: botão cuja LEITURA MUDOU de forma significativa em relação
@@ -928,10 +1152,13 @@ function captureStepInput(signal, skipSignal){
       // (alguns gamepads reportam gatilhos/botões em repouso != 0) — antes a
       // condição "v-base>0.4" exigia subir do repouso e por isso esses botões
       // (RT/LT/Start/Back/L3/R3 deste controle) nunca avançavam o passo.
-      {
+      if(expectedKind==='button'){
         let bBest=-1, bDelta=0.4;
+        const bSources=[];
         for(let i=0;i<gp.buttons.length;i++){
-          const d=Math.abs((gp.buttons[i].value)-(baseBtn[i]||0));
+          const pressedChanged=(!!gp.buttons[i].pressed)!==(!!basePressed[i]);
+          const d=pressedChanged ? 1 : Math.abs((gp.buttons[i].value)-(baseBtn[i]||0));
+          if(d>0.4) bSources.push({type:'button', index:i, rest:finiteNumber(baseBtn[i], 0), restPressed:!!basePressed[i]});
           if(d>bDelta){ bDelta=d; bBest=i; }
         }
         if(bBest>=0){
@@ -939,25 +1166,35 @@ function captureStepInput(signal, skipSignal){
           else { btnCand=bBest; btnCandFrames=1; }
           if(btnCandFrames>=2){
             // grava o repouso (baseline) p/ o mapGamepad saber qual extremo é "pressionado"
-            finish(resolve, {type:'button', index:bBest, rest:finiteNumber(baseBtn[bBest], 0)}); return;
+            const captured=bSources.slice();
+            if(keyCand) captured.push({type:'key', code:keyCand, label:keyCandLabel||keyCand});
+            finish(resolve, captured.length>1 ? captured : captured[0]); return;
           }
         } else { btnCand=-1; btnCandFrames=0; }
       }
-      // PRIORIDADE 2: eixo sustentado (gatilho/HAT como eixo). Exige >=3 frames
-      // no mesmo eixo e direção para não capturar drift momentâneo.
-      let best=-1, bestAbs=CALIB_AXIS_DELTA;
-      for(let i=0;i<gp.axes.length;i++){
-        const d=Math.abs((gp.axes[i]||0)-(baseAx[i]||0));
-        if(d>bestAbs){ bestAbs=d; best=i; }
-      }
-      if(best>=0){
-        const dir=((gp.axes[best]||0)-(baseAx[best]||0))>0?1:-1;
-        if(best===axisCand && dir===axisCandDir){ axisCandFrames++; }
-        else { axisCand=best; axisCandDir=dir; axisCandFrames=1; }
-        if(axisCandFrames>=3){
-          finish(resolve, {type:'axis', index:best, dir, rest:finiteNumber(baseAx[best], 0)}); return;
+      // Eixo só é aceito em passos de stick. Em botões, só LT/RT/D-pad podem
+      // usar eixo/HAT, e eixos já mapeados como sticks ficam bloqueados.
+      if(expectedKind==='axis' || allowAxisButton){
+        let best=-1, bestAbs=CALIB_AXIS_DELTA;
+        for(let i=0;i<gp.axes.length;i++){
+          if(expectedKind==='button' && blockedButtonAxes.has(i)) continue;
+          const d=Math.abs((gp.axes[i]||0)-(baseAx[i]||0));
+          if(d>bestAbs){ bestAbs=d; best=i; }
         }
-      } else { axisCand=-1; axisCandFrames=0; }
+        if(best>=0){
+          const dir=((gp.axes[best]||0)-(baseAx[best]||0))>0?1:-1;
+          if(best===axisCand && dir===axisCandDir){ axisCandFrames++; }
+          else { axisCand=best; axisCandDir=dir; axisCandFrames=1; }
+          if(axisCandFrames>=3){
+            finish(resolve, {type:'axis', index:best, dir, rest:finiteNumber(baseAx[best], 0)}); return;
+          }
+        } else { axisCand=-1; axisCandFrames=0; }
+      }
+      if(expectedKind==='button' && keyCand){
+        if(++keyCandFrames>=2){
+          finish(resolve, {type:'key', code:keyCand, label:keyCandLabel||keyCand}); return;
+        }
+      }
     };
     timer=setInterval(tick, 16); // ~60Hz, imune ao throttle de rAF em background
   });
@@ -982,17 +1219,30 @@ function waitInputReleased(src, signal){
     let stable=0;
     const t=setInterval(()=>{
       if(signal.cancelled){ clearInterval(t); resolve(); return; }
-      const gp=currentPad();
-      if(!gp){ clearInterval(t); resolve(); return; }
-      let released=true;
-      if(src.type==='button'){
-        // "solto" = voltou para perto do repouso capturado (cobre botão que
-        // repousa alto, onde "solto" é valor ALTO, não baixo)
-        const v=gp.buttons[src.index] ? gp.buttons[src.index].value : 0;
-        released=Math.abs(v-finiteNumber(src.rest,0))<0.3;
-      } else if(src.type==='axis'){
-        released=Math.abs(finiteNumber(gp.axes[src.index], 0)-finiteNumber(src.rest, 0))<0.25;
+      const sources=Array.isArray(src) ? src : [src];
+      if(src.type==='key'){
+        stable = !padKeyDown.has(src.code) ? stable+1 : 0;
+        if(stable>=4){ clearInterval(t); resolve(); }
+        return;
       }
+      const gp=currentPad();
+      const released=sources.every(source=>{
+        if(source.type==='key') return !padKeyDown.has(source.code);
+        if(!gp) return true;
+        if(source.type==='button'){
+          // "solto" = voltou para perto do repouso capturado (cobre botão que
+          // repousa alto, onde "solto" é valor ALTO, não baixo)
+          const btn=gp.buttons[source.index];
+          const v=btn ? btn.value : 0;
+          const nearValue=Math.abs(v-finiteNumber(source.rest,0))<0.3;
+          const samePressed=!btn || (!!btn.pressed)===!!source.restPressed;
+          return nearValue && samePressed;
+        }
+        if(source.type==='axis'){
+          return Math.abs(finiteNumber(gp.axes[source.index], 0)-finiteNumber(source.rest, 0))<0.25;
+        }
+        return true;
+      });
       stable = released ? stable+1 : 0;
       if(stable>=4){ clearInterval(t); resolve(); }
     },16);
@@ -1002,6 +1252,8 @@ function waitInputReleased(src, signal){
 async function startCalibration(){
   if(padIndex===null || calibActive) return;
   calibActive=true; updateCalibUi();
+  padKeyDown.clear();
+  padKeyDirtyUntil=0;
   const overlay=document.getElementById('calibOverlay');
   const promptEl=document.getElementById('calibPrompt');
   const progEl=document.getElementById('calibProgress');
@@ -1022,15 +1274,26 @@ async function startCalibration(){
   const cancel=()=>{ signal.cancelled=true; };
   const skipSignal={skip:false};
   document.getElementById('calibCancel').onclick=cancel;
-  document.getElementById('calibSkip').onclick=()=>{ skipSignal.skip=true; };
+  const skipBtn=document.getElementById('calibSkip');
+  const oldSkipText=skipBtn.textContent;
+  skipBtn.onclick=()=>{ skipSignal.skip=true; };
 
   const steps=[
-    ...STANDARD_BUTTON_SLOTS.map(([label,slot])=>({kind:'button',label,slot})),
     ...STANDARD_AXIS_SLOTS.map(([label,slot])=>({kind:'axis',label,slot})),
+    ...STANDARD_BUTTON_SLOTS.map(([label,slot])=>({kind:'button',label,slot})),
   ];
   const profile={ buttons:new Array(17).fill(null), axes:new Array(4).fill(null), id:padId };
 
   try{
+    promptEl.textContent='descobrir entradas';
+    progEl.textContent='sem limite de tempo';
+    skipBtn.textContent='parar descoberta';
+    skipSignal.skip=false;
+    const discovered=await discoverPadInputs(signal, skipSignal, m=>{ if(insp) insp.textContent=m; });
+    if(signal.cancelled) throw new Error('cancelado');
+    calibLog('entradas descobertas: '+discoveredSummary(discovered, 32));
+    skipBtn.textContent=oldSkipText;
+
     for(let s=0;s<steps.length;s++){
       const step=steps[s];
       promptEl.textContent=step.label;
@@ -1039,10 +1302,10 @@ async function startCalibration(){
       await waitInputSettle(signal);
       if(signal.cancelled) throw new Error('cancelado');
 
-      const captured=await captureStepInput(signal, skipSignal);
+      const captured=await captureStepInput(signal, skipSignal, step, profile);
 
       if(captured){
-        const desc = captured.type==='button' ? ('btn '+captured.index) : ('eixo '+captured.index+' dir'+captured.dir);
+        const desc = describeSource(captured);
         calibLog('passo "'+step.label+'" -> '+desc);
         if(step.kind==='button') profile.buttons[step.slot]=captured;
         else { // eixo de stick: guarda índice; invert se a direção "para a direita/baixo" deu negativa
@@ -1066,6 +1329,7 @@ async function startCalibration(){
     calibLog('ERRO/abortou: '+(e && e.message ? e.message : e));
     await new Promise(r=>setTimeout(r,1500)); // mantém o erro visível na tela
   }finally{
+    skipBtn.textContent=oldSkipText;
     overlay.style.display='none';
     if(insp) insp.style.display='none';
     if(logBox) logBox.style.display='none';
@@ -1133,8 +1397,8 @@ function padUiNav(b, ax){
 // loop de leitura/visualização do controle
 function padLoop(){
   if(padIndex!==null){
-    const gp=navigator.getGamepads()[padIndex];
-    if(gp){
+    const gp=currentPad();
+    if(gp || hasMappedPadKeyActivity()){
       const m=mapGamepad(gp);     // já no layout standard (aplica perfil se houver)
       const b=m.buttons, ax=m.axes;
       padUiNav(b, ax);
@@ -1313,9 +1577,10 @@ function enablePlayoutDelayExtension(sdp){
 
 function sendInput(){
   if(!dc || dc.readyState!=='open') return;
-  const gp = padIndex!==null ? navigator.getGamepads()[padIndex] : null;
+  const gp = padIndex!==null ? currentPad() : null;
   const useVirtual = vpadState.active;
-  if(!gp && !useVirtual) return; // nada para enviar
+  const useMappedKeys = hasMappedPadKeyActivity();
+  if(!gp && !useVirtual && !useMappedKeys) return; // nada para enviar
 
   // base: controle físico (já traduzido para o layout standard via perfil)
   const m = mapGamepad(gp);
@@ -1373,15 +1638,27 @@ function installControlCapture(){
   const keydown=e=>{
     if(!active() || fromUi(e)) return;
     e.preventDefault();
+    const code=keyEventCode(e);
+    if(!code) return;
+    if(isMappedPadKeyCode(code)){
+      setPadKeyDown(code, true);
+      return;
+    }
     if(e.repeat) return;
-    keysDown.add(e.code);
-    sendCommand({type:'key', code:e.code, down:true});
+    keysDown.add(code);
+    sendCommand({type:'key', code, down:true});
   };
   const keyup=e=>{
     if(!active()) return;
     e.preventDefault();
-    keysDown.delete(e.code);
-    sendCommand({type:'key', code:e.code, down:false});
+    const code=keyEventCode(e);
+    if(!code) return;
+    if(isMappedPadKeyCode(code)){
+      setPadKeyDown(code, false);
+      return;
+    }
+    keysDown.delete(code);
+    sendCommand({type:'key', code, down:false});
   };
   const mousemove=e=>{
     if(!active()) return;
@@ -1429,6 +1706,8 @@ function uninstallControlCapture(){
   if(!controlHandlers) return;
   for(const code of keysDown) sendCommand({type:'key', code, down:false});
   keysDown.clear();
+  padKeyDown.clear();
+  padKeyDirtyUntil=0;
 
   const stage=document.getElementById('stage');
   window.removeEventListener('keydown', controlHandlers.keydown, true);
