@@ -1,8 +1,7 @@
 # Netlify — publica a landing estática de marketing (landing/index.html).
 # O host/client (Go) NÃO é deployado aqui; só o site institucional.
 [build]
-  base    = "landing"
-  publish = "."
+  publish = "landing"
   command = ""
 
 [[headers]]
