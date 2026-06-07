@@ -855,13 +855,19 @@ function updateCalibUi(){
 
 // captura uma única entrada física: resolve com {type,index,dir,rest}
 // quando o usuário pressiona um botão, move um eixo ou clica em "pular".
+// Re-resolve o gamepad a cada leitura: no celular (controle Bluetooth) o índice
+// e o próprio array de getGamepads() podem oscilar entre frames. Procuramos pelo
+// id quando o índice falha, em vez de abortar a calibração.
+function currentPad(){
+  const pads=navigator.getGamepads ? navigator.getGamepads() : [];
+  if(padIndex!==null && pads[padIndex]) return pads[padIndex];
+  for(const p of pads){ if(p && (!padId || p.id===padId)){ padIndex=p.index; return p; } }
+  return null;
+}
+
 function captureStepInput(signal, skipSignal){
   return new Promise((resolve,reject)=>{
-    const gp0=navigator.getGamepads()[padIndex];
-    if(!gp0){ reject(new Error('controle desconectado')); return; }
-    // baseline (estado de repouso) para detectar mudanças relativas
-    const baseBtn=gp0.buttons.map(b=>b.value);
-    const baseAx=gp0.axes.slice();
+    let baseBtn=null, baseAx=null; // baseline definido no 1º frame com leitura válida
     let raf=null, done=false;
     const finish=(fn,value)=>{
       if(done) return;
@@ -874,19 +880,35 @@ function captureStepInput(signal, skipSignal){
     // auto-capturado e fazia o passo "pular sozinho" (RT/LT/Start/Back/L3/R3
     // pareciam não detectar porque o ruído avançava o passo antes do toque).
     let axisCand=-1, axisCandFrames=0, axisCandDir=0;
-    let btnCand=-1, btnCandFrames=0;
+    let btnCand=-1, btnCandFrames=0, frameCount=0;
     const insp=document.getElementById('calibInspector');
+    let missing=0;
     const tick=()=>{
       if(signal.cancelled){ finish(reject, new Error('cancelado')); return; }
       if(skipSignal.skip){ finish(resolve, null); return; }
-      const gp=navigator.getGamepads()[padIndex];
-      if(!gp){ finish(reject, new Error('desconectado')); return; }
+      const gp=currentPad();
+      if(!gp){
+        // tolera sumiço momentâneo (Bluetooth no celular pisca o array);
+        // só desiste após ~3s sem nenhuma leitura.
+        if(++missing>180){ finish(reject, new Error('controle não responde (sem leitura)')); return; }
+        raf=requestAnimationFrame(tick); return;
+      }
+      missing=0;
+      if(!baseBtn){ baseBtn=gp.buttons.map(b=>b.value); baseAx=gp.axes.slice(); }
 
-      // inspetor ao vivo: lista botões/eixos atualmente ativos (cru, p/ diagnóstico)
-      if(insp && insp.style.display!=='none'){
-        const ab=[]; for(let i=0;i<gp.buttons.length;i++){ const v=gp.buttons[i].value; if(v>0.15) ab.push('b'+i+'='+v.toFixed(2)); }
-        const aa=[]; for(let i=0;i<gp.axes.length;i++){ const d=(gp.axes[i]||0)-(baseAx[i]||0); if(Math.abs(d)>0.15) aa.push('a'+i+'Δ'+d.toFixed(2)); }
-        insp.textContent='botões: '+(ab.join(' ')||'—')+'\neixos:  '+(aa.join(' ')||'—');
+      frameCount++;
+      // inspetor ao vivo: lista botões/eixos ativos + candidatos + frames (sempre
+      // visível durante a calibração; essencial p/ diagnosticar no celular onde
+      // não há console acessível).
+      if(insp){
+        const ab=[]; for(let i=0;i<gp.buttons.length;i++){ const v=gp.buttons[i].value; if(v>0.12) ab.push('b'+i+'='+v.toFixed(2)); }
+        const aa=[]; for(let i=0;i<gp.axes.length;i++){ const d=(gp.axes[i]||0)-(baseAx[i]||0); if(Math.abs(d)>0.12) aa.push('a'+i+'Δ'+d.toFixed(2)); }
+        insp.textContent=
+          'frames:'+frameCount+' nbtn:'+gp.buttons.length+' nax:'+gp.axes.length+'\n'+
+          'btns ativos: '+(ab.join(' ')||'—')+'\n'+
+          'eixos mov.:  '+(aa.join(' ')||'—')+'\n'+
+          'cand btn:'+(btnCand>=0?('b'+btnCand+'×'+btnCandFrames):'—')+
+          '  cand eixo:'+(axisCand>=0?('a'+axisCand+'×'+axisCandFrames):'—');
       }
 
       // PRIORIDADE 1: botão cuja LEITURA MUDOU de forma significativa em relação
@@ -939,8 +961,7 @@ function waitInputSettle(signal){
     let frames=0;
     const tick=()=>{
       if(signal.cancelled){ resolve(); return; }
-      if(!navigator.getGamepads()[padIndex]) resolve();
-      else if(++frames>=4) resolve();
+      if(++frames>=4) resolve();
       else requestAnimationFrame(tick);
     };
     requestAnimationFrame(tick);
@@ -955,7 +976,7 @@ function waitInputReleased(src, signal){
     let stable=0;
     const tick=()=>{
       if(signal.cancelled){ resolve(); return; }
-      const gp=navigator.getGamepads()[padIndex];
+      const gp=currentPad();
       if(!gp){ resolve(); return; }
       let released=true;
       if(src.type==='button'){
@@ -981,9 +1002,14 @@ async function startCalibration(){
   const promptEl=document.getElementById('calibPrompt');
   const progEl=document.getElementById('calibProgress');
   const insp=document.getElementById('calibInspector');
-  // inspetor cru ligado por ?debug=1 (ajuda a ver como o controle reporta cada tecla)
-  if(insp) insp.style.display = urlParams.has('debug') ? 'block' : 'none';
+  // inspetor cru SEMPRE visível durante a calibração — sem console no celular,
+  // é a única forma de ver o que o controle reporta e por que um passo não avança.
+  if(insp){ insp.style.display='block'; insp.textContent='aguardando leitura do controle…'; }
   overlay.style.display='flex';
+
+  // captura erros assíncronos e mostra na tela (celular não tem console)
+  const calibLog=(m)=>{ if(insp) insp.textContent=m+'\n'+insp.textContent; log('[calib] '+m,'warn'); };
+  calibLog('controle idx='+padIndex+' id='+(padId||'?').slice(0,30));
 
   const signal={cancelled:false};
   const cancel=()=>{ signal.cancelled=true; };
@@ -1009,6 +1035,8 @@ async function startCalibration(){
       const captured=await captureStepInput(signal, skipSignal);
 
       if(captured){
+        const desc = captured.type==='button' ? ('btn '+captured.index) : ('eixo '+captured.index+' dir'+captured.dir);
+        calibLog('passo "'+step.label+'" -> '+desc);
         if(step.kind==='button') profile.buttons[step.slot]=captured;
         else { // eixo de stick: guarda índice; invert se a direção "para a direita/baixo" deu negativa
           profile.axes[step.slot]={ index:captured.index, invert: captured.dir<0, center:finiteNumber(captured.rest, 0) };
@@ -1017,14 +1045,19 @@ async function startCalibration(){
         await new Promise(r=>setTimeout(r,140));
         promptEl.textContent='solte';
         await waitInputReleased(captured, signal);
+      } else {
+        calibLog('passo "'+step.label+'" PULADO (skip)');
       }
     }
     // grava e ativa
     padProfile=profile;
     savePadProfile(padId, profile);
+    calibLog('SALVO ✓ — perfil gravado');
     log('controle calibrado e salvo ✓','ok');
+    await new Promise(r=>setTimeout(r,900)); // deixa ler o log final
   }catch(e){
-    log('calibração cancelada','warn');
+    calibLog('ERRO/abortou: '+(e && e.message ? e.message : e));
+    await new Promise(r=>setTimeout(r,1500)); // mantém o erro visível na tela
   }finally{
     overlay.style.display='none';
     calibActive=false;
