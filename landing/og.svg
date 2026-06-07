@@ -37,7 +37,7 @@
   <text x="86" y="468" font-family="'Segoe UI',Arial,sans-serif" font-size="86" font-weight="800" fill="#b6ff3a">Um clique e jogou.</text>
 
   <!-- subline -->
-  <text x="90" y="540" font-family="'Segoe UI',Arial,sans-serif" font-size="27" fill="#6f8088">Steam Link para a rede local · TV, celular ou tablet · sem nuvem, sem mensalidade.</text>
+  <text x="90" y="540" font-family="'Segoe UI',Arial,sans-serif" font-size="27" fill="#6f8088">Transmissão Steam pela rede local · TV, celular ou tablet · sem nuvem, sem mensalidade.</text>
 
   <!-- footer chips -->
   <g font-family="'Courier New',monospace" font-size="18" letter-spacing="2">

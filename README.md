@@ -1,4 +1,4 @@
-# Tether · Steam Link para navegador (LAN)
+# Tether · Transmissão Steam para navegador (LAN)
 
 [![Site](https://img.shields.io/badge/site-tether-b6ff3a)](https://tether-lan.netlify.app)
 [![Release](https://img.shields.io/github/v/release/danielpalmares/tether?color=2ad4ff)](https://github.com/danielpalmares/tether/releases/latest)
