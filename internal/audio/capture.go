@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"tether/internal/process"
@@ -16,14 +17,17 @@ import (
 const RTPPayloadType = 111
 
 type Capturer struct {
+	mu     sync.Mutex
 	cmd    *exec.Cmd
 	cancel context.CancelFunc
+	stream *RTPStream
 }
 
 type RTPStream struct {
 	conn  *net.UDPConn
 	first []byte
 	stop  func()
+	once  sync.Once
 }
 
 func New() *Capturer {
@@ -90,9 +94,9 @@ func (c *Capturer) startWASAPI(ctx context.Context) (*RTPStream, error) {
 		return nil, err
 	}
 
+	c.mu.Lock()
 	c.cmd = cmd
-	fmt.Fprintf(os.Stderr, "[audio] usando %s -> PCM -> Opus/RTP\n", loopback.Name())
-	return &RTPStream{
+	c.stream = &RTPStream{
 		conn:  conn,
 		first: first,
 		stop: func() {
@@ -102,7 +106,11 @@ func (c *Capturer) startWASAPI(ctx context.Context) (*RTPStream, error) {
 			}
 			_ = conn.Close()
 		},
-	}, nil
+	}
+	stream := c.stream
+	c.mu.Unlock()
+	fmt.Fprintf(os.Stderr, "[audio] usando %s -> PCM -> Opus/RTP\n", loopback.Name())
+	return stream, nil
 }
 
 func (c *Capturer) startDirectShow(ctx context.Context) (*RTPStream, error) {
@@ -135,9 +143,9 @@ func (c *Capturer) startDirectShow(ctx context.Context) (*RTPStream, error) {
 		return nil, err
 	}
 
+	c.mu.Lock()
 	c.cmd = cmd
-	fmt.Fprintf(os.Stderr, "[audio] usando DirectShow '%s' -> Opus/RTP\n", device)
-	return &RTPStream{
+	c.stream = &RTPStream{
 		conn:  conn,
 		first: first,
 		stop: func() {
@@ -146,15 +154,30 @@ func (c *Capturer) startDirectShow(ctx context.Context) (*RTPStream, error) {
 			}
 			_ = conn.Close()
 		},
-	}, nil
+	}
+	stream := c.stream
+	c.mu.Unlock()
+	fmt.Fprintf(os.Stderr, "[audio] usando DirectShow '%s' -> Opus/RTP\n", device)
+	return stream, nil
 }
 
 func (c *Capturer) Stop() {
-	if c.cancel != nil {
-		c.cancel()
+	c.mu.Lock()
+	cancel := c.cancel
+	cmd := c.cmd
+	stream := c.stream
+	c.stream = nil
+	c.cmd = nil
+	c.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
 	}
-	if c.cmd != nil && c.cmd.Process != nil {
-		_ = c.cmd.Process.Kill()
+	if stream != nil {
+		_ = stream.Close()
+	}
+	if cmd != nil && cmd.Process != nil {
+		_ = cmd.Process.Kill()
 	}
 }
 
@@ -174,7 +197,7 @@ func (s *RTPStream) ReadPacket() ([]byte, error) {
 
 func (s *RTPStream) Close() error {
 	if s.stop != nil {
-		s.stop()
+		s.once.Do(s.stop)
 	}
 	return nil
 }

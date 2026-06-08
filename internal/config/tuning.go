@@ -68,6 +68,12 @@ const (
 	// ajudou — o log mostrou pico real de 2-4 frames; o excedente só somava lag.
 	queueMillis = 65
 
+	// O libx264 é o caminho de compatibilidade/teste: ele já paga custo de cópia
+	// GPU->CPU e encode CPU. Para não mascarar esse custo com mais atraso no
+	// transporte, usa uma janela mais curta que o NVENC.
+	x264VBVMillis   = 20
+	x264QueueMillis = 35
+
 	// pacerHoldPercent*: o teto de espera do pacer é uma PORCENTAGEM do frameDur,
 	// ESCALADA por resolução. Frame grande (2K/4K) leva mais tempo para
 	// packetizar/enviar e chega mais irregular; meio-frame (1080p) é pouca folga
@@ -77,6 +83,7 @@ const (
 	pacerHoldPercent1080 = 50  // frameDur*50% ≈ 8ms
 	pacerHoldPercent2K   = 75  // ≈ 12.5ms
 	pacerHoldPercent4K   = 100 // ≈ 16.6ms (um frame inteiro de teto)
+	x264PacerHoldPercent = 25  // ≈ 4ms em 60fps: só tira micro-rajada
 )
 
 // Tuning calcula o profile a partir da config já normalizada.
@@ -109,7 +116,16 @@ func (c StreamConfig) Tuning() TuningProfile {
 
 	// Fila em frames = folga(ms) × fps / 1000, com piso de 2 (nunca regredir ao
 	// comportamento sem buffer). Regra única: escala sozinha com qualquer fps.
-	queueDepth := queueMillis * fps / 1000
+	queueMs := queueMillis
+	if c.Codec == CodecH264X264 {
+		vbv = c.Bitrate * x264VBVMillis / 1000
+		queueMs = x264QueueMillis
+		holdPct = x264PacerHoldPercent
+		if vbv <= 0 {
+			vbv = c.Bitrate
+		}
+	}
+	queueDepth := queueMs * fps / 1000
 	if queueDepth < 2 {
 		queueDepth = 2
 	}

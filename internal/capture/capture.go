@@ -15,7 +15,7 @@ import (
 )
 
 // Capturer encapsula um processo FFmpeg que captura a tela via DXGI (ddagrab)
-// e codifica em H.264 usando NVENC, emitindo um Annex-B stream no stdout.
+// e codifica em H.264, emitindo um Annex-B stream no stdout.
 type Capturer struct {
 	cfg    config.StreamConfig
 	cmd    *exec.Cmd
@@ -33,18 +33,18 @@ func New(cfg config.StreamConfig) *Capturer {
 //	ddagrab (D3D11) -> h264_nvenc -> H.264 Annex-B (stdout)
 //
 // Se o FFmpeg/GPU não aceitar o caminho D3D11 direto, cai para o fallback
-// hwdownload -> nv12 -> h264_nvenc. O preset "p1" + "ull" + zerolatency tuning
-// minimiza fila interna do encoder.
+// hwdownload -> nv12 -> h264_nvenc. No modo universal/teste, usa
+// hwdownload -> yuv420p -> libx264 para não depender do fabricante da GPU.
 func (c *Capturer) Start(ctx context.Context) (io.ReadCloser, error) {
 	ctx, c.cancel = context.WithCancel(ctx)
 
 	c.cfg = c.cfg.Normalize()
 	var lastErr error
-	for _, mode := range pipelineOrder() {
+	for _, mode := range pipelineOrder(c.cfg.Codec) {
 		reader, cmd, err := c.startFFmpeg(ctx, mode)
 		if err == nil {
 			c.cmd = cmd
-			logPipeline(mode)
+			logPipeline(mode, c.cfg.Codec)
 			logEncodingTuning(c.cfg)
 			return &procReader{Reader: reader, c: c}, nil
 		}
@@ -67,7 +67,10 @@ const (
 	pipelineCPU   pipelineMode = "cpu"
 )
 
-func pipelineOrder() []pipelineMode {
+func pipelineOrder(codec string) []pipelineMode {
+	if codec == config.CodecH264X264 {
+		return []pipelineMode{pipelineCPU}
+	}
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("TETHER_FFMPEG_PIPELINE"))) {
 	case "cpu", "download":
 		return []pipelineMode{pipelineCPU}
@@ -78,21 +81,40 @@ func pipelineOrder() []pipelineMode {
 	}
 }
 
-func logPipeline(mode pipelineMode) {
+func logPipeline(mode pipelineMode, codec string) {
 	switch mode {
 	case pipelineD3D11:
 		fmt.Fprintln(os.Stderr, "[capture] usando pipeline d3d11 direto para NVENC")
 	case pipelineCPU:
-		fmt.Fprintln(os.Stderr, "[capture] usando fallback hwdownload->CPU->NVENC")
+		if codec == config.CodecH264X264 {
+			fmt.Fprintln(os.Stderr, "[capture] usando pipeline hwdownload->CPU->libx264 (TESTE)")
+		} else {
+			fmt.Fprintln(os.Stderr, "[capture] usando fallback hwdownload->CPU->NVENC")
+		}
 	}
 }
 
 func logEncodingTuning(cfg config.StreamConfig) {
 	cfg = cfg.Normalize()
 	t := cfg.Tuning()
+	if cfg.Codec == config.CodecH264X264 {
+		fmt.Fprintf(
+			os.Stderr,
+			"[capture] h264_x264 TESTE %dx%d@%d %dkbps level=%s gop=%d vbv=%dk\n",
+			cfg.Width,
+			cfg.Height,
+			cfg.FPS,
+			cfg.Bitrate,
+			t.Level,
+			t.GOPFrames,
+			t.VBVBufferKb,
+		)
+		return
+	}
+
 	fmt.Fprintf(
 		os.Stderr,
-		"[capture] h264 %dx%d@%d %dkbps level=%s gop=%d vbv=%dk surfaces=%d aq=%t\n",
+		"[capture] h264_nvenc %dx%d@%d %dkbps level=%s gop=%d vbv=%dk surfaces=%d aq=%t\n",
 		cfg.Width,
 		cfg.Height,
 		cfg.FPS,
@@ -155,9 +177,10 @@ func (c *Capturer) startFFmpeg(ctx context.Context, mode pipelineMode) (*bufio.R
 }
 
 func (c *Capturer) ffmpegArgs(mode pipelineMode) []string {
+	cfg := c.cfg.Normalize()
 	// Todos os ajustes finos vêm do TuningProfile adaptativo (função de
 	// bitrate × resolução × fps), não de constantes. Ver internal/config/tuning.go.
-	tune := c.cfg.Tuning()
+	tune := cfg.Tuning()
 	gop := tune.GOPFrames
 
 	// VBV em milissegundos de bitrate: janela temporal estável para o rate
@@ -168,10 +191,10 @@ func (c *Capturer) ffmpegArgs(mode pipelineMode) []string {
 
 	input := fmt.Sprintf(
 		"ddagrab=output_idx=%d:framerate=%d:video_size=%dx%d:dup_frames=1",
-		c.cfg.Display,
-		c.cfg.FPS,
-		c.cfg.Width,
-		c.cfg.Height,
+		cfg.Display,
+		cfg.FPS,
+		cfg.Width,
+		cfg.Height,
 	)
 
 	args := []string{
@@ -188,14 +211,40 @@ func (c *Capturer) ffmpegArgs(mode pipelineMode) []string {
 	}
 
 	if mode == pipelineCPU {
+		filter := "hwdownload,format=bgra,format=nv12"
+		if cfg.Codec == config.CodecH264X264 {
+			filter = "hwdownload,format=bgra,format=yuv420p"
+		}
 		args = append(args,
-			// Fallback compatível: baixa o frame do d3d11 pra CPU e converte pra
-			// nv12. O caminho preferencial evita esta cópia.
-			"-vf", "hwdownload,format=bgra,format=nv12",
+			// Fallback compatível: baixa o frame do d3d11 pra CPU e converte para
+			// o formato esperado pelo encoder selecionado.
+			"-vf", filter,
 		)
 	}
 
+	if cfg.Codec == config.CodecH264X264 {
+		args = appendX264Args(args, cfg, tune, gop, bufsize)
+	} else {
+		args = appendNVENCArgs(args, cfg, tune, gop, bufsize)
+	}
+
 	args = append(args,
+		// força SPS/PPS antes de cada keyframe (idempotência se o client
+		// perder o início do stream ou um IDR).
+		"-bsf:v", "dump_extra",
+		// baixa latência de saída: não enche o buffer antes de despejar.
+		"-flush_packets", "1",
+
+		// --- saída: Annex-B cru pro Pion samplear ---
+		"-f", "h264",
+		"-",
+	)
+
+	return args
+}
+
+func appendNVENCArgs(args []string, cfg config.StreamConfig, tune config.TuningProfile, gop, bufsize int) []string {
+	return append(args,
 		// --- encoder NVENC low-latency ---
 		"-c:v", "h264_nvenc",
 		"-preset", "p1", // mais rápido
@@ -209,8 +258,8 @@ func (c *Capturer) ffmpegArgs(mode pipelineMode) []string {
 		"-profile:v", "baseline",
 		"-level", tune.Level,
 		"-rc", tune.RateControl,
-		"-b:v", fmt.Sprintf("%dk", c.cfg.Bitrate),
-		"-maxrate", fmt.Sprintf("%dk", c.cfg.Bitrate),
+		"-b:v", fmt.Sprintf("%dk", cfg.Bitrate),
+		"-maxrate", fmt.Sprintf("%dk", cfg.Bitrate),
 		"-bufsize", fmt.Sprintf("%dk", bufsize),
 		"-g", fmt.Sprintf("%d", gop),
 		"-bf", "0", // sem B-frames (latência)
@@ -242,18 +291,32 @@ func (c *Capturer) ffmpegArgs(mode pipelineMode) []string {
 		// emite access unit delimiters (NAL type 9) -> fronteira de frame
 		// inequívoca para o agrupador do lado Go.
 		"-aud", "1",
-		// força SPS/PPS antes de cada keyframe (idempotência se o client
-		// perder o início do stream ou um IDR).
-		"-bsf:v", "dump_extra",
-		// baixa latência de saída: não enche o buffer antes de despejar.
-		"-flush_packets", "1",
-
-		// --- saída: Annex-B cru pro Pion samplear ---
-		"-f", "h264",
-		"-",
 	)
+}
 
-	return args
+func appendX264Args(args []string, cfg config.StreamConfig, tune config.TuningProfile, gop, bufsize int) []string {
+	return append(args,
+		// --- encoder universal/teste: CPU libx264 low-latency ---
+		"-c:v", "libx264",
+		"-preset", "ultrafast",
+		"-tune", "zerolatency",
+		// Mantém o contrato do SDP: H.264 Baseline sem B-frames, com level
+		// derivado da resolução.
+		"-profile:v", "baseline",
+		"-level", tune.Level,
+		"-pix_fmt", "yuv420p",
+		"-b:v", fmt.Sprintf("%dk", cfg.Bitrate),
+		"-maxrate", fmt.Sprintf("%dk", cfg.Bitrate),
+		"-bufsize", fmt.Sprintf("%dk", bufsize),
+		"-g", fmt.Sprintf("%d", gop),
+		"-keyint_min", fmt.Sprintf("%d", gop),
+		"-bf", "0",
+		"-sc_threshold", "0",
+		"-x264-params", "repeat-headers=1:sliced-threads=1:sync-lookahead=0:rc-lookahead=0",
+		// emite access unit delimiters (NAL type 9) -> fronteira de frame
+		// inequívoca para o agrupador do lado Go.
+		"-aud", "1",
+	)
 }
 
 func boolFlag(b bool) string {

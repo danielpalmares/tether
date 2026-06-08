@@ -1,8 +1,8 @@
 # Tether — Documentação do Projeto
 
 > Streaming de jogos em **baixa latência** na rede local (LAN). Host em Windows
-> (captura + encode NVENC), client em navegador (foco: TV Samsung Tizen 6.5+ e
-> celular). Transporte WebRTC. Estado atual: **v1 de teste**.
+> (captura + encode H.264 por NVENC ou libx264), client em navegador (foco: TV
+> Samsung Tizen 6.5+ e celular). Transporte WebRTC. Estado atual: **v1 de teste**.
 
 ---
 
@@ -11,7 +11,7 @@
 ```
 ┌───────────────────────────── HOST (Windows) ──────────────────────────────┐
 │                                                                            │
-│  ddagrab (DXGI) ──► h264_nvenc ──► Annex-B ──► pumpVideo ──► WebRTC track   │
+│  ddagrab (DXGI) ──► H.264 encoder ─► Annex-B ─► pumpVideo ─► WebRTC track   │
 │  WASAPI loopback ─► Opus (FFmpeg) ─────────► pumpAudio ──► WebRTC track     │
 │                                                                            │
 │  HTTP/WS signaling (porta 8787)  ·  painel host.html  ·  client.html (PWA) │
@@ -24,7 +24,7 @@
 |---|---|
 | `cmd/host` | entrypoint, servidor HTTP, embed dos assets web, headers de cache/PWA |
 | `internal/config` | `StreamConfig` + **`Tuning()`** (algoritmo adaptativo de encoder) |
-| `internal/capture` | FFmpeg ddagrab→NVENC; consome `TuningProfile` |
+| `internal/capture` | FFmpeg ddagrab→NVENC/libx264; consome `TuningProfile` |
 | `internal/webrtc` | `Session`, negociação SDP, `pumpVideo`/`pumpAudio`, pacer anti-jitter |
 | `internal/audio` | captura WASAPI, re-pacing RTP de Opus |
 | `internal/input` | injeção SendInput / ViGEm (gamepad virtual) |
@@ -72,7 +72,7 @@ Documentadas em detalhe na memória do agente; resumo:
 1. **Codec H264 único forçado** com `SetCodecPreferences` antes do `CreateAnswer`.
    Sem isso o Pion ecoa perfis 720p na answer e a TV configura o decoder errado → congela.
 2. **`profile-level-id` dinâmico** por resolução (`42c02a`/`42c033`/`42c034`),
-   com `profile-iop 0xc0` casando os constraint flags reais do SPS do NVENC.
+   com `profile-iop 0xc0` casando os constraint flags reais do SPS H.264 Baseline.
 3. **Baseline profile** (sem CABAC/B-frames): denominador comum de decoders de TV.
 4. **playout-delay extension** com `max=1` (não 0): a Tizen interpreta `max=0`
    como "sem limite" e infla o jitter buffer p/ ~160ms.
@@ -161,7 +161,8 @@ O que ele faz:
   do usuário. (precisa de 7-Zip; instala via winget se faltar).
 - **ViGEmBus**: se o driver não estiver presente, roda `libs/ViGEmBus_*.exe`
   com elevação UAC (gamepad virtual). Sem ele, o vídeo funciona; só o gamepad fica off.
-- **GPU**: avisa se não houver NVIDIA (NVENC); o host tenta o fallback CPU.
+- **GPU**: NVENC segue como padrão; sem NVIDIA, selecione
+  **H.264 · Universal CPU (TESTE)** no painel.
 - **Binário**: usa `tether-host.exe` se existir; senão compila (precisa de Go).
 - Flags: `-SkipChecks` (pula validação), `-Reinstall` (força reinstalar FFmpeg).
 
@@ -178,6 +179,7 @@ go test ./...                            # testes (config + webrtc)
 - Painel host: `http://localhost:8787/host.html`
 - Client LAN: `http://<IP-do-host>:8787/client.html`
 - Variáveis: `TETHER_VIDEO_NACK=0` desliga NACK; `TETHER_FFMPEG_PIPELINE=cpu|d3d11`.
+- Codec no painel host: **H.264 · NVENC** ou **H.264 · Universal CPU (TESTE)**.
 
 ### Instalar o PWA no client
 - Automático: navegadores que suportam disparam o prompt; o client também tem um

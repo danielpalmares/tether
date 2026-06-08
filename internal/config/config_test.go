@@ -15,6 +15,30 @@ func TestNormalizeKeepsOnlySupportedResolutionAndForces60FPS(t *testing.T) {
 	}
 }
 
+func TestNormalizeCodec(t *testing.T) {
+	cases := []struct {
+		name  string
+		codec string
+		want  string
+	}{
+		{name: "empty", codec: "", want: CodecH264NVENC},
+		{name: "legacy h264", codec: "h264", want: CodecH264NVENC},
+		{name: "nvenc", codec: CodecH264NVENC, want: CodecH264NVENC},
+		{name: "x264", codec: CodecH264X264, want: CodecH264X264},
+		{name: "libx264 alias", codec: "libx264", want: CodecH264X264},
+		{name: "invalid", codec: "vp8", want: CodecH264NVENC},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := StreamConfig{Width: 1920, Height: 1080, FPS: 60, Bitrate: 8000, Codec: tc.codec}.Normalize()
+			if cfg.Codec != tc.want {
+				t.Fatalf("codec = %s, want %s", cfg.Codec, tc.want)
+			}
+		})
+	}
+}
+
 func TestH264ProfileLevelIDByResolution(t *testing.T) {
 	cases := []struct {
 		name string
@@ -82,7 +106,7 @@ func TestTuningPacerHoldScalesWithResolution(t *testing.T) {
 
 func TestTuningFrameQueueScalesWithFPS(t *testing.T) {
 	// Fila curta (~65ms) derivada do fps; pacer hold ≈ meio frame. Regra única
-	// para toda resolução.
+	// para o caminho NVENC.
 	t60 := StreamConfig{Width: 1920, Height: 1080, FPS: 60, Bitrate: 8000}.Tuning()
 	if t60.FrameQueueDepth != 3 { // 65 * 60 / 1000 = 3
 		t.Fatalf("60fps queue = %d, want 3", t60.FrameQueueDepth)
@@ -93,6 +117,27 @@ func TestTuningFrameQueueScalesWithFPS(t *testing.T) {
 	}
 	if !t60.TemporalAQ {
 		t.Fatalf("temporal-aq deve estar ligado")
+	}
+}
+
+func TestX264TuningUsesShorterLatencyBudget(t *testing.T) {
+	frameDur := time.Second / 60
+	tune := StreamConfig{
+		Width:   1920,
+		Height:  1080,
+		FPS:     60,
+		Bitrate: 8000,
+		Codec:   CodecH264X264,
+	}.Tuning()
+
+	if tune.VBVBufferKb != 160 { // 8000 * 20 / 1000
+		t.Fatalf("x264 VBV = %d, want 160", tune.VBVBufferKb)
+	}
+	if tune.FrameQueueDepth != 2 { // 35 * 60 / 1000 = 2
+		t.Fatalf("x264 queue = %d, want 2", tune.FrameQueueDepth)
+	}
+	if tune.PacerMaxHold != frameDur/4 {
+		t.Fatalf("x264 pacer hold = %s, want %s", tune.PacerMaxHold, frameDur/4)
 	}
 }
 

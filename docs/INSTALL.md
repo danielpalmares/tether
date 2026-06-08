@@ -6,8 +6,9 @@ Guia de instalação para o **usuário final** e de empacotamento para o **mante
 
 ## Para o usuário (instalar o host no PC com o jogo)
 
-> Requisitos: **Windows 10/11**, GPU **NVIDIA** (NVENC) recomendada, rede local
-> compartilhada com a TV/celular.
+> Requisitos: **Windows 10/11**, GPU **NVIDIA** (NVENC) recomendada ou
+> **H.264 Universal CPU (TESTE)** para AMD/Intel, rede local compartilhada com a
+> TV/celular.
 
 ### Opção A — Instalador automático (recomendado)
 Abra o **PowerShell** e cole:

@@ -56,6 +56,46 @@ func TestReadH264AccessUnitsGroupsOneSamplePerFrame(t *testing.T) {
 	}
 }
 
+func TestReadH264AccessUnitsKeepsMultipleSlicesInOneAUDFrame(t *testing.T) {
+	stream := bytes.NewReader(bytes.Join([][]byte{
+		testNAL(nalTypeAUD, 0xf0),
+		testNAL(nalTypeSPS, 0x42, 0xc0, 0x2a),
+		testNAL(nalTypePPS, 0xce, 0x06),
+		testNAL(nalTypeIDR, 0x88, 0x84),
+		testNAL(nalTypeIDR, 0x12, 0x34),
+		testNAL(nalTypeAUD, 0xf0),
+		testNAL(nalTypeNonIDR, 0x9a, 0x22),
+		testNAL(nalTypeNonIDR, 0x56, 0x78),
+	}, nil))
+
+	out := make(chan encodedFrame, 4)
+	frameDur := time.Second / 60
+
+	if err := readH264AccessUnits(stream, frameDur, out, nil); err != nil {
+		t.Fatalf("read access units: %v", err)
+	}
+
+	if got := len(out); got != 2 {
+		t.Fatalf("frames = %d, want 2", got)
+	}
+
+	first := <-out
+	if !first.keyframe {
+		t.Fatalf("first frame should be keyframe")
+	}
+	if got := bytes.Count(first.data, []byte(annexBStartCode)); got != 5 {
+		t.Fatalf("first frame NAL count = %d, want 5", got)
+	}
+
+	second := <-out
+	if second.keyframe {
+		t.Fatalf("second frame should not be keyframe")
+	}
+	if got := bytes.Count(second.data, []byte(annexBStartCode)); got != 3 {
+		t.Fatalf("second frame NAL count = %d, want 3", got)
+	}
+}
+
 // O pacer anti-jitter pode segurar frames ADIANTADOS (até um frameDur) para
 // suavizar a chegada na TV, mas NUNCA pode acumular atraso: frames que já estão
 // disponíveis em lote (chegaram atrasados / em rajada) devem sair imediatamente.

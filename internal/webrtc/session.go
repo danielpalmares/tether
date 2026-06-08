@@ -66,8 +66,8 @@ func NewSession(cfg config.StreamConfig, injector input.Injector, onClose func()
 	// 42c02a = Baseline + profile-iop 0xc0 + level 4.2 (1080p60)
 	// 42c033 = Baseline + profile-iop 0xc0 + level 5.1 (1440p60)
 	// 42c034 = Baseline + profile-iop 0xc0 + level 5.2 (2160p60)
-	// O profile-iop reflete os constraint_set flags reais do SPS do NVENC, medidos
-	// com trace_headers: constraint_set0=1, set1=1, set2=0 -> 0b11000000 = 0xc0.
+	// O profile-iop reflete os constraint_set flags reais do SPS H.264 Baseline,
+	// medidos com trace_headers: constraint_set0=1, set1=1, set2=0 -> 0b11000000 = 0xc0.
 	// Decoders de TV (Samsung Tizen) configuram o pipeline pelo profile-level-id da
 	// SDP; se o SPS diverge — ou se a SDP anuncia um LEVEL menor que o bitstream —
 	// o decoder de hardware estoura e congela. Chrome/Android toleram; a TV não.
@@ -154,7 +154,7 @@ func NewSession(cfg config.StreamConfig, injector input.Injector, onClose func()
 	// todos os perfis H264 que o client oferece (42001f, 42e01f, ...). O 42001f
 	// (Level 3.1 = 720p30) acabava na posição preferencial da answer; a TV casava
 	// esse payload, configurava o decoder para 720p e recebia o bitstream 1080p60
-	// do NVENC — estouro de level -> descarte de frames e congelamento. Restringir
+	// do host — estouro de level -> descarte de frames e congelamento. Restringir
 	// o transceiver ao nosso único codec garante que a answer descreva exatamente
 	// o que o WriteSample empacota. (Pion: SetCodecPreferences ANTES do
 	// CreateAnswer; getCodecs() do transceiver passa a retornar só estes.)
@@ -555,6 +555,7 @@ func readH264AccessUnits(stream io.Reader, frameDur time.Duration, out chan enco
 	var au []byte     // access unit em construção (Annex-B)
 	haveVCL := false  // já vimos uma slice (VCL) no AU atual?
 	auHasIDR := false // o AU atual contém um keyframe?
+	auHasAUD := false // o AU atual começou com AUD; nesse caso AUD marca o frame
 
 	var lastRead time.Time
 
@@ -595,6 +596,7 @@ func readH264AccessUnits(stream io.Reader, frameDur time.Duration, out chan enco
 		}
 		haveVCL = false
 		auHasIDR = false
+		auHasAUD = false
 	}
 
 	for {
@@ -613,10 +615,13 @@ func readH264AccessUnits(stream io.Reader, frameDur time.Duration, out chan enco
 		nalType := nal.UnitType
 		isVCL := nalType == nalTypeNonIDR || nalType == nalTypeIDR
 
-		// Fronteira de access unit: AUD, ou nova NAL de parâmetro/slice quando já
-		// temos uma slice acumulada, fecha o frame anterior.
+		// Fronteira de access unit: se o encoder emite AUD, ele é a fonte de
+		// verdade. Isso importa para x264, que pode emitir múltiplas slices VCL
+		// para o mesmo frame; sem respeitar o AUD, cada slice vira um "frame" e o
+		// RTP sai a centenas de fps. Encoders sem AUD continuam no heurístico
+		// antigo por nova NAL de parâmetro/slice.
 		boundary := nalType == nalTypeAUD ||
-			(haveVCL && (isVCL || nalType == nalTypeSPS || nalType == nalTypePPS || nalType == nalTypeSEI))
+			(haveVCL && !auHasAUD && (isVCL || nalType == nalTypeSPS || nalType == nalTypePPS || nalType == nalTypeSEI))
 		if boundary {
 			flush()
 		}
@@ -624,6 +629,9 @@ func readH264AccessUnits(stream io.Reader, frameDur time.Duration, out chan enco
 		// Reconstrói o Annex-B (o h264reader remove o start code).
 		au = append(au, []byte(annexBStartCode)...)
 		au = append(au, nal.Data...)
+		if nalType == nalTypeAUD {
+			auHasAUD = true
+		}
 		if isVCL {
 			haveVCL = true
 		}

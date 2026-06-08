@@ -8,7 +8,7 @@
   Verifica (e instala quando ausente):
     - FFmpeg  : via winget; fallback para download do build gyan.dev + PATH do usuário.
     - ViGEmBus: driver de gamepad virtual (libs/ViGEmBus_*.exe), instalação com UAC.
-    - GPU     : aviso se não houver NVIDIA (NVENC) — o host ainda tenta o fallback CPU.
+    - GPU     : aviso se não houver NVIDIA (NVENC); use Universal CPU (TESTE) no painel.
     - Binário : usa tether-host.exe se existir; senão compila uma vez (precisa de Go).
 
   Uso:
@@ -163,7 +163,7 @@ function Check-GPU {
   $gpu = Get-CimInstance Win32_VideoController -ErrorAction SilentlyContinue |
          Where-Object { $_.Name -match 'NVIDIA' } | Select-Object -First 1
   if ($gpu) { Write-Ok "NVIDIA detectada — $($gpu.Name)" }
-  else { Write-Warn2 'sem GPU NVIDIA — h264_nvenc pode falhar; o host tentará o fallback CPU.' }
+  else { Write-Warn2 'sem GPU NVIDIA — selecione H.264 Universal CPU (TESTE) no painel do host.' }
 }
 
 # --- Binário do host -----------------------------------------------------------

@@ -63,8 +63,9 @@
 
       <div class="field">
         <label>codec</label>
-        <div class="seg">
-          <button class="active">H.264 · NVENC</button>
+        <div class="seg" id="codecSeg">
+          <button data-codec="h264_nvenc" class="active">H.264 · NVENC</button>
+          <button data-codec="h264_x264">H.264 · Universal CPU (TESTE)</button>
         </div>
       </div>
 
@@ -86,7 +87,7 @@
       <div class="hint" style="margin-top:14px">
         Monitor de origem é qual tela do Windows será capturada. Alterar a
         configuração durante uma live reinicia a sessão para aplicar o novo
-        perfil. Requer GPU NVIDIA + FFmpeg no PATH.
+        perfil. Use NVENC em NVIDIA; use Universal CPU (TESTE) para AMD/Intel.
       </div>
     </div>
   </div>
@@ -109,7 +110,7 @@ const log = (msg, cls='') => {
   el.appendChild(ln); el.scrollTop = el.scrollHeight;
 };
 
-let cfg = { width:1920, height:1080, fps:60, bitrate:8000, codec:'h264', display:0 };
+let cfg = { width:1920, height:1080, fps:60, bitrate:8000, codec:'h264_nvenc', display:0 };
 
 function setResolutionActive(width, height){
   let matched=false;
@@ -124,9 +125,22 @@ function setResolutionActive(width, height){
   }
 }
 
+function codecLabel(codec){
+  return codec === 'h264_x264' ? 'H.264 CPU TESTE' : 'H.264 NVENC';
+}
+
+function setCodecActive(codec){
+  const normalized = codec === 'h264_x264' ? 'h264_x264' : 'h264_nvenc';
+  cfg.codec = normalized;
+  document.querySelectorAll('#codecSeg button').forEach(b => {
+    b.classList.toggle('active', b.dataset.codec === normalized);
+  });
+}
+
 function syncControls(){
   cfg.fps=60;
   setResolutionActive(cfg.width, cfg.height);
+  setCodecActive(cfg.codec);
   document.getElementById('fpsVal').textContent = '60 fps';
   document.getElementById('brVal').textContent = (cfg.bitrate/1000).toFixed(0)+' Mbps';
   br.value = cfg.bitrate;
@@ -140,6 +154,9 @@ document.querySelectorAll('#resSeg button').forEach(b => b.onclick = () => {
   cfg.width=+b.dataset.w;
   cfg.height=+b.dataset.h;
   cfg.fps=60;
+});
+document.querySelectorAll('#codecSeg button').forEach(b => b.onclick = () => {
+  setCodecActive(b.dataset.codec);
 });
 const br = document.getElementById('bitrate');
 br.oninput = () => {
@@ -156,7 +173,7 @@ document.getElementById('saveBtn').onclick = async () => {
     if (r.ok) {
       cfg = await r.json();
       syncControls();
-      log('configuração salva · ' + cfg.width+'x'+cfg.height+' @60fps · '+(cfg.bitrate/1000).toFixed(0)+' Mbps', 'ok');
+      log('configuração salva · ' + cfg.width+'x'+cfg.height+' @60fps · '+(cfg.bitrate/1000).toFixed(0)+' Mbps · '+codecLabel(cfg.codec), 'ok');
       if(before.streaming) log('live reiniciada para aplicar o novo perfil', 'warn');
     }
     else log('falha ao salvar config', 'err');

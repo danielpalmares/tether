@@ -26,7 +26,7 @@ navegador da TV/celular e aperte **iniciar streaming**. Detalhes em
 HOST (Go, nativo)                          CLIENT (browser puro)
  ├─ serve painel web (localhost:8787)       ├─ abre client.html
  ├─ captura tela (DXGI/ddagrab)             ├─ recebe vídeo H.264 (WebRTC)
- ├─ encode H.264 (NVENC, low-latency)  ───► ├─ lê controle (Gamepad API)
+ ├─ encode H.264 (NVENC/libx264)       ───► ├─ lê controle (Gamepad API)
  ├─ servidor WebRTC (Pion)             ◄─── └─ envia input @60Hz (data channel)
  └─ injeta input (ViGEmBus → Xbox 360 virtual)
 ```
@@ -34,8 +34,8 @@ HOST (Go, nativo)                          CLIENT (browser puro)
 ## Requisitos (host)
 
 - **Windows 10/11**
-- **GPU NVIDIA** (encoder NVENC)
-- **FFmpeg** no PATH, com suporte a `ddagrab` e `h264_nvenc` (builds gyan.dev/BtbN têm)
+- **GPU NVIDIA** para NVENC; AMD/Intel podem usar **H.264 Universal CPU (TESTE)**
+- **FFmpeg** no PATH, com suporte a `ddagrab` e `h264_nvenc` ou `libx264` (builds gyan.dev/BtbN têm)
 - **ViGEmBus** instalado: https://github.com/ViGEm/ViGEmBus/releases
 - **Go 1.22+** (para compilar)
 - **Steam** instalado e logado
@@ -90,7 +90,7 @@ go build -o tether-host.exe ./cmd/host
 | Client web (UI/UX) | ✅ funcional |
 | Signaling WebSocket | ✅ funcional |
 | WebRTC vídeo (Pion) | ✅ pipeline pronto |
-| Captura+encode (FFmpeg) | ✅ implementado (precisa de GPU/Windows p/ rodar) |
+| Captura+encode (FFmpeg) | ✅ implementado (NVENC ou Universal CPU/teste no Windows) |
 | Gamepad → data channel | ✅ funcional |
 | Injeção Xbox 360 virtual | ✅ Windows sem cgo quando `ViGEmClient.dll` está disponível |
 | Teclado/mouse | ✅ fallback Windows sem cgo via SendInput |
@@ -103,7 +103,7 @@ go build -o tether-host.exe ./cmd/host
 cmd/host/main.go            entry point + embed das páginas web
 cmd/host/web/               host.html, client.html, style.css (servidas embarcadas)
 internal/config/            struct de configuração de streaming
-internal/capture/           wrapper FFmpeg (ddagrab + h264_nvenc)
+internal/capture/           wrapper FFmpeg (ddagrab + h264_nvenc/libx264)
 internal/webrtc/            sessão Pion: track de vídeo + data channel de input
 internal/signaling/         servidor HTTP + WebSocket de signaling
 internal/input/             GamepadState + injetor ViGEm/SendInput (win) / noop
@@ -114,7 +114,7 @@ internal/steam/             dispara steam://open/bigpicture
 ## Notas técnicas
 
 - **Annex-B → WebRTC:** o FFmpeg emite H.264 Annex-B; o `h264reader` do Pion
-  fatia em NAL units enviadas como samples. GOP de 2s e `-bf 0` (sem B-frames)
+  fatia em NAL units enviadas como samples. GOP de 3s e `-bf 0` (sem B-frames)
   para minimizar latência.
 - **Input não-confiável:** o data channel usa `ordered:false, maxRetransmits:0`
   (UDP-like) — perder um pacote de input é melhor que esperar retransmissão.

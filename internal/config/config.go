@@ -4,6 +4,12 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
+)
+
+const (
+	CodecH264NVENC = "h264_nvenc"
+	CodecH264X264  = "h264_x264"
 )
 
 // StreamConfig guarda as configurações de streaming definidas no painel do host.
@@ -12,7 +18,7 @@ type StreamConfig struct {
 	Height  int    `json:"height"`
 	FPS     int    `json:"fps"`
 	Bitrate int    `json:"bitrate"` // kbps
-	Codec   string `json:"codec"`   // "h264"
+	Codec   string `json:"codec"`   // "h264_nvenc" ou "h264_x264"
 	Display int    `json:"display"` // índice do monitor (0 = primário)
 }
 
@@ -29,7 +35,7 @@ func Default() StreamConfig {
 		Height:  1080,
 		FPS:     60,
 		Bitrate: 8000,
-		Codec:   "h264",
+		Codec:   CodecH264NVENC,
 		Display: 0,
 	}
 }
@@ -102,7 +108,12 @@ func (c StreamConfig) Normalize() StreamConfig {
 	if c.Bitrate <= 0 {
 		c.Bitrate = d.Bitrate
 	}
-	if c.Codec == "" {
+	switch strings.ToLower(strings.TrimSpace(c.Codec)) {
+	case "", "h264", CodecH264NVENC:
+		c.Codec = d.Codec
+	case CodecH264X264, "libx264", "x264":
+		c.Codec = CodecH264X264
+	default:
 		c.Codec = d.Codec
 	}
 	if c.Display < 0 {
