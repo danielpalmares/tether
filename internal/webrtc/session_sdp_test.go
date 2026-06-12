@@ -57,7 +57,7 @@ func TestAnswerAdvertisesNackPLI(t *testing.T) {
 	if err != nil {
 		t.Fatalf("injector: %v", err)
 	}
-	sess, err := NewSession(config.Default(), injector, func() {})
+	sess, err := NewSession(config.Default(), injector, func() {}, nil)
 	if err != nil {
 		t.Fatalf("new session: %v", err)
 	}
@@ -79,23 +79,26 @@ func TestAnswerAdvertisesNackPLI(t *testing.T) {
 		t.Errorf("answer SDP não negocia playout-delay")
 	}
 
-	// 2) EXATAMENTE UM codec H264, e com o profile-level-id 42c02a. Esta é a
-	// regressão crítica: sem SetCodecPreferences o Pion ecoa todos os perfis H264
-	// da offer (inclusive 42001f = Level 3.1/720p na posição preferencial), e a
-	// TV casa o profile errado, estourando o decoder no bitstream 1080p60.
+	// 2) EXATAMENTE UM codec H264, com o profile-level-id de level MÁXIMO
+	// (42c034 = Baseline/5.2). Duas regressões críticas cobertas: (a) sem
+	// SetCodecPreferences o Pion ecoa todos os perfis H264 da offer (inclusive
+	// 42001f = Level 3.1/720p na posição preferencial) e a TV casa o profile
+	// errado, estourando o decoder; (b) o SDP precisa anunciar sempre o level
+	// máximo do pipeline para o hot-swap de resolução não exceder o decoder
+	// provisionado (anunciar level maior que o bitstream é seguro; menor congela).
 	h264Count := strings.Count(sdp, "H264/90000")
 	if h264Count != 1 {
 		t.Errorf("answer deve ter EXATAMENTE 1 codec H264, tem %d (SetCodecPreferences não restringiu)", h264Count)
 	}
-	if !strings.Contains(sdp, "profile-level-id=42c02a") {
-		t.Errorf("answer não anuncia o profile-level-id=42c02a (Level 4.2/1080p)")
+	if !strings.Contains(sdp, "profile-level-id="+config.H264MaxProfileLevelID()) {
+		t.Errorf("answer não anuncia o profile-level-id=%s (level máximo do pipeline)", config.H264MaxProfileLevelID())
 	}
 	if !strings.Contains(sdp, "opus/48000/2") {
 		t.Errorf("answer não anuncia Opus estéreo para áudio")
 	}
 	for _, bad := range []string{"42001f", "42e01f", "4d001f", "64001f"} {
 		if strings.Contains(sdp, bad) {
-			t.Errorf("answer contém profile indesejado %s (eco da offer; deveria ser só 42c02a)", bad)
+			t.Errorf("answer contém profile indesejado %s (eco da offer; deveria ser só o do host)", bad)
 		}
 	}
 }
@@ -130,7 +133,7 @@ func TestAnswerOmitsVideoNackWhenDisabled(t *testing.T) {
 	if err != nil {
 		t.Fatalf("injector: %v", err)
 	}
-	sess, err := NewSession(config.Default(), injector, func() {})
+	sess, err := NewSession(config.Default(), injector, func() {}, nil)
 	if err != nil {
 		t.Fatalf("new session: %v", err)
 	}

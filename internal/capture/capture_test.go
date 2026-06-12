@@ -28,8 +28,27 @@ func TestFFmpegArgsUseNVENCByDefault(t *testing.T) {
 	requireArgValue(t, args, "-c:v", "h264_nvenc")
 	requireArgValue(t, args, "-bufsize", "240k")
 	requireArg(t, args, "-surfaces")
+	// PIR é o default: sem IDR periódico, sem strict_gop.
+	requireArgValue(t, args, "-intra-refresh", "1")
+	requireNoArg(t, args, "-strict_gop")
 	requireNoArgValue(t, args, "-c:v", "libx264")
 	requireNoArg(t, args, "-vf")
+}
+
+func TestFFmpegArgsIntraRefreshEscapeHatch(t *testing.T) {
+	t.Setenv("TETHER_INTRA_REFRESH", "0")
+
+	c := New(config.StreamConfig{
+		Width:   1920,
+		Height:  1080,
+		FPS:     60,
+		Bitrate: 8000,
+		Codec:   config.CodecH264NVENC,
+	})
+
+	args := c.ffmpegArgs(pipelineD3D11)
+	requireNoArg(t, args, "-intra-refresh")
+	requireArgValue(t, args, "-strict_gop", "1")
 }
 
 func TestFFmpegArgsUseX264ForUniversalCPU(t *testing.T) {
@@ -47,7 +66,7 @@ func TestFFmpegArgsUseX264ForUniversalCPU(t *testing.T) {
 	requireArgValue(t, args, "-preset", "ultrafast")
 	requireArgValue(t, args, "-tune", "zerolatency")
 	requireArgValue(t, args, "-bufsize", "160k")
-	requireArgValue(t, args, "-x264-params", "repeat-headers=1:sliced-threads=1:sync-lookahead=0:rc-lookahead=0")
+	requireArgValue(t, args, "-x264-params", "repeat-headers=1:sliced-threads=1:sync-lookahead=0:rc-lookahead=0:intra-refresh=1")
 	requireNoArg(t, args, "-nal-hrd")
 	requireNoArg(t, args, "-surfaces")
 	requireNoArg(t, args, "-zerolatency")

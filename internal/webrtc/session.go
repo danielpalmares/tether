@@ -3,6 +3,8 @@ package webrtc
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -27,14 +29,35 @@ import (
 // Session representa uma sessão de streaming com um client.
 type Session struct {
 	pc       *webrtc.PeerConnection
-	cfg      config.StreamConfig
-	cap      streamCapturer
 	audioCap audioCapturer
 	injector input.Injector
 	input    inputStats
 	audioOn  bool
 	onClose  func()
+
+	// onConfigSaved persiste uma config aplicada com sucesso via hot-swap
+	// (injetado pelo signaling server — a Session não conhece o disco).
+	onConfigSaved func(config.StreamConfig)
+
+	// mu protege o estado do pipeline de vídeo (cfg/cap/videoDone/closed)
+	// contra corrida entre Reconfigure (hot-swap) e Close.
+	mu        sync.Mutex
+	cfg       config.StreamConfig
+	cap       streamCapturer
+	videoDone chan struct{}
+	closed    bool
+
+	videoTrack *lowLatencyH264Track
+
+	// dc é o data channel "input" — bidirecional: input client->host e
+	// controle/status host->client.
+	dc            atomic.Pointer[webrtc.DataChannel]
+	reconfiguring atomic.Bool
 }
+
+// ErrNeedsRestart sinaliza que a mudança pedida não cabe num hot-swap do
+// encoder (ex.: troca de codec) e exige fechar a sessão e renegociar.
+var ErrNeedsRestart = errors.New("mudança de config exige reiniciar a sessão")
 
 type streamCapturer interface {
 	Start(context.Context) (io.ReadCloser, error)
@@ -55,23 +78,25 @@ var newAudioCapturer = func() audioCapturer {
 }
 
 // NewSession cria a peer connection, registra a track de vídeo e o data channel.
-func NewSession(cfg config.StreamConfig, injector input.Injector, onClose func()) (*Session, error) {
+// onConfigSaved é chamado após um hot-swap de config bem-sucedido para o caller
+// persistir/propagar a nova config (pode ser nil).
+func NewSession(cfg config.StreamConfig, injector input.Injector, onClose func(), onConfigSaved func(config.StreamConfig)) (*Session, error) {
 	cfg = cfg.Normalize()
 	videoNack := videoNackEnabled()
 
 	// Codec H264 ÚNICO do host, definido uma vez e reusado em RegisterCodec, na
 	// track e no SetCodecPreferences — os três PRECISAM ser idênticos byte a byte.
 	//
-	// profile-level-id dinâmico:
-	// 42c02a = Baseline + profile-iop 0xc0 + level 4.2 (1080p60)
-	// 42c033 = Baseline + profile-iop 0xc0 + level 5.1 (1440p60)
+	// profile-level-id FIXO no level máximo do pipeline:
 	// 42c034 = Baseline + profile-iop 0xc0 + level 5.2 (2160p60)
 	// O profile-iop reflete os constraint_set flags reais do SPS H.264 Baseline,
 	// medidos com trace_headers: constraint_set0=1, set1=1, set2=0 -> 0b11000000 = 0xc0.
 	// Decoders de TV (Samsung Tizen) configuram o pipeline pelo profile-level-id da
 	// SDP; se o SPS diverge — ou se a SDP anuncia um LEVEL menor que o bitstream —
 	// o decoder de hardware estoura e congela. Chrome/Android toleram; a TV não.
-	profileLevelID := cfg.H264ProfileLevelID()
+	// Anunciar SEMPRE o level máximo (capacidade, não conteúdo) é seguro e permite
+	// o hot-swap de resolução sem renegociar a SDP (ver Reconfigure).
+	profileLevelID := config.H264MaxProfileLevelID()
 	h264Codec := webrtc.RTPCodecParameters{
 		RTPCodecCapability: webrtc.RTPCodecCapability{
 			MimeType:     webrtc.MimeTypeH264,
@@ -139,7 +164,7 @@ func NewSession(cfg config.StreamConfig, injector input.Injector, onClose func()
 		return nil, err
 	}
 
-	s := &Session{pc: pc, cfg: cfg, injector: injector, onClose: onClose}
+	s := &Session{pc: pc, cfg: cfg, injector: injector, onClose: onClose, onConfigSaved: onConfigSaved}
 
 	// --- Track de vídeo ---
 	// A track carrega o MESMO capability do codec registrado.
@@ -192,12 +217,9 @@ func NewSession(cfg config.StreamConfig, injector input.Injector, onClose func()
 	// frame). Iniciando aqui — antes de "connected" — o pipeline FFmpeg já está
 	// entregando 60fps quando a conexão sobe, eliminando o ramp-up visível no
 	// começo do stream (qualidade Steam Link: vídeo fluido desde o frame 1).
-	s.cap = newCapturer(cfg)
-	stream, capErr := s.cap.Start(context.Background())
-	if capErr != nil {
+	s.videoTrack = videoTrack
+	if capErr := s.startVideoPipeline(cfg); capErr != nil {
 		log.Printf("[capture] erro ao pré-aquecer: %v", capErr)
-	} else {
-		go s.pumpVideo(stream, videoTrack)
 	}
 	var startAudioOnce sync.Once
 	startAudio := func() {
@@ -217,32 +239,54 @@ func NewSession(cfg config.StreamConfig, injector input.Injector, onClose func()
 		})
 	}
 
-	// --- Data channel de input (negociado pelo client) ---
+	// --- Data channels (negociados pelo client) ---
+	// "input": unreliable/unordered (perder um frame de gamepad é melhor que
+	// atrasá-lo). "control": confiável — config/ping client->host e
+	// respostas/status host->client NÃO podem se perder.
 	pc.OnDataChannel(func(dc *webrtc.DataChannel) {
-		if dc.Label() != "input" {
-			return
+		switch dc.Label() {
+		case "input":
+			log.Println("[webrtc] data channel de input aberto")
+			s.input.lastNs.Store(time.Now().UnixNano())
+			stopInputLog := make(chan struct{})
+			go logInputStats(&s.input, stopInputLog)
+			dc.OnClose(func() {
+				close(stopInputLog)
+				log.Println("[webrtc] data channel de input fechado")
+			})
+			dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+				if err := s.handleInputMessage(msg.Data); err != nil {
+					log.Printf("[input] apply: %v", err)
+				}
+			})
+		case "control":
+			log.Println("[webrtc] data channel de controle aberto")
+			s.dc.Store(dc)
+			dc.OnClose(func() {
+				s.dc.CompareAndSwap(dc, nil)
+				log.Println("[webrtc] data channel de controle fechado")
+			})
+			dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+				if err := s.handleInputMessage(msg.Data); err != nil {
+					log.Printf("[control] apply: %v", err)
+				}
+			})
 		}
-		log.Println("[webrtc] data channel de input aberto")
-		s.input.lastNs.Store(time.Now().UnixNano())
-		stopInputLog := make(chan struct{})
-		go logInputStats(&s.input, stopInputLog)
-		dc.OnClose(func() {
-			close(stopInputLog)
-			log.Println("[webrtc] data channel de input fechado")
-		})
-		dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-			if err := s.handleInputMessage(msg.Data); err != nil {
-				log.Printf("[input] apply: %v", err)
-			}
-		})
 	})
 
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		log.Printf("[webrtc] estado: %s", state)
 		switch state {
 		case webrtc.PeerConnectionStateConnected:
-			// A captura já está rodando (pré-aquecida no NewSession). Aqui só
-			// disparamos o Big Picture.
+			// O track acabou de fazer bind: reinicia o FFmpeg para o stream
+			// abrir com IDR+SPS/PPS que o client realmente recebe (o IDR do
+			// pré-aquecimento foi descartado antes do bind; com intra-refresh
+			// não existe outro keyframe — sem isto, tela preta).
+			go func() {
+				if err := s.restartVideoPipeline(); err != nil {
+					log.Printf("[webrtc] restart do pipeline ao conectar: %v", err)
+				}
+			}()
 			log.Println("[steam] abrindo Big Picture")
 			if err := steam.LaunchBigPicture(); err != nil {
 				log.Printf("[steam] aviso: %v", err)
@@ -258,6 +302,135 @@ func NewSession(cfg config.StreamConfig, injector input.Injector, onClose func()
 	})
 
 	return s, nil
+}
+
+// startVideoPipeline cria o capturer e inicia o pump de vídeo para cfg,
+// escrevendo no track RTP já existente. Chamado no NewSession (pré-aquecimento,
+// sessão ainda não publicada) e no Reconfigure (hot-swap, sob s.mu).
+func (s *Session) startVideoPipeline(cfg config.StreamConfig) error {
+	capturer := newCapturer(cfg)
+	stream, err := capturer.Start(context.Background())
+	if err != nil {
+		return err
+	}
+	done := make(chan struct{})
+	s.cap = capturer
+	s.videoDone = done
+	go func() {
+		s.pumpVideo(cfg, stream, s.videoTrack)
+		close(done)
+		s.maybeRestartAfterPumpExit(done)
+	}()
+	return nil
+}
+
+// maybeRestartAfterPumpExit religa a captura quando o pump morre SOZINHO —
+// ddagrab perde o device na transição de fullscreen exclusivo (fechar/abrir
+// jogo) e o FFmpeg cai; sem isto a tela fica preta para sempre. Saídas
+// deliberadas (Reconfigure/Close) trocam s.videoDone ou marcam closed antes,
+// então não disparam o restart.
+func (s *Session) maybeRestartAfterPumpExit(done chan struct{}) {
+	s.mu.Lock()
+	unexpected := s.videoDone == done && !s.closed
+	s.mu.Unlock()
+	if !unexpected {
+		return
+	}
+	log.Println("[video] captura terminou inesperadamente (provável transição de fullscreen); religando em 1s")
+	time.Sleep(time.Second)
+	if err := s.restartVideoPipeline(); err != nil {
+		log.Printf("[video] religamento da captura falhou: %v", err)
+	}
+}
+
+// Reconfigure troca o encoder a quente: mata o FFmpeg atual e sobe outro com a
+// nova config, mantendo a peer connection e o track RTP vivos. O novo stream
+// abre com IDR+SPS/PPS (-forced-idr + dump_extra), então o decoder absorve os
+// novos parâmetros — inclusive resolução — sem renegociar a SDP (que anuncia
+// sempre o level máximo; ver NewSession).
+func (s *Session) Reconfigure(cfg config.StreamConfig) error {
+	cfg = cfg.Normalize()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return errors.New("sessão encerrada")
+	}
+	if cfg.Codec != s.cfg.Codec {
+		// Trocar o encoder muda o caminho do pipeline (GPU vs CPU) e os
+		// parâmetros de transporte derivados; mais seguro renegociar do zero.
+		return ErrNeedsRestart
+	}
+	if cfg == s.cfg {
+		return nil
+	}
+	return s.swapPipelineLocked(cfg)
+}
+
+// restartVideoPipeline reinicia o FFmpeg com a config corrente para emitir
+// IDR+SPS/PPS frescos COM o track já bound. Necessário ao conectar: o
+// pré-aquecimento começa antes do handshake, e com intra-refresh o ÚNICO
+// IDR do stream é o frame 0 — que o Pion descarta enquanto o track não está
+// conectado. Sem este restart o decoder do client nunca recebe headers e a
+// tela fica preta.
+func (s *Session) restartVideoPipeline() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return errors.New("sessão encerrada")
+	}
+	return s.swapPipelineLocked(s.cfg)
+}
+
+// swapPipelineLocked troca o pipeline de vídeo (caller segura s.mu): para o
+// FFmpeg atual, ESPERA o pump drenar — dois pumps nunca escrevem intercalado
+// no mesmo track — e sobe o novo com cfg.
+func (s *Session) swapPipelineLocked(cfg config.StreamConfig) error {
+	if s.cap != nil {
+		s.cap.Stop()
+	}
+	if s.videoDone != nil {
+		select {
+		case <-s.videoDone:
+		case <-time.After(5 * time.Second):
+			return errors.New("timeout drenando o pipeline de vídeo atual")
+		}
+	}
+
+	old := s.cfg
+	s.cfg = cfg
+	if err := s.startVideoPipeline(cfg); err != nil {
+		s.cfg = old
+		if rbErr := s.startVideoPipeline(old); rbErr != nil {
+			return fmt.Errorf("troca de pipeline falhou (%w) e rollback também (%v)", err, rbErr)
+		}
+		return err
+	}
+	log.Printf("[webrtc] pipeline de vídeo reiniciado: %dx%d@%dfps %dkbps", cfg.Width, cfg.Height, cfg.FPS, cfg.Bitrate)
+	return nil
+}
+
+// Config devolve a config corrente da sessão.
+func (s *Session) Config() config.StreamConfig {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cfg
+}
+
+// sendToClient envia uma mensagem JSON host->client pelo data channel de input.
+// Silencioso se o canal ainda não abriu — status é best-effort.
+func (s *Session) sendToClient(v any) {
+	dc := s.dc.Load()
+	if dc == nil {
+		return
+	}
+	data, err := json.Marshal(v)
+	if err != nil {
+		return
+	}
+	if err := dc.Send(data); err != nil {
+		log.Printf("[webrtc] envio host->client: %v", err)
+	}
 }
 
 func videoNackEnabled() bool {
@@ -279,15 +452,16 @@ func videoRTCPFeedback(enableNack bool) []webrtc.RTCPFeedback {
 	}
 }
 
-// audioFrameDuration é a cadência alvo de saída do áudio. O FFmpeg empacota Opus
-// em frames de 20ms (frame_duration=20), mas o muxer RTP os emite em RAJADA —
+// audioFrameDuration é a cadência alvo de saída do áudio — DEVE casar com o
+// frame_duration do Opus em internal/audio (hoje 10ms). O FFmpeg empacota os
+// frames, mas o muxer RTP os emite em RAJADA —
 // vários pacotes colados (<2ms) seguidos de silêncio de ~90ms (medido: 77% dos
 // pacotes saem agrupados). Essa rajada infla o jitter buffer de áudio da TV e,
 // via sincronismo A/V, arrasta o vídeo junto (lip-sync). Nenhuma flag do FFmpeg
 // corrige (testadas max_delay/muxdelay/muxpreload/avioflags=direct/pkt_size). A
 // correção é re-pacear no host: ler o socket sem bloquear e escrever cada pacote
 // no ritmo de 20ms.
-const audioFrameDuration = 20 * time.Millisecond
+const audioFrameDuration = 10 * time.Millisecond
 
 // audioPaceQueueDepth é a folga máxima antes de descartar. Mantém latência baixa:
 // se a fila passa disto, preferimos soltar o pacote mais antigo a acumular atraso.
@@ -386,6 +560,23 @@ type inputWireMessage struct {
 	DX      int32     `json:"dx"`
 	DY      int32     `json:"dy"`
 	DeltaY  float64   `json:"deltaY"`
+
+	// --- controle (type=config/configGet/ping) ---
+	Width   int     `json:"width"`
+	Height  int     `json:"height"`
+	FPS     int     `json:"fps"`
+	Bitrate int     `json:"bitrate"` // kbps
+	T       float64 `json:"t"`       // timestamp do ping (eco no pong)
+
+	// --- telemetria do decoder do client (type=stats), p/ diagnóstico no log
+	// do host sem depender do HUD da TV ---
+	RTT    float64 `json:"rtt"`    // ms (candidate-pair)
+	Buf    float64 `json:"buf"`    // jitterBufferDelay por frame emitido, ms
+	Tgt    float64 `json:"tgt"`    // jitterBufferTargetDelay por frame, ms
+	Jit    float64 `json:"jit"`    // jitter RTP, ms
+	DecFPS float64 `json:"decfps"` // frames decodificados/s
+	Lost   float64 `json:"lost"`   // pacotes perdidos/s
+	Drop   float64 `json:"drop"`   // frames descartados/s
 }
 
 type inputStats struct {
@@ -397,13 +588,32 @@ type inputStats struct {
 }
 
 func (s *Session) handleInputMessage(raw []byte) error {
-	if s.injector == nil {
-		return nil
-	}
-
 	var msg inputWireMessage
 	if err := json.Unmarshal(raw, &msg); err != nil {
 		return err
+	}
+
+	switch msg.Type {
+	case "stats":
+		// Telemetria do decoder remoto: a visão da TV (buffer/jitter/fps) ao
+		// lado dos stats de envio no mesmo log — fecha o ciclo de diagnóstico.
+		log.Printf("[client] rtt=%.0fms buf=%.0fms tgt=%.0fms jit=%.1fms fps=%.0f lost=%.0f/s drop=%.0f/s",
+			msg.RTT, msg.Buf, msg.Tgt, msg.Jit, msg.DecFPS, msg.Lost, msg.Drop)
+		return nil
+	case "ping":
+		// RTT de aplicação para o teste de rede do client.
+		s.sendToClient(map[string]any{"type": "pong", "t": msg.T})
+		return nil
+	case "configGet":
+		s.sendToClient(map[string]any{"type": "configResult", "ok": true, "config": s.Config()})
+		return nil
+	case "config":
+		s.applyClientConfig(msg)
+		return nil
+	}
+
+	if s.injector == nil {
+		return nil
 	}
 
 	switch msg.Type {
@@ -446,6 +656,45 @@ func (s *Session) handleInputMessage(raw []byte) error {
 	default:
 		return nil
 	}
+}
+
+// applyClientConfig trata o pedido de config vindo do client: hot-swap do
+// encoder em goroutine própria — Reconfigure leva ~1-2s (restart do FFmpeg) e
+// não pode bloquear o callback do data channel, que entrega o input na mesma
+// fila. Pedidos sobrepostos são rejeitados.
+func (s *Session) applyClientConfig(msg inputWireMessage) {
+	if !s.reconfiguring.CompareAndSwap(false, true) {
+		s.sendToClient(map[string]any{"type": "configResult", "ok": false, "error": "reconfiguração em andamento"})
+		return
+	}
+	go func() {
+		defer s.reconfiguring.Store(false)
+
+		cfg := s.Config()
+		if msg.Width > 0 {
+			cfg.Width = msg.Width
+		}
+		if msg.Height > 0 {
+			cfg.Height = msg.Height
+		}
+		if msg.FPS > 0 {
+			cfg.FPS = msg.FPS
+		}
+		if msg.Bitrate > 0 {
+			cfg.Bitrate = msg.Bitrate
+		}
+		cfg = cfg.Normalize()
+
+		if err := s.Reconfigure(cfg); err != nil {
+			log.Printf("[webrtc] config do client rejeitada: %v", err)
+			s.sendToClient(map[string]any{"type": "configResult", "ok": false, "error": err.Error()})
+			return
+		}
+		if s.onConfigSaved != nil {
+			s.onConfigSaved(cfg)
+		}
+		s.sendToClient(map[string]any{"type": "configResult", "ok": true, "config": cfg})
+	}()
 }
 
 func (s *Session) recordInput(kind string) {
@@ -526,11 +775,14 @@ type videoPumpStats struct {
 	maxQueueBlockNs atomic.Int64
 }
 
-func (s *Session) pumpVideo(stream io.ReadCloser, track sampleWriter) {
+// pumpVideo recebe a cfg do SEU pipeline por parâmetro (não lê s.cfg): durante
+// um hot-swap o pump antigo continua drenando com o tuning antigo enquanto a
+// sessão já aponta para a config nova.
+func (s *Session) pumpVideo(cfg config.StreamConfig, stream io.ReadCloser, track sampleWriter) {
 	defer stream.Close()
 
-	tune := s.cfg.Tuning()
-	frameDur := time.Second / time.Duration(s.cfg.FPS)
+	tune := cfg.Tuning()
+	frameDur := time.Second / time.Duration(cfg.FPS)
 	frames := make(chan encodedFrame, tune.FrameQueueDepth)
 	var stats videoPumpStats
 
@@ -541,8 +793,53 @@ func (s *Session) pumpVideo(stream io.ReadCloser, track sampleWriter) {
 		}
 	}()
 
-	if err := writeVideoFrames(frames, track, frameDur, tune.PacerMaxHold, &stats); err != nil {
+	monitor := &overloadMonitor{targetFPS: cfg.FPS, notify: func(overloaded bool, capturedFPS, targetFPS int) {
+		status := "ok"
+		if overloaded {
+			status = "overloaded"
+		}
+		log.Printf("[video] host %s: captura %dfps de %dfps alvo", status, capturedFPS, targetFPS)
+		s.sendToClient(map[string]any{
+			"type":        "hostStatus",
+			"status":      status,
+			"capturedFps": capturedFPS,
+			"targetFps":   targetFPS,
+		})
+	}}
+
+	if err := writeVideoFrames(frames, track, frameDur, tune.PacerMaxHold, &stats, monitor); err != nil {
 		log.Printf("[video] WriteSample: %v", err)
+	}
+}
+
+// overloadMonitor detecta captura/encoder saturado — a assinatura conhecida de
+// GPU sob carga é o DWM compondo irregular e o ddagrab entregando abaixo do
+// alvo de forma SUSTENTADA (queda pontual é só cena pesada). Critério: lidos <
+// 85% do fps alvo por 3 ticks de 1s consecutivos. Notifica o client na entrada
+// e na saída do estado (uma vez cada, sem spam).
+type overloadMonitor struct {
+	targetFPS  int
+	lowTicks   int
+	overloaded bool
+	notify     func(overloaded bool, capturedFPS, targetFPS int)
+}
+
+func (m *overloadMonitor) observe(readFPS int64) {
+	if m == nil || m.targetFPS <= 0 || m.notify == nil {
+		return
+	}
+	if readFPS < int64(m.targetFPS)*85/100 {
+		m.lowTicks++
+	} else {
+		m.lowTicks = 0
+		if m.overloaded {
+			m.overloaded = false
+			m.notify(false, int(readFPS), m.targetFPS)
+		}
+	}
+	if !m.overloaded && m.lowTicks >= 3 {
+		m.overloaded = true
+		m.notify(true, int(readFPS), m.targetFPS)
 	}
 }
 
@@ -641,7 +938,7 @@ func readH264AccessUnits(stream io.Reader, frameDur time.Duration, out chan enco
 	}
 }
 
-func writeVideoFrames(frames <-chan encodedFrame, track sampleWriter, frameDur, maxHold time.Duration, stats *videoPumpStats) error {
+func writeVideoFrames(frames <-chan encodedFrame, track sampleWriter, frameDur, maxHold time.Duration, stats *videoPumpStats, monitor *overloadMonitor) error {
 	logTicker := time.NewTicker(time.Second)
 	defer logTicker.Stop()
 
@@ -709,7 +1006,8 @@ func writeVideoFrames(frames <-chan encodedFrame, track sampleWriter, frameDur, 
 			}
 
 		case <-logTicker.C:
-			logVideoPumpStats(stats)
+			read := logVideoPumpStats(stats)
+			monitor.observe(read)
 		}
 	}
 }
@@ -735,9 +1033,11 @@ func boundedQueueDepth(depth, capacity int) int64 {
 	return int64(depth)
 }
 
-func logVideoPumpStats(stats *videoPumpStats) {
+// logVideoPumpStats loga e zera os contadores do tick; devolve os frames LIDOS
+// no intervalo (entrada do overloadMonitor).
+func logVideoPumpStats(stats *videoPumpStats) int64 {
 	if stats == nil {
-		return
+		return 0
 	}
 
 	read := stats.readFrames.Swap(0)
@@ -752,11 +1052,12 @@ func logVideoPumpStats(stats *videoPumpStats) {
 	maxQueueBlock := time.Duration(stats.maxQueueBlockNs.Swap(0))
 
 	if read == 0 && sent == 0 && keyframes == 0 && bytes == 0 {
-		return
+		return read
 	}
 
 	log.Printf("[video] lidos=%d fps enviados=%d fps keyframes=%d taxa=%d KB/s frameMax=%d KB gapMax leitura/envio=%s/%s writeMax=%s filaPicoMax=%d filaBloqMax=%s",
 		read, sent, keyframes, bytes/1024, maxFrameBytes/1024, maxReadGap, maxSendGap, maxWrite, maxQueueDepth, maxQueueBlock)
+	return read
 }
 
 // HandleOffer processa a SDP offer do client e devolve a answer.
@@ -788,8 +1089,19 @@ func offerIncludesAudio(sdp string) bool {
 
 // Close encerra a sessão.
 func (s *Session) Close() {
-	if s.cap != nil {
-		s.cap.Stop()
+	s.mu.Lock()
+	alreadyClosed := s.closed
+	s.closed = true
+	capturer := s.cap
+	onClose := s.onClose
+	s.onClose = nil
+	s.mu.Unlock()
+	if alreadyClosed {
+		return
+	}
+
+	if capturer != nil {
+		capturer.Stop()
 	}
 	if s.audioCap != nil {
 		s.audioCap.Stop()
@@ -797,8 +1109,7 @@ func (s *Session) Close() {
 	if s.pc != nil {
 		_ = s.pc.Close()
 	}
-	if s.onClose != nil {
-		s.onClose()
-		s.onClose = nil
+	if onClose != nil {
+		onClose()
 	}
 }

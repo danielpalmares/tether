@@ -1,16 +1,22 @@
 package signaling
 
 import (
+	"context"
+	"crypto/rand"
 	"encoding/json"
 	"log"
 	"net/http"
+	"strconv"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/gorilla/websocket"
 	pionwebrtc "github.com/pion/webrtc/v4"
 
 	"tether/internal/config"
 	"tether/internal/input"
+	"tether/internal/sysinfo"
 	"tether/internal/webrtc"
 )
 
@@ -26,6 +32,11 @@ type Server struct {
 	cfgPath string
 	active  *webrtc.Session
 	hostNm  string
+
+	// netInfo é o adaptador de rede do host, detectado uma vez no boot (lado do
+	// enlace que o client não enxerga no teste de capacidade da LAN).
+	netInfo        atomic.Pointer[sysinfo.AdapterInfo]
+	throughputBusy atomic.Bool
 }
 
 func NewServer(hostName string) *Server {
@@ -43,7 +54,21 @@ func NewServer(hostName string) *Server {
 	} else {
 		log.Printf("[config] carregada de %s: %dx%d@%dfps %dkbps", path, cfg.Width, cfg.Height, cfg.FPS, cfg.Bitrate)
 	}
-	return &Server{cfg: cfg, cfgPath: path, hostNm: hostName}
+	s := &Server{cfg: cfg, cfgPath: path, hostNm: hostName}
+
+	// Detecção do adaptador em background: custa ~1s de PowerShell e não pode
+	// atrasar o boot do host.
+	go func() {
+		info, err := sysinfo.DetectAdapter(context.Background())
+		if err != nil {
+			log.Printf("[sysinfo] adaptador de rede indisponível: %v", err)
+			return
+		}
+		s.netInfo.Store(&info)
+		log.Printf("[sysinfo] rede do host: %s (%s, %d Mbps)", info.Name, info.Type, info.LinkMbps)
+	}()
+
+	return s
 }
 
 type wsMsg struct {
@@ -102,7 +127,7 @@ func (s *Server) handleOffer(conn *websocket.Conn, offer pionwebrtc.SessionDescr
 	sess, err = webrtc.NewSession(cfg, injector, func() {
 		_ = injector.Close()
 		s.clearActive(sess)
-	})
+	}, s.persistConfig)
 	if err != nil {
 		log.Printf("[signal] nova sessão: %v", err)
 		return
@@ -131,6 +156,20 @@ func (s *Server) clearActive(sess *webrtc.Session) {
 	}
 }
 
+// persistConfig é o callback injetado na sessão: propaga ao estado do server e
+// ao disco uma config aplicada com sucesso via hot-swap (pedido do client).
+func (s *Server) persistConfig(c config.StreamConfig) {
+	s.mu.Lock()
+	s.cfg = c
+	path := s.cfgPath
+	s.mu.Unlock()
+	if err := config.Save(path, c); err != nil {
+		log.Printf("[config] falha ao salvar em %s: %v", path, err)
+	} else {
+		log.Printf("[config] persistida: %dx%d@%dfps %dkbps", c.Width, c.Height, c.FPS, c.Bitrate)
+	}
+}
+
 // HandleConfig expõe GET/POST da config de streaming (usado pelo painel host).
 func (s *Server) HandleConfig(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
@@ -148,7 +187,6 @@ func (s *Server) HandleConfig(w http.ResponseWriter, r *http.Request) {
 		c = c.Normalize()
 		s.mu.Lock()
 		active := s.active
-		s.active = nil
 		s.cfg = c
 		path := s.cfgPath
 		s.mu.Unlock()
@@ -158,11 +196,23 @@ func (s *Server) HandleConfig(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[config] falha ao salvar em %s: %v", path, err)
 		}
 
-		if active != nil {
-			log.Printf("[config] alterada para %dx%d@%dfps %dkbps; reiniciando live ativa", c.Width, c.Height, c.FPS, c.Bitrate)
-			active.Close()
-		} else {
+		switch {
+		case active == nil:
 			log.Printf("[config] alterada para %dx%d@%dfps %dkbps", c.Width, c.Height, c.FPS, c.Bitrate)
+		default:
+			// Tenta o hot-swap do encoder (sem derrubar a sessão WebRTC); só
+			// reinicia a live quando a mudança exige renegociação (ex.: codec).
+			if err := active.Reconfigure(c); err != nil {
+				log.Printf("[config] hot-swap indisponível (%v); reiniciando live ativa", err)
+				s.mu.Lock()
+				if s.active == active {
+					s.active = nil
+				}
+				s.mu.Unlock()
+				active.Close()
+			} else {
+				log.Printf("[config] hot-swap aplicado: %dx%d@%dfps %dkbps", c.Width, c.Height, c.FPS, c.Bitrate)
+			}
 		}
 		_ = json.NewEncoder(w).Encode(c)
 	default:
@@ -178,9 +228,57 @@ func (s *Server) HandleInfo(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	_ = json.NewEncoder(w).Encode(map[string]any{
+	payload := map[string]any{
 		"app":       "Tether",
 		"host":      s.hostNm,
 		"streaming": streaming,
-	})
+	}
+	if info := s.netInfo.Load(); info != nil {
+		payload["network"] = info
+	}
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+// HandleThroughput envia bytes aleatórios por N segundos para o client medir a
+// capacidade de transferência host->client da LAN — NÃO é teste de internet; o
+// gargalo medido é o enlace local (tipicamente o Wi-Fi da TV). TCP subestima um
+// pouco o teto UDP do RTP; o client compensa na heurística de sugestão.
+func (s *Server) HandleThroughput(w http.ResponseWriter, r *http.Request) {
+	const (
+		defaultSeconds = 5
+		maxSeconds     = 10
+		chunkSize      = 256 * 1024
+	)
+	seconds := defaultSeconds
+	if v := r.URL.Query().Get("seconds"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= maxSeconds {
+			seconds = n
+		}
+	}
+
+	// Um teste por vez: medições concorrentes dividem o enlace e mentem.
+	if !s.throughputBusy.CompareAndSwap(false, true) {
+		http.Error(w, "teste de capacidade já em andamento", http.StatusConflict)
+		return
+	}
+	defer s.throughputBusy.Store(false)
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+
+	// Bloco aleatório (incompressível) reusado: o custo de CPU fica no rand uma
+	// única vez; o loop só empurra bytes até o deadline.
+	chunk := make([]byte, chunkSize)
+	if _, err := rand.Read(chunk); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	deadline := time.Now().Add(time.Duration(seconds) * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := w.Write(chunk); err != nil {
+			return // client abortou o teste
+		}
+	}
 }

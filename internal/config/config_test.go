@@ -74,13 +74,13 @@ func TestH264LowLatencyTuningByResolution(t *testing.T) {
 	if got := fourK.H264GOPFrames(); got != 180 {
 		t.Fatalf("4K GOP = %d, want 180", got)
 	}
-	if got := fourK.H264VBVBufferKbps(); got != 3150 { // 42000 * 75 / 1000
-		t.Fatalf("4K VBV = %d, want 3150", got)
+	if got := fourK.H264VBVBufferKbps(); got != 1890 { // 42000 * 45 / 1000
+		t.Fatalf("4K VBV = %d, want 1890", got)
 	}
 
 	twoK := StreamConfig{Width: 2560, Height: 1440, FPS: 60, Bitrate: 24000}
-	if got := twoK.H264VBVBufferKbps(); got != 1320 { // 24000 * 55 / 1000
-		t.Fatalf("2K VBV = %d, want 1320", got)
+	if got := twoK.H264VBVBufferKbps(); got != 960 { // 24000 * 40 / 1000
+		t.Fatalf("2K VBV = %d, want 960", got)
 	}
 }
 

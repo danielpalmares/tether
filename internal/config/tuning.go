@@ -1,6 +1,9 @@
 package config
 
-import "time"
+import (
+	"os"
+	"time"
+)
 
 // TuningProfile é o conjunto de parâmetros de encoder/transporte DERIVADOS de
 // bitrate × resolução × fps. Centraliza num único lugar a "fórmula" que antes
@@ -22,7 +25,17 @@ type TuningProfile struct {
 	SpatialAQ    bool // distribui bits para reduzir picos em cenas complexas
 	TemporalAQ   bool // distribui bits ENTRE frames -> achata o pico do IDR
 	Level        string
+	Profile      string // -profile:v do encoder ("baseline" | "high"); ver H264Profile()
 	ProfileLevel string // profile-level-id da SDP
+
+	// IntraRefresh: substitui o IDR periódico por uma onda rolante de
+	// intra-blocks (Periodic Intra Refresh). O IDR concentrado é a causa raiz da
+	// "respiração" de qualidade na cadência do GOP: sob CBR, o frame ~50% maior
+	// consome o budget e o rate control degrada os frames vizinhos a cada 3s.
+	// Com PIR o custo intra é diluído uniformemente (1/GOPFrames do quadro por
+	// frame), então não existe pico — e GOPFrames vira o período da onda de
+	// refresh, mantendo a janela de recuperação pós-perda nos mesmos 3s.
+	IntraRefresh bool
 
 	// --- transporte/pacing (lado Go, consumido em pumpVideo) ---
 	// FrameQueueDepth: fila entre o leitor de NALs e o escritor RTP. Curta
@@ -58,9 +71,12 @@ const (
 	// 1080p 34KB), e o frame grande pulsa quando o VBV é apertado. Mais janela dá
 	// ao rate control espaço para achatar o frame -> chegada mais regular na TV.
 	// 1080p está ok e fica intocado.
+	// Com intra-refresh (default) não existe mais o pico do IDR para amortizar:
+	// a janela pode ser mais curta, o que CAPA o tamanho dos frames de pico e
+	// regulariza a chegada na TV (jitter buffer menor => menos input lag).
 	vbvMillisFloor = 30 // 1080p
-	vbvMillis2K    = 55
-	vbvMillis4K    = 75
+	vbvMillis2K    = 40
+	vbvMillis4K    = 45
 
 	// queueMillis: folga temporal da fila de vídeo. Curta de propósito (~65ms a
 	// 60fps ≈ 4 frames): só precisa absorver uma rajada breve do writer RTP sem
@@ -143,10 +159,20 @@ func (c StreamConfig) Tuning() TuningProfile {
 		SpatialAQ:       true,
 		TemporalAQ:      true,
 		Level:           c.H264Level(),
+		Profile:         H264Profile(),
 		ProfileLevel:    c.H264ProfileLevelID(),
+		IntraRefresh:    envIntraRefresh(),
 		FrameQueueDepth: queueDepth,
 		PacerMaxHold:    pacerHold,
 	}
+}
+
+// envIntraRefresh lê o escape hatch TETHER_INTRA_REFRESH. Default LIGADO:
+// rolling intra elimina o pulso de qualidade do IDR periódico. Desligar
+// (TETHER_INTRA_REFRESH=0) restaura o comportamento IDR/strict_gop para
+// validação em decoders que não aceitem PIR.
+func envIntraRefresh() bool {
+	return os.Getenv("TETHER_INTRA_REFRESH") != "0"
 }
 
 // surfaces escala a fila interna do NVENC pela carga (pixels × fps). Com apenas

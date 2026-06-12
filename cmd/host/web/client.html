@@ -78,6 +78,32 @@
   /* HUD de stats oculto: o jogo fica limpo */
   #stageHud.hud-hidden { display: none; }
 
+  /* presets de resolução no menu de qualidade */
+  .q-presets { display: flex; gap: 6px; }
+  .q-presets button {
+    flex: 1; padding: 7px 0; cursor: pointer;
+    font: 12px var(--mono); color: var(--txt);
+    background: transparent; border: 1px solid var(--line-2); border-radius: 8px;
+  }
+  .q-presets button.sel { background: var(--acid); color: #001; border-color: var(--acid); }
+  #qApply {
+    width: 100%; padding: 9px 0; cursor: pointer; text-align: center;
+    font: 700 12px var(--mono); letter-spacing: .5px;
+    background: color-mix(in srgb, var(--acid) 14%, transparent);
+    border: 1px solid var(--acid); border-radius: 8px; color: var(--acid);
+  }
+  #qApply:disabled { opacity: .45; cursor: default; }
+
+  /* aviso de host sobrecarregado (GPU saturada) durante o streaming */
+  #hostWarn {
+    position: fixed; left: 50%; transform: translateX(-50%);
+    bottom: max(20px, env(safe-area-inset-bottom)); z-index: 540;
+    display: none; padding: 10px 16px; border-radius: 10px;
+    border: 1px solid #e0b13a; background: rgba(40, 30, 0, .88);
+    color: #e0b13a; font: 12px var(--mono); max-width: 90%;
+  }
+  #hostWarn.show { display: block; }
+
   /* ===== controle Xbox virtual (touch) sobre o stream ===== */
   #vpad {
     position: fixed; inset: 0; z-index: 505; display: none;
@@ -291,6 +317,19 @@
       </div>
     </div>
     <div id="hostInfo" class="hint" style="margin-top:10px"></div>
+
+    <!-- teste de capacidade da LAN (host -> client): mede o enlace local, não a internet -->
+    <div id="netTest" style="margin-top:14px; padding-top:14px; border-top:1px solid var(--line);">
+      <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
+        <button class="btn" id="netTestBtn" style="width:auto; padding:8px 14px" disabled>testar capacidade da rede</button>
+        <span class="hint" id="netTestState" style="margin:0">vincule um host para medir o enlace local</span>
+      </div>
+      <div id="netTestResult" style="display:none; margin-top:10px; font:12px var(--mono,monospace); line-height:1.9;"></div>
+      <div id="netTestSuggest" style="display:none; margin-top:10px; align-items:center; gap:12px; flex-wrap:wrap;">
+        <span class="pill on"><span class="dot"></span> sugerido: <b id="suggestLabel" style="margin-left:4px"></b></span>
+        <button class="btn" id="applySuggestBtn" style="width:auto; padding:8px 14px">aplicar perfil sugerido</button>
+      </div>
+    </div>
   </div>
 
   <!-- 02 · controle -->
@@ -389,6 +428,7 @@
     <span class="pill"><span class="dot" style="background:var(--cyan)"></span> <span id="hudRtt">— ms</span></span>
     <span class="pill"><span class="dot" style="background:var(--acid)"></span> <span id="audioState">aud —</span></span>
   </div>
+  <div id="hostWarn">⚠ host sobrecarregado — <span id="hostWarnDetail"></span> · reduza bitrate/resolução no menu ⋮</div>
   <div id="stageMenuWrap">
     <button class="btn" id="stageMenuBtn" title="Menu" aria-haspopup="true" aria-expanded="false">⋮</button>
     <div id="stageMenu" role="menu">
@@ -398,9 +438,28 @@
       <button class="menu-item" id="toggleVpad" role="menuitemcheckbox">
         <span class="mi-ico">🎮</span> controle na tela <span class="mi-state">OCULTO</span>
       </button>
+      <!-- áudio off corta o arrasto do lip-sync (o browser atrasa o vídeo para
+           casar com o playout do áudio) — modo "competitivo" -->
+      <button class="menu-item" id="toggleAudio" role="menuitemcheckbox">
+        <span class="mi-ico">🔊</span> áudio <span class="mi-state">LIGADO</span>
+      </button>
       <div class="menu-row" id="opacityRow">
         <div class="mr-head"><span class="mi-ico">🌓</span> transparência <span class="mr-val" id="opacityVal">85%</span></div>
         <input type="range" id="opacityRange" min="20" max="100" step="5" value="85">
+      </div>
+      <div class="menu-sep"></div>
+      <!-- qualidade da transmissão: aplicada no host via hot-swap do encoder
+           (canal "control"), sem derrubar a sessão -->
+      <div class="menu-row" id="qualityRow">
+        <div class="mr-head"><span class="mi-ico">🎚️</span> qualidade <span class="mr-val" id="qualityVal">—</span></div>
+        <div class="q-presets" id="qResPresets">
+          <button data-res="1920x1080">1080p</button>
+          <button data-res="2560x1440">2K</button>
+          <button data-res="3840x2160">4K</button>
+        </div>
+        <div class="mr-head" style="font-size:12px">bitrate <span class="mr-val" id="qBitrateVal">— Mbps</span></div>
+        <input type="range" id="qBitrate" min="4" max="50" step="1" value="8">
+        <button id="qApply">aplicar no host</button>
       </div>
       <div class="menu-sep"></div>
       <button class="menu-item danger" id="stageExit" role="menuitem">
@@ -455,7 +514,11 @@
 <script>
 const log=(m,c='')=>{const e=document.getElementById('log'),l=document.createElement('div');l.className='ln '+c;l.textContent=m;e.appendChild(l);e.scrollTop=e.scrollHeight;};
 
-let hostAddr=null, padIndex=null, padId=null, padStandard=false, pc=null, dc=null, signalWs=null, inputTimer=null, reconnectTimer=null, remoteVideoStream=null, remoteAudioStream=null, controlHandlers=null;
+let hostAddr=null, padIndex=null, padId=null, padStandard=false, pc=null, dc=null, ctrlDc=null, signalWs=null, inputTimer=null, reconnectTimer=null, remoteVideoStream=null, remoteAudioStream=null, controlHandlers=null;
+let lastHostInfo=null;   // /api/info do host vinculado (inclui rede do host)
+let hostCfg=null;        // config corrente reportada pelo host (configResult)
+let suggestedProfile=null;
+let netTestRunning=false;
 let lastVideoStats=null;
 let lastDecodeProgressAt=0;
 let decoderStallLogged=false;
@@ -675,8 +738,15 @@ function mapGamepad(gp){
 }
 
 const urlParams = new URLSearchParams(location.search);
-const audioMode = !urlParams.has('noaudio');
-const videoOnlyMode = !audioMode;
+// Áudio é alternável em runtime (menu da sessão): off elimina o arrasto do
+// lip-sync sobre o vídeo. ?noaudio força off; senão vale a preferência salva.
+let audioMode = !urlParams.has('noaudio') && localStorage.getItem('tether.audio')!=='0';
+let videoOnlyMode = !audioMode;
+function setAudioMode(on){
+  audioMode = on;
+  videoOnlyMode = !on;
+  localStorage.setItem('tether.audio', on ? '1' : '0');
+}
 
 function resetVideoStats(){
   lastVideoStats=null;
@@ -806,15 +876,24 @@ async function probeHost(addr, timeoutMs=700){
 
 function bindHost(addr, info, auto=false){
   hostAddr=normalizeHostAddr(addr);
+  lastHostInfo=info||null;
   localStorage.setItem('tether.hostAddr', hostAddr);
   document.getElementById('hostAddr').value=hostAddr;
   document.getElementById('hostInfo').innerHTML='';
   document.getElementById('linkState').textContent='vinculado';
+  const ntBtn=document.getElementById('netTestBtn');
+  if(ntBtn){ ntBtn.disabled=false; document.getElementById('netTestState').textContent='mede o enlace local host → este aparelho (não usa internet)'; }
   setHostBanner('found',
     '✓ '+(auto?'PC encontrado':'PC vinculado')+': '+info.host,
     hostAddr+' · '+(info.streaming?'OCUPADO em outra sessão':'disponível para conectar'));
   log((auto?'host detectado: ':'host vinculado: ')+info.host+' ('+hostAddr+')','ok');
   refreshReady();
+  // ?autostart=1: conecta sozinho ao vincular — usado em testes automatizados
+  // (sem clique em "iniciar streaming")
+  if(urlParams.has('autostart') && !pc){
+    log('autostart: conectando…','warn');
+    startStream();
+  }
 }
 
 function candidateSubnetHosts(){
@@ -1508,13 +1587,22 @@ async function startStream(){
     pc.addTransceiver('audio', {direction:'recvonly'});
   }
 
-  // data channel de input
+  // data channel de input: unreliable de propósito (frame de gamepad atrasado
+  // é pior que perdido)
   dc = pc.createDataChannel('input', {ordered:false, maxRetransmits:0});
   dc.onopen = () => {
     log('canal de input aberto · enviando @60hz','ok');
     installControlCapture();
     inputTimer=setInterval(sendInput, 1000/60);
   };
+
+  // data channel de controle: CONFIÁVEL — config/ping e respostas/status do
+  // host não podem se perder (o de input descarta pacotes por design)
+  ctrlDc = pc.createDataChannel('control', {ordered:true});
+  ctrlDc.onopen = () => {
+    sendControl({type:'configGet'}); // popula o menu de qualidade com a config atual
+  };
+  ctrlDc.onmessage = ev => handleHostMessage(ev.data);
 
   // signaling via websocket
   signalWs=new WebSocket('ws://'+hostAddr+'/ws');
@@ -1608,9 +1696,9 @@ function minimizeReceiverLatency(recv, shouldLog=false){
     const kind = recv.track.kind;
     // LAN local: alvo mínimo. jitterBufferTarget é em MILISSEGUNDOS (não segundos)
     // na spec do W3C — valores como 0.001 eram interpretados como 0 e deixavam o
-    // buffer no adaptativo (~160ms). Áudio usa 20ms porque os pacotes Opus saem
-    // nesse ritmo; vídeo pode ir ao chão.
-    const target = kind === 'audio' ? 20 : 0;
+    // buffer no adaptativo (~160ms). Áudio usa 10ms porque os pacotes Opus saem
+    // nesse ritmo (frame_duration=10 no host); vídeo pode ir ao chão.
+    const target = kind === 'audio' ? 10 : 0;
     if ('jitterBufferTarget' in recv) {
       recv.jitterBufferTarget = target; applied.push('jitterBufferTarget');
     }
@@ -1728,6 +1816,193 @@ function sendCommand(cmd){
   dc.send(JSON.stringify(cmd));
 }
 
+function sendControl(msg){
+  if(!ctrlDc || ctrlDc.readyState!=='open') return false;
+  ctrlDc.send(JSON.stringify(msg));
+  return true;
+}
+
+/* ---------- mensagens host -> client (canal "control") ---------- */
+function handleHostMessage(raw){
+  let msg;
+  try{ msg=JSON.parse(raw); }catch(_){ return; }
+  switch(msg.type){
+    case 'configResult':
+      if(msg.ok && msg.config){
+        syncQualityUi(msg.config);
+        log('config do host: '+msg.config.width+'x'+msg.config.height+' @ '+(msg.config.bitrate/1000)+' Mbps','ok');
+      } else if(!msg.ok){
+        log('host recusou a config: '+(msg.error||'erro desconhecido'),'err');
+      }
+      break;
+    case 'hostStatus':
+      setHostWarn(msg.status==='overloaded', msg);
+      break;
+    case 'pong':
+      // reservado: RTT de aplicação (o HUD já usa o RTT do candidate-pair)
+      break;
+  }
+}
+
+function setHostWarn(on, msg){
+  const el=document.getElementById('hostWarn');
+  if(!el) return;
+  if(on){
+    document.getElementById('hostWarnDetail').textContent=
+      'captura a '+(msg && msg.capturedFps!=null ? msg.capturedFps : '?')+'/'+(msg && msg.targetFps!=null ? msg.targetFps : '?')+' fps';
+    if(!el.classList.contains('show')) log('host sobrecarregado (GPU saturada) — considere reduzir bitrate/resolução','warn');
+    el.classList.add('show');
+  } else {
+    el.classList.remove('show');
+  }
+}
+
+/* ---------- qualidade da transmissão (menu da sessão) ---------- */
+function syncQualityUi(cfg){
+  hostCfg=cfg;
+  const mbps=Math.round(cfg.bitrate/1000);
+  document.getElementById('qualityVal').textContent=cfg.width+'x'+cfg.height+' · '+mbps+' Mbps';
+  const range=document.getElementById('qBitrate');
+  range.value=Math.max(+range.min, Math.min(+range.max, mbps));
+  document.getElementById('qBitrateVal').textContent=range.value+' Mbps';
+  document.querySelectorAll('#qResPresets button').forEach(b=>{
+    b.classList.toggle('sel', b.dataset.res===cfg.width+'x'+cfg.height);
+  });
+}
+
+// Aplica config no host: via canal de controle (hot-swap, sem derrubar a
+// sessão) quando streaming; via HTTP /api/config quando fora da sessão.
+async function applyStreamConfig(cfg){
+  if(sendControl({type:'config', ...cfg})){
+    log('config enviada ao host · trocando encoder a quente…','warn');
+    return;
+  }
+  if(!hostAddr){ log('vincule um host antes de aplicar a config','warn'); return; }
+  try{
+    const current=await fetch('http://'+hostAddr+'/api/config', {cache:'no-store'}).then(r=>r.json());
+    const next={...current, ...cfg};
+    const res=await fetch('http://'+hostAddr+'/api/config', {method:'POST', body:JSON.stringify(next)});
+    if(!res.ok) throw new Error('HTTP '+res.status);
+    syncQualityUi(await res.json());
+    log('config aplicada no host ✓','ok');
+  }catch(e){
+    log('falha ao aplicar config: '+e.message,'err');
+  }
+}
+
+(function setupQualityMenu(){
+  let selRes=null;
+  const presets=document.querySelectorAll('#qResPresets button');
+  presets.forEach(b=>{
+    b.onclick=()=>{
+      selRes=b.dataset.res;
+      presets.forEach(x=>x.classList.toggle('sel', x===b));
+    };
+  });
+  const range=document.getElementById('qBitrate');
+  range.oninput=()=>{ document.getElementById('qBitrateVal').textContent=range.value+' Mbps'; };
+  document.getElementById('qApply').onclick=()=>{
+    const cfg={bitrate:parseInt(range.value,10)*1000};
+    let res=selRes;
+    if(!res){
+      const selBtn=document.querySelector('#qResPresets button.sel');
+      if(selBtn) res=selBtn.dataset.res;
+    }
+    if(res){ const [w,h]=res.split('x').map(Number); cfg.width=w; cfg.height=h; }
+    applyStreamConfig(cfg);
+  };
+})();
+
+/* ---------- teste de capacidade da LAN + perfil sugerido ---------- */
+// Mede o enlace LOCAL host -> client (não a internet): download de bytes
+// aleatórios do próprio host via /api/throughput, mais RTT por HTTP. O TCP
+// subestima um pouco o teto UDP do RTP; a heurística compensa (+15%) e ainda
+// reserva metade do enlace de folga para picos/retransmissão.
+async function measureHttpRtt(samples=5){
+  const times=[];
+  for(let i=0;i<samples;i++){
+    const t0=performance.now();
+    try{ await fetch('http://'+hostAddr+'/api/info', {cache:'no-store'}); }
+    catch(_){ return null; }
+    times.push(performance.now()-t0);
+  }
+  times.sort((a,b)=>a-b);
+  return times[Math.floor(times.length/2)];
+}
+
+function suggestProfile(measuredMbps, hostLinkMbps){
+  let cap=measuredMbps*1.15;                       // folga TCP -> UDP
+  if(hostLinkMbps>0) cap=Math.min(cap, hostLinkMbps);
+  const target=cap*0.5;                            // 50% do enlace: folga para picos
+  if(target>=30) return {width:3840, height:2160, bitrate:30000, label:'4K · 30 Mbps'};
+  if(target>=16){
+    const mbps=Math.max(14, Math.min(20, Math.round(target)));
+    return {width:2560, height:1440, bitrate:mbps*1000, label:'2K · '+mbps+' Mbps'};
+  }
+  const mbps=Math.max(6, Math.min(12, Math.round(target)));
+  return {width:1920, height:1080, bitrate:mbps*1000, label:'1080p · '+mbps+' Mbps'};
+}
+
+async function runNetTest(){
+  if(!hostAddr || netTestRunning) return;
+  netTestRunning=true;
+  const btn=document.getElementById('netTestBtn');
+  const state=document.getElementById('netTestState');
+  const result=document.getElementById('netTestResult');
+  const suggest=document.getElementById('netTestSuggest');
+  btn.disabled=true;
+  suggest.style.display='none';
+  result.style.display='none';
+  const liveNow=!!(pc && pc.connectionState==='connected');
+  try{
+    state.textContent='medindo RTT…';
+    const rtt=await measureHttpRtt();
+
+    state.textContent='medindo capacidade (≈4s)…';
+    const res=await fetch('http://'+hostAddr+'/api/throughput?seconds=4', {cache:'no-store'});
+    if(!res.ok) throw new Error('HTTP '+res.status);
+    const reader=res.body.getReader();
+    let bytes=0;
+    const t0=performance.now();
+    for(;;){
+      const {done, value}=await reader.read();
+      if(done) break;
+      bytes+=value.length;
+      state.textContent='medindo capacidade… '+((bytes*8)/((performance.now()-t0)/1000)/1e6).toFixed(0)+' Mbps';
+    }
+    const seconds=(performance.now()-t0)/1000;
+    const mbps=bytes*8/seconds/1e6;
+
+    const net=lastHostInfo && lastHostInfo.network;
+    const lines=[
+      'este aparelho ⇠ host: <b style="color:var(--acid)">'+mbps.toFixed(0)+' Mbps</b>'+(liveNow?' <span style="color:var(--txt-dim)">(medido DURANTE a live: é a sobra, não o total)</span>':''),
+      'RTT (HTTP): <b>'+(rtt!=null ? rtt.toFixed(0)+' ms' : 'n/d')+'</b>',
+      'rede do host: <b>'+(net ? (net.type==='wifi'?'Wi-Fi':net.type==='ethernet'?'cabo':'?')+' · '+(net.linkMbps||'?')+' Mbps ('+net.adapter+')' : 'n/d')+'</b>',
+    ];
+    result.innerHTML=lines.join('<br>');
+    result.style.display='block';
+
+    suggestedProfile=suggestProfile(mbps, net ? net.linkMbps : 0);
+    document.getElementById('suggestLabel').textContent=suggestedProfile.label;
+    suggest.style.display='flex';
+    state.textContent=liveNow ? 'concluído (repita fora da live para o valor cheio)' : 'concluído';
+    log('teste de rede: '+mbps.toFixed(0)+' Mbps · sugerido '+suggestedProfile.label,'ok');
+  }catch(e){
+    state.textContent='falha no teste: '+e.message;
+    log('teste de rede falhou: '+e.message,'err');
+  }finally{
+    netTestRunning=false;
+    btn.disabled=!hostAddr;
+  }
+}
+
+document.getElementById('netTestBtn').onclick=runNetTest;
+document.getElementById('applySuggestBtn').onclick=()=>{
+  if(!suggestedProfile) return;
+  const {width, height, bitrate}=suggestedProfile;
+  applyStreamConfig({width, height, bitrate});
+};
+
 function endStream(opts={}){
   const manual=!!opts.manual;
   // Reconexão (manual=false) preserva o fullscreen: ao salvar config a stream
@@ -1750,9 +2025,11 @@ function endStream(opts={}){
     document.getElementById('stageMenu').classList.remove('open');
   }
   if(dc) dc.close();
+  if(ctrlDc) ctrlDc.close();
   if(pc) pc.close();
   if(signalWs) signalWs.close();
-  pc=null; dc=null; signalWs=null;
+  pc=null; dc=null; ctrlDc=null; signalWs=null;
+  setHostWarn(false);
   if(remoteVideoStream){
     remoteVideoStream.getTracks().forEach(t=>t.stop());
     remoteVideoStream=null;
@@ -1789,6 +2066,7 @@ document.getElementById('stageExit').onclick = () => endStream({manual:true});
   const menu=document.getElementById('stageMenu');
   const tStats=document.getElementById('toggleStats');
   const tVpad=document.getElementById('toggleVpad');
+  const tAudio=document.getElementById('toggleAudio');
   const opacityRow=document.getElementById('opacityRow');
   const opacityRange=document.getElementById('opacityRange');
   const opacityVal=document.getElementById('opacityVal');
@@ -1831,6 +2109,22 @@ document.getElementById('stageExit').onclick = () => endStream({manual:true});
     localStorage.setItem('tether.showVpad', on?'1':'0');
   }
   tVpad.onclick=()=>applyVpad(!vpad.classList.contains('show'));
+
+  // ---- áudio (off = sem arrasto de lip-sync no vídeo) ----
+  function applyAudio(on, reconnect){
+    setAudioMode(on);
+    tAudio.classList.toggle('on', on);
+    tAudio.querySelector('.mi-state').textContent = on ? 'LIGADO' : 'DESLIGADO';
+    if(reconnect && pc){
+      // reusa o fluxo comprovado de reconexão (mesmo caminho da troca de config
+      // no host): encerra mantendo fullscreen e religa em ~1s
+      log('alternando áudio: reconectando…','warn');
+      endStream({manual:false});
+      scheduleReconnect();
+    }
+  }
+  tAudio.onclick=()=>applyAudio(!audioMode, true);
+  applyAudio(audioMode, false);
 
   // ---- transparência do controle ----
   function applyOpacity(pct){
@@ -2070,6 +2364,20 @@ setInterval(async () => {
     const freezeDelta=counterDelta(nowStats, lastVideoStats, 'freezeCount');
     if(nackDelta>0) parts.push('nack '+nackDelta);
     if(freezeDelta>0) parts.push('freeze '+freezeDelta);
+
+    // telemetria para o log do host: a visão do decoder da TV ao lado dos
+    // stats de envio, sem depender de alguém ler o HUD na tela
+    sendControl({
+      type:'stats',
+      rtt: parseFloat(rttText)||0,
+      buf: bufMs!==null ? bufMs : 0,
+      tgt: targetMs!==null ? targetMs : 0,
+      jit: nowStats.jitter!=null ? nowStats.jitter*1000 : 0,
+      decfps: fps!==null ? fps : 0,
+      lost: lostRate!==null ? lostRate : 0,
+      drop: dropRate!==null ? dropRate : 0,
+    });
+
     lastVideoStats=nowStats;
     document.getElementById('hudRtt').textContent=parts.join(' · ');
   } else {

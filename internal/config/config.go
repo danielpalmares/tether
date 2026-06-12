@@ -74,6 +74,36 @@ func (c StreamConfig) H264ProfileLevelID() string {
 	}
 }
 
+// H264Profile lê o escape hatch TETHER_H264_PROFILE. Default "baseline":
+// denominador comum dos decoders rígidos de TV. "high" rende ~10-15% mais
+// qualidade por bit (CABAC + transform 8x8) — relevante em 4K/30Mbps — mas
+// precisa ser validado na TV real antes de virar default. O profile do encoder
+// e o profile-level-id da SDP DEVEM casar (a Tizen trava se divergirem).
+func H264Profile() string {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("TETHER_H264_PROFILE"))) {
+	case "high":
+		return "high"
+	default:
+		return "baseline"
+	}
+}
+
+// H264MaxProfileLevelID é o profile-level-id ANUNCIADO na SDP: sempre o level
+// máximo do pipeline (5.2/4K60), independente da resolução corrente. Anunciar
+// level MAIOR que o bitstream é seguro — é declaração de capacidade, não de
+// conteúdo — e é o pré-requisito do hot-swap de resolução: o decoder da TV é
+// provisionado uma única vez pelo SDP e precisa aguentar qualquer resolução que
+// o encoder venha a emitir durante a sessão. (O inverso — anunciar level menor
+// que o bitstream — congela o decoder Tizen; ver session.go.)
+func H264MaxProfileLevelID() string {
+	if H264Profile() == "high" {
+		// 64 = High, profile-iop 0x00, level 5.2.
+		return "640034"
+	}
+	// 42 = Baseline, profile-iop 0xc0 (constraint_set0+1, medido no SPS), level 5.2.
+	return "42c034"
+}
+
 func (c StreamConfig) Is4K() bool {
 	c = c.Normalize()
 	return c.Width >= 3840 || c.Height >= 2160

@@ -244,18 +244,18 @@ func (c *Capturer) ffmpegArgs(mode pipelineMode) []string {
 }
 
 func appendNVENCArgs(args []string, cfg config.StreamConfig, tune config.TuningProfile, gop, bufsize int) []string {
-	return append(args,
+	args = append(args,
 		// --- encoder NVENC low-latency ---
 		"-c:v", "h264_nvenc",
 		"-preset", "p1", // mais rápido
 		"-tune", "ull", // ultra low latency
-		// Constrained Baseline + level compatível com a resolução: casa com o SDP
-		// (profile-level-id dinâmico; profile-iop 0xc0 medido no SPS via
-		// trace_headers). NVENC por padrão emite Main profile
+		// Profile vindo do tuning (baseline default; "high" via
+		// TETHER_H264_PROFILE depois de validado na TV): precisa casar com o
+		// profile-level-id anunciado no SDP. NVENC por padrão emite Main profile
 		// (CABAC); decoders rígidos de TV (Tizen/webOS/Android TV) travam na
 		// imagem quando o stream diverge do profile/level anunciado no SDP.
 		// Baseline (sem CABAC, sem B-frames) é o denominador comum compatível.
-		"-profile:v", "baseline",
+		"-profile:v", tune.Profile,
 		"-level", tune.Level,
 		"-rc", tune.RateControl,
 		"-b:v", fmt.Sprintf("%dk", cfg.Bitrate),
@@ -278,7 +278,6 @@ func appendNVENCArgs(args []string, cfg config.StreamConfig, tune config.TuningP
 		// estoura o gap de envio a cada keyframe.
 		"-temporal-aq", boolFlag(tune.TemporalAQ),
 		"-multipass", "disabled",
-		"-strict_gop", "1",
 		// zerolatency: desliga o atraso interno de 1 quadro do rate control do
 		// NVENC. Cada frame codificado é emitido imediatamente, sem o "pipeline
 		// delay" que o encoder normalmente mantém para suavizar bitrate. Essencial
@@ -292,17 +291,33 @@ func appendNVENCArgs(args []string, cfg config.StreamConfig, tune config.TuningP
 		// inequívoca para o agrupador do lado Go.
 		"-aud", "1",
 	)
+	if tune.IntraRefresh {
+		// PIR: onda rolante de intra-blocks no lugar do IDR periódico. Elimina o
+		// pico de tamanho do keyframe — a causa da "respiração" de qualidade na
+		// cadência do GOP. -g vira o período da onda de refresh; o primeiro frame
+		// continua IDR (-forced-idr 1), então o client decodifica de imediato.
+		args = append(args, "-intra-refresh", "1")
+	} else {
+		args = append(args, "-strict_gop", "1")
+	}
+	return args
 }
 
 func appendX264Args(args []string, cfg config.StreamConfig, tune config.TuningProfile, gop, bufsize int) []string {
+	x264Params := "repeat-headers=1:sliced-threads=1:sync-lookahead=0:rc-lookahead=0"
+	if tune.IntraRefresh {
+		// Mesmo racional do NVENC: PIR dilui o custo intra e elimina o pulso de
+		// qualidade do IDR. keyint (-g) define o período da onda de refresh.
+		x264Params += ":intra-refresh=1"
+	}
 	return append(args,
 		// --- encoder universal/teste: CPU libx264 low-latency ---
 		"-c:v", "libx264",
 		"-preset", "ultrafast",
 		"-tune", "zerolatency",
-		// Mantém o contrato do SDP: H.264 Baseline sem B-frames, com level
+		// Mantém o contrato do SDP: mesmo profile anunciado, sem B-frames, level
 		// derivado da resolução.
-		"-profile:v", "baseline",
+		"-profile:v", tune.Profile,
 		"-level", tune.Level,
 		"-pix_fmt", "yuv420p",
 		"-b:v", fmt.Sprintf("%dk", cfg.Bitrate),
@@ -312,7 +327,7 @@ func appendX264Args(args []string, cfg config.StreamConfig, tune config.TuningPr
 		"-keyint_min", fmt.Sprintf("%d", gop),
 		"-bf", "0",
 		"-sc_threshold", "0",
-		"-x264-params", "repeat-headers=1:sliced-threads=1:sync-lookahead=0:rc-lookahead=0",
+		"-x264-params", x264Params,
 		// emite access unit delimiters (NAL type 9) -> fronteira de frame
 		// inequívoca para o agrupador do lado Go.
 		"-aud", "1",

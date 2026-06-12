@@ -229,7 +229,10 @@ func ffmpegArgs(device string, port int) []string {
 		"-ar", "48000",
 		"-c:a", "libopus",
 		"-application", "lowdelay",
-		"-frame_duration", "20",
+		// 10ms por frame Opus: metade da latência de enquadramento do áudio. O
+		// lip-sync do browser ATRASA O VÍDEO para casar com o playout do áudio,
+		// então cada ms cortado aqui é input lag a menos no vídeo.
+		"-frame_duration", "10",
 		"-b:a", "96k",
 		"-vbr", "off",
 		"-compression_level", "0",
@@ -260,7 +263,9 @@ func ffmpegPCMArgs(format pcmFormat, port int) []string {
 		"-ar", "48000",
 		"-c:a", "libopus",
 		"-application", "lowdelay",
-		"-frame_duration", "20",
+		// 10ms por frame Opus: metade da latência de enquadramento. O lip-sync
+		// atrasa o VÍDEO para casar com o áudio; frame menor = vídeo mais cedo.
+		"-frame_duration", "10",
 		"-b:a", "96k",
 		"-vbr", "off",
 		"-compression_level", "0",
@@ -268,9 +273,9 @@ func ffmpegPCMArgs(format pcmFormat, port int) []string {
 		// max_delay/muxdelay/muxpreload = 0: o muxer RTP, por padrão, bufferiza
 		// ~90ms de áudio antes de despejar (medido como gapMax=90ms no pumpAudio,
 		// pkt_size sozinho não quebra isso porque o muxer agrega por TEMPO, não
-		// por tamanho). Zerar os três força a emissão de cada frame Opus (~20ms)
-		// imediatamente -> gap cai de 90ms para ~20ms, lip-sync deixa de arrastar
-		// o vídeo.
+		// por tamanho). Zerar os três força a emissão de cada frame Opus
+		// imediatamente -> o gap cai para a duração do frame, lip-sync deixa de
+		// arrastar o vídeo.
 		"-max_delay", "0",
 		"-muxdelay", "0",
 		"-muxpreload", "0",

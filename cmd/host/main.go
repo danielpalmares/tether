@@ -47,6 +47,7 @@ func main() {
 	mux.Handle("/", cacheControl(http.FileServer(http.FS(webFS))))
 	mux.HandleFunc("/api/info", srv.HandleInfo)
 	mux.HandleFunc("/api/config", srv.HandleConfig)
+	mux.HandleFunc("/api/throughput", srv.HandleThroughput)
 	mux.HandleFunc("/ws", srv.HandleSignal)
 
 	ip := localIP()
