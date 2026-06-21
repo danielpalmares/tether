@@ -32,9 +32,11 @@ func New(cfg config.StreamConfig) *Capturer {
 //
 //	ddagrab (D3D11) -> h264_nvenc -> H.264 Annex-B (stdout)
 //
-// Se o FFmpeg/GPU não aceitar o caminho D3D11 direto, cai para o fallback
-// hwdownload -> nv12 -> h264_nvenc. No modo universal/teste, usa
-// hwdownload -> yuv420p -> libx264 para não depender do fabricante da GPU.
+// Se o FFmpeg/GPU não aceitar o caminho D3D11 direto, a sessão falha em vez de
+// cair silenciosamente para hwdownload -> CPU. Esse fallback é útil para
+// diagnóstico, mas em notebooks híbridos custa caro e mascara o problema real.
+// No modo universal/teste, usa hwdownload -> yuv420p -> libx264 para não
+// depender do fabricante da GPU.
 func (c *Capturer) Start(ctx context.Context) (io.ReadCloser, error) {
 	ctx, c.cancel = context.WithCancel(ctx)
 
@@ -53,7 +55,11 @@ func (c *Capturer) Start(ctx context.Context) (io.ReadCloser, error) {
 			return nil, fmt.Errorf("iniciar ffmpeg: %w", ctx.Err())
 		}
 		if mode == pipelineD3D11 {
-			fmt.Fprintf(os.Stderr, "[capture] pipeline d3d11 direto indisponível, tentando fallback CPU: %v\n", err)
+			if allowsCPUFallback(c.cfg.Codec) {
+				fmt.Fprintf(os.Stderr, "[capture] pipeline d3d11 direto indisponível, tentando fallback CPU: %v\n", err)
+			} else {
+				fmt.Fprintf(os.Stderr, "[capture] pipeline d3d11 direto indisponível: %v\n", err)
+			}
 		}
 	}
 
@@ -74,10 +80,24 @@ func pipelineOrder(codec string) []pipelineMode {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("TETHER_FFMPEG_PIPELINE"))) {
 	case "cpu", "download":
 		return []pipelineMode{pipelineCPU}
+	case "auto", "fallback":
+		return []pipelineMode{pipelineD3D11, pipelineCPU}
 	case "d3d11", "direct", "gpu":
 		return []pipelineMode{pipelineD3D11}
 	default:
-		return []pipelineMode{pipelineD3D11, pipelineCPU}
+		return []pipelineMode{pipelineD3D11}
+	}
+}
+
+func allowsCPUFallback(codec string) bool {
+	if codec == config.CodecH264X264 {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("TETHER_FFMPEG_PIPELINE"))) {
+	case "auto", "fallback":
+		return true
+	default:
+		return false
 	}
 }
 

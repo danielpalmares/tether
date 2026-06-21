@@ -15,6 +15,33 @@ func TestPipelineOrderForX264ForcesCPU(t *testing.T) {
 	}
 }
 
+func TestPipelineOrderForNVENCDefaultsToD3D11Only(t *testing.T) {
+	t.Setenv("TETHER_FFMPEG_PIPELINE", "")
+
+	got := pipelineOrder(config.CodecH264NVENC)
+	if len(got) != 1 || got[0] != pipelineD3D11 {
+		t.Fatalf("pipeline order = %v, want [%s]", got, pipelineD3D11)
+	}
+}
+
+func TestPipelineOrderForNVENCAutoAllowsCPUFallback(t *testing.T) {
+	t.Setenv("TETHER_FFMPEG_PIPELINE", "auto")
+
+	got := pipelineOrder(config.CodecH264NVENC)
+	if len(got) != 2 || got[0] != pipelineD3D11 || got[1] != pipelineCPU {
+		t.Fatalf("pipeline order = %v, want [%s %s]", got, pipelineD3D11, pipelineCPU)
+	}
+}
+
+func TestPipelineOrderForNVENCCanForceCPUFallback(t *testing.T) {
+	t.Setenv("TETHER_FFMPEG_PIPELINE", "cpu")
+
+	got := pipelineOrder(config.CodecH264NVENC)
+	if len(got) != 1 || got[0] != pipelineCPU {
+		t.Fatalf("pipeline order = %v, want [%s]", got, pipelineCPU)
+	}
+}
+
 func TestFFmpegArgsUseNVENCByDefault(t *testing.T) {
 	c := New(config.StreamConfig{
 		Width:   1920,
