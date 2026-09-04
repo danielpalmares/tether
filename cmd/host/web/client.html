@@ -366,9 +366,48 @@
     </div>
   </div>
 
-  <!-- 03 · iniciar -->
+  <!-- 03 · qualidade (painel único: configura o host daqui) -->
+  <div class="panel" id="qualityPanel" style="display:none">
+    <div class="hdr">qualidade da transmissão <span class="idx">CFG · 03</span></div>
+
+    <div class="field">
+      <label>predefinição</label>
+      <select id="presetSel"></select>
+      <div class="hint" id="presetHint" style="margin-top:6px"></div>
+    </div>
+
+    <div class="grid cols-2" style="margin-top:14px">
+      <div class="field" style="margin:0">
+        <label>bitrate personalizado (Mbps)</label>
+        <input type="number" id="bitrateCustom" min="1" max="80" step="1" placeholder="usar o do preset">
+        <div class="hint" style="margin-top:6px">Deixe vazio para usar o recomendado da predefinição.</div>
+      </div>
+      <div class="field" style="margin:0">
+        <label>perfil de latência</label>
+        <select id="latencySel"></select>
+        <div class="hint" id="latencyHint" style="margin-top:6px"></div>
+      </div>
+    </div>
+
+    <div class="field" id="displayField" style="margin-top:14px; display:none">
+      <label>monitor de origem</label>
+      <select id="displaySel"></select>
+    </div>
+
+    <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-top:16px">
+      <button class="btn" id="netTestBtn" style="width:auto; padding:9px 16px">testar rede e sugerir</button>
+      <button class="btn" id="applyCfgBtn" style="width:auto; padding:9px 16px">aplicar</button>
+      <span class="hint" id="cfgState" style="margin:0"></span>
+    </div>
+
+    <div id="netResult" class="hint" style="margin-top:12px; display:none"></div>
+    <div id="gpuBox" class="hint" style="margin-top:10px; display:none"></div>
+    <div class="hint" id="codecInfo" style="margin-top:10px"></div>
+  </div>
+
+  <!-- 04 · iniciar -->
   <div class="panel">
-    <div class="hdr">sessão <span class="idx">RUN · 03</span></div>
+    <div class="hdr">sessão <span class="idx">RUN · 04</span></div>
     <div style="display:flex; align-items:center; gap:16px; flex-wrap:wrap;">
       <span class="pill" id="readyPill"><span class="dot"></span> aguardando host + controle</span>
       <button class="btn live" id="startBtn" style="margin-left:auto; max-width:260px" disabled>
@@ -815,6 +854,8 @@ function bindHost(addr, info, auto=false){
     hostAddr+' · '+(info.streaming?'OCUPADO em outra sessão':'disponível para conectar'));
   log((auto?'host detectado: ':'host vinculado: ')+info.host+' ('+hostAddr+')','ok');
   refreshReady();
+  // Com o host vinculado, o painel de qualidade passa a poder configurá-lo.
+  loadQualityPanel();
 }
 
 function candidateSubnetHosts(){
@@ -1513,6 +1554,9 @@ async function startStream(){
   dc.onopen = () => {
     log('canal de input aberto · enviando @60hz','ok');
     installControlCapture();
+    // Zera a supressão: numa reconexão o host não conhece o estado anterior, então
+    // o primeiro pacote precisa sair mesmo que idêntico ao último da sessão velha.
+    lastInputPayload=''; lastInputSentAt=0;
     inputTimer=setInterval(sendInput, 1000/60);
   };
 
@@ -1575,6 +1619,14 @@ function enablePlayoutDelayExtension(sdp){
   return lines.join(eol);
 }
 
+// Estado do envio de input: usado para suprimir pacotes idênticos consecutivos.
+// O keep-alive garante que o host receba o estado periodicamente mesmo parado
+// (defesa contra um pacote perdido deixar um botão "preso", já que o canal é
+// unordered/sem retransmissão).
+let lastInputPayload = '';
+let lastInputSentAt = 0;
+const INPUT_KEEPALIVE_MS = 250;
+
 function sendInput(){
   if(!dc || dc.readyState!=='open') return;
   const gp = padIndex!==null ? currentPad() : null;
@@ -1598,7 +1650,17 @@ function sendInput(){
     axes[4]=Math.max(axes[4], vpadState.trig[0]);
     axes[5]=Math.max(axes[5], vpadState.trig[1]);
   }
-  dc.send(JSON.stringify({type:'gamepad', buttons, axes}));
+  // Envia só quando o estado MUDA (com keep-alive periódico). Antes o cliente
+  // serializava e transmitia um JSON a 60Hz mesmo com o controle parado: puro
+  // desperdício de CPU na TV (que é fraca e também está decodificando 60fps) e
+  // de banda no mesmo Wi-Fi que carrega o vídeo. A latência de resposta não muda
+  // — toda mudança real continua saindo no próximo tick de 16ms.
+  const payload = JSON.stringify({type:'gamepad', buttons, axes});
+  const now = Date.now();
+  if(payload === lastInputPayload && (now - lastInputSentAt) < INPUT_KEEPALIVE_MS) return;
+  lastInputPayload = payload;
+  lastInputSentAt = now;
+  dc.send(payload);
 }
 
 function minimizeReceiverLatency(recv, shouldLog=false){
@@ -2088,6 +2150,276 @@ if('serviceWorker' in navigator){
       .catch(e=>log('service worker indisponível: '+e.message,'warn'));
   });
 }
+
+/* ==========================================================================
+   PAINEL DE QUALIDADE — controla o host a partir do cliente.
+   Existe para haver UMA interface só: antes, resolução/bitrate ficavam no
+   painel do PC e o resto aqui, o que obrigava a ir e voltar entre dois lugares.
+   Tudo aqui fala com o host por /api/*.
+   Sintaxe deliberadamente conservadora (sem ?. nem ??): a Tizen roda Chromium ~76.
+   ========================================================================== */
+
+var qualityOptions = null;   // presets/latência/monitores vindos do host
+var qualityCfg = null;       // config atual do host
+var netTestBusy = false;
+var gpuPollTimer = null;
+
+function apiBase(){
+  return hostAddr ? ('http://' + hostAddr) : '';
+}
+
+function apiFetch(path, opts){
+  var base = apiBase();
+  if(!base) return Promise.reject(new Error('host não vinculado'));
+  return fetch(base + path, opts).then(function(r){
+    if(!r.ok) throw new Error('HTTP ' + r.status);
+    return r.json();
+  });
+}
+
+// Carrega opções + config assim que um host é vinculado.
+function loadQualityPanel(){
+  if(!hostAddr) return;
+  Promise.all([
+    apiFetch('/api/options'),
+    apiFetch('/api/config')
+  ]).then(function(res){
+    qualityOptions = res[0];
+    qualityCfg = res[1];
+    renderQualityPanel();
+    document.getElementById('qualityPanel').style.display = '';
+    startGpuPolling();
+  }).catch(function(e){
+    log('painel de qualidade indisponível: ' + e.message, 'warn');
+  });
+}
+
+function renderQualityPanel(){
+  if(!qualityOptions || !qualityCfg) return;
+
+  // --- presets ---
+  var sel = document.getElementById('presetSel');
+  sel.innerHTML = '';
+  var presets = qualityOptions.presets || [];
+  var matched = '';
+  for(var i=0;i<presets.length;i++){
+    var p = presets[i];
+    var o = document.createElement('option');
+    o.value = p.id;
+    o.textContent = p.label + '  ·  ' + Math.round(p.bitrate/1000) + ' Mbps';
+    sel.appendChild(o);
+    // O preset ativo é o que casa resolução E bitrate; se o bitrate foi
+    // customizado, ainda assim marcamos o preset da resolução.
+    if(p.width === qualityCfg.width && p.height === qualityCfg.height){
+      if(!matched || p.bitrate === qualityCfg.bitrate) matched = p.id;
+    }
+  }
+  if(matched) sel.value = matched;
+  updatePresetHint();
+
+  // --- bitrate custom: só preenche se divergir do preset ---
+  var cur = presetById(sel.value);
+  var custom = document.getElementById('bitrateCustom');
+  if(cur && qualityCfg.bitrate && qualityCfg.bitrate !== cur.bitrate){
+    custom.value = Math.round(qualityCfg.bitrate/1000);
+  } else {
+    custom.value = '';
+  }
+
+  // --- latência ---
+  var lsel = document.getElementById('latencySel');
+  lsel.innerHTML = '';
+  var profs = qualityOptions.latency || [];
+  for(var j=0;j<profs.length;j++){
+    var lp = profs[j];
+    var lo = document.createElement('option');
+    lo.value = lp.id;
+    lo.textContent = lp.label;
+    lsel.appendChild(lo);
+  }
+  lsel.value = qualityCfg.latency || 'balanced';
+  updateLatencyHint();
+
+  // --- monitores: o campo só aparece se houver escolha real a fazer ---
+  var displays = qualityOptions.displays || [];
+  var dfield = document.getElementById('displayField');
+  var dsel = document.getElementById('displaySel');
+  dsel.innerHTML = '';
+  for(var k=0;k<displays.length;k++){
+    var d = displays[k];
+    var opt = document.createElement('option');
+    opt.value = String(d.index);
+    opt.textContent = d.label;
+    dsel.appendChild(opt);
+  }
+  dsel.value = String(qualityCfg.display || 0);
+  dfield.style.display = displays.length > 1 ? '' : 'none';
+
+  // --- codec (informativo: a detecção é automática) ---
+  var c = qualityOptions.codec;
+  if(c) document.getElementById('codecInfo').textContent = 'Codificador detectado automaticamente: ' + c.label;
+}
+
+function presetById(id){
+  if(!qualityOptions) return null;
+  var ps = qualityOptions.presets || [];
+  for(var i=0;i<ps.length;i++){ if(ps[i].id === id) return ps[i]; }
+  return null;
+}
+
+function updatePresetHint(){
+  var p = presetById(document.getElementById('presetSel').value);
+  document.getElementById('presetHint').textContent = p ? p.description : '';
+}
+
+function updateLatencyHint(){
+  var id = document.getElementById('latencySel').value;
+  var profs = (qualityOptions && qualityOptions.latency) ? qualityOptions.latency : [];
+  for(var i=0;i<profs.length;i++){
+    if(profs[i].id === id){
+      document.getElementById('latencyHint').textContent = profs[i].description;
+      return;
+    }
+  }
+  document.getElementById('latencyHint').textContent = '';
+}
+
+// Aplica a configuração no host. O host reinicia a sessão ativa sozinho.
+function applyQualityConfig(){
+  var p = presetById(document.getElementById('presetSel').value);
+  if(!p) return;
+
+  var customMbps = parseFloat(document.getElementById('bitrateCustom').value);
+  var bitrate = p.bitrate;
+  if(!isNaN(customMbps) && customMbps > 0) bitrate = Math.round(customMbps * 1000);
+
+  var body = {
+    width: p.width,
+    height: p.height,
+    fps: 60,
+    bitrate: bitrate,
+    codec: 'auto',
+    display: parseInt(document.getElementById('displaySel').value || '0', 10),
+    latency: document.getElementById('latencySel').value
+  };
+
+  var state = document.getElementById('cfgState');
+  state.textContent = 'aplicando…';
+  apiFetch('/api/config', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify(body)
+  }).then(function(cfg){
+    qualityCfg = cfg;
+    state.textContent = 'aplicado ✓';
+    log('qualidade: ' + cfg.width + 'x' + cfg.height + ' @ ' + Math.round(cfg.bitrate/1000) + ' Mbps · ' + cfg.latency, 'ok');
+    setTimeout(function(){ state.textContent=''; }, 2500);
+  }).catch(function(e){
+    state.textContent = 'falhou: ' + e.message;
+  });
+}
+
+/* --- Teste de rede -------------------------------------------------------
+   Mede o caminho REAL do stream (cliente <- host, mesmo Wi-Fi e mesma porta),
+   não a internet: o vídeo nunca sai da LAN, então velocidade de internet é
+   irrelevante aqui. É a saturação DESTE link que faz a TV pedir NACK e travar. */
+function runNetworkTest(){
+  if(netTestBusy || !hostAddr) return;
+  netTestBusy = true;
+
+  var btn = document.getElementById('netTestBtn');
+  var box = document.getElementById('netResult');
+  btn.disabled = true;
+  btn.textContent = 'medindo…';
+  box.style.display = '';
+  box.textContent = 'baixando amostra do host…';
+
+  // Duas passadas: a primeira aquece o TCP (slow-start) e é descartada; a
+  // segunda é a medida válida da taxa sustentada.
+  measureDownload(2 << 20).then(function(){
+    return measureDownload(8 << 20);
+  }).then(function(mbps){
+    return apiFetch('/api/recommend?mbps=' + encodeURIComponent(mbps.toFixed(1)))
+      .then(function(rec){ return {mbps: mbps, rec: rec}; });
+  }).then(function(out){
+    var p = out.rec.preset;
+    box.innerHTML = 'Link medido: <b>' + out.mbps.toFixed(0) + ' Mbps</b>'
+      + ' · sugerido: <b>' + p.label + '</b> (' + Math.round(p.bitrate/1000) + ' Mbps)';
+    // Aplica a sugestão no seletor, mas NÃO envia sozinho: a decisão final é
+    // do usuário, que pode preferir mais qualidade e aceitar o risco.
+    document.getElementById('presetSel').value = p.id;
+    document.getElementById('bitrateCustom').value = '';
+    updatePresetHint();
+    log('teste de rede: ' + out.mbps.toFixed(0) + ' Mbps → ' + p.label, 'ok');
+  }).catch(function(e){
+    box.textContent = 'teste falhou: ' + e.message;
+  }).then(function(){
+    netTestBusy = false;
+    btn.disabled = false;
+    btn.textContent = 'testar rede e sugerir';
+  });
+}
+
+function measureDownload(bytes){
+  var url = apiBase() + '/api/bandwidth?bytes=' + bytes + '&t=' + Date.now();
+  var t0 = (window.performance && performance.now) ? performance.now() : Date.now();
+  return fetch(url, {cache:'no-store'}).then(function(r){
+    if(!r.ok) throw new Error('HTTP ' + r.status);
+    return r.arrayBuffer();
+  }).then(function(buf){
+    var t1 = (window.performance && performance.now) ? performance.now() : Date.now();
+    var secs = (t1 - t0) / 1000;
+    if(secs <= 0) secs = 0.001;
+    return (buf.byteLength * 8) / secs / 1e6;
+  });
+}
+
+/* --- Monitor de GPU ------------------------------------------------------
+   Responde a pergunta que o usuário realmente tem quando trava: é a minha GPU
+   ou é a rede? O host distingue gargalo de NÚCLEO (baixar gráficos do jogo) de
+   gargalo de ENCODER (baixar a qualidade da stream). */
+function startGpuPolling(){
+  if(gpuPollTimer) clearInterval(gpuPollTimer);
+  pollGpu();
+  gpuPollTimer = setInterval(pollGpu, 3000);
+}
+
+function pollGpu(){
+  if(!hostAddr) return;
+  apiFetch('/api/stats').then(function(s){
+    var g = s.gpu;
+    var box = document.getElementById('gpuBox');
+    if(!g || !g.available){ box.style.display='none'; return; }
+
+    box.style.display = '';
+    var txt = 'GPU ' + g.gpuUtil + '% · encoder ' + g.encUtil + '%';
+    if(g.throttle) txt += ' · throttle ' + g.throttle;
+    if(g.advice){
+      box.style.color = 'var(--warn, #e8b04b)';
+      txt += ' — ' + g.advice;
+    } else {
+      box.style.color = '';
+    }
+    box.textContent = txt;
+  }).catch(function(){ /* host offline: silencioso */ });
+}
+
+// Liga os controles.
+(function bindQualityPanel(){
+  var sel = document.getElementById('presetSel');
+  if(sel) sel.onchange = function(){
+    updatePresetHint();
+    // Trocar de preset limpa o bitrate custom: o valor antigo pertencia à
+    // resolução anterior e quase nunca faz sentido na nova.
+    document.getElementById('bitrateCustom').value = '';
+  };
+  var lsel = document.getElementById('latencySel');
+  if(lsel) lsel.onchange = updateLatencyHint;
+  var apply = document.getElementById('applyCfgBtn');
+  if(apply) apply.onclick = applyQualityConfig;
+  var net = document.getElementById('netTestBtn');
+  if(net) net.onclick = runNetworkTest;
+})();
 
 log('client tether inicializado','ok');
 autoDiscoverHosts();
