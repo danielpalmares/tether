@@ -85,7 +85,13 @@ func pipelineOrder(codec string) []pipelineMode {
 	case "d3d11", "direct", "gpu":
 		return []pipelineMode{pipelineD3D11}
 	default:
-		return []pipelineMode{pipelineD3D11}
+		// D3D11 direto primeiro, CPU como rede de segurança. Forçar SOMENTE o
+		// caminho direto (comportamento anterior) transformava qualquer falha
+		// transitória — GPU saturada por um jogo, sessão NVENC ocupada, troca de
+		// modo de display — em ausência total de vídeo, porque não sobrava
+		// pipeline nenhum. O fallback custa CPU, mas só é usado quando a
+		// alternativa é tela preta; o log deixa explícito quando isso acontece.
+		return []pipelineMode{pipelineD3D11, pipelineCPU}
 	}
 }
 
@@ -94,10 +100,10 @@ func allowsCPUFallback(codec string) bool {
 		return false
 	}
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("TETHER_FFMPEG_PIPELINE"))) {
-	case "auto", "fallback":
-		return true
-	default:
+	case "cpu", "download", "d3d11", "direct", "gpu":
 		return false
+	default:
+		return true
 	}
 }
 
@@ -168,7 +174,12 @@ func (c *Capturer) startFFmpeg(ctx context.Context, mode pipelineMode) (*bufio.R
 	// Confirma que o pipeline escolhido realmente produz H.264. O FFmpeg pode
 	// iniciar e só falhar ao abrir o encoder depois; esperar o primeiro byte
 	// permite cair para o fallback sem devolver um stream morto ao WebRTC.
-	reader := bufio.NewReaderSize(stdout, 64<<10)
+	// Buffer pequeno de propósito: com 64KB, vários frames de uma cena leve
+	// (~16KB cada) chegavam ao leitor no MESMO bloco, e o pipeline só os
+	// processava em lote — medido: com leitura de 64KB o contador de frames caía
+	// de ~460 para ~262 em 8s, ou seja, frames sendo agrupados em vez de fluir.
+	// 8KB entrega cada frame assim que ele sai do FFmpeg, sem esperar encher.
+	reader := bufio.NewReaderSize(stdout, 8<<10)
 	ready := make(chan error, 1)
 	go func() {
 		_, err := reader.Peek(1)

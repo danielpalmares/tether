@@ -15,8 +15,22 @@ func TestPipelineOrderForX264ForcesCPU(t *testing.T) {
 	}
 }
 
-func TestPipelineOrderForNVENCDefaultsToD3D11Only(t *testing.T) {
+// Por padrão o D3D11 direto vem primeiro, mas o CPU permanece como rede de
+// segurança: sem ele, uma falha transitória do caminho direto (GPU saturada,
+// sessão NVENC ocupada) deixa a sessão SEM vídeo nenhum em vez de degradar.
+func TestPipelineOrderForNVENCPrefersD3D11WithCPUFallback(t *testing.T) {
 	t.Setenv("TETHER_FFMPEG_PIPELINE", "")
+
+	got := pipelineOrder(config.CodecH264NVENC)
+	if len(got) != 2 || got[0] != pipelineD3D11 || got[1] != pipelineCPU {
+		t.Fatalf("pipeline order = %v, want [%s %s]", got, pipelineD3D11, pipelineCPU)
+	}
+}
+
+// Forçar explicitamente o caminho direto continua desabilitando o fallback —
+// útil para diagnóstico, quando mascarar o problema é indesejado.
+func TestPipelineOrderForNVENCCanForceD3D11Only(t *testing.T) {
+	t.Setenv("TETHER_FFMPEG_PIPELINE", "d3d11")
 
 	got := pipelineOrder(config.CodecH264NVENC)
 	if len(got) != 1 || got[0] != pipelineD3D11 {

@@ -60,19 +60,22 @@ func TestH264ProfileLevelIDByResolution(t *testing.T) {
 }
 
 func TestH264LowLatencyTuningByResolution(t *testing.T) {
-	// GOP longo (3s) amortiza a frequência dos picos de IDR; VBV dimensionado em
-	// milissegundos de bitrate dá folga para o rate control espalhar o IDR.
+	// GOP de 2s: o keyframe é o único ponto de entrada válido do stream, então o
+	// GOP limita quanto tempo a TV fica em tela preta ao conectar ou ao se
+	// recuperar (perda, ou captura reiniciada por troca de modo de display). Com
+	// VBR o IDR deixou de ser um pico caro, então encurtar custa pouca banda.
+	// VBV segue dimensionado em milissegundos de bitrate.
 	fullHD := StreamConfig{Width: 1920, Height: 1080, FPS: 60, Bitrate: 8000}
-	if got := fullHD.H264GOPFrames(); got != 180 {
-		t.Fatalf("1080p GOP = %d, want 180", got)
+	if got := fullHD.H264GOPFrames(); got != 120 {
+		t.Fatalf("1080p GOP = %d, want 120", got)
 	}
 	if got := fullHD.H264VBVBufferKbps(); got != 240 { // 8000 * 30 / 1000
 		t.Fatalf("1080p VBV = %d, want 240", got)
 	}
 
 	fourK := StreamConfig{Width: 3840, Height: 2160, FPS: 60, Bitrate: 42000}
-	if got := fourK.H264GOPFrames(); got != 180 {
-		t.Fatalf("4K GOP = %d, want 180", got)
+	if got := fourK.H264GOPFrames(); got != 120 {
+		t.Fatalf("4K GOP = %d, want 120", got)
 	}
 	if got := fourK.H264VBVBufferKbps(); got != 3150 { // 42000 * 75 / 1000
 		t.Fatalf("4K VBV = %d, want 3150", got)
@@ -105,11 +108,12 @@ func TestTuningPacerHoldScalesWithResolution(t *testing.T) {
 }
 
 func TestTuningFrameQueueScalesWithFPS(t *testing.T) {
-	// Fila curta (~65ms) derivada do fps; pacer hold ≈ meio frame. Regra única
-	// para o caminho NVENC.
+	// Fila curta (~40ms no perfil padrão) derivada do fps; pacer hold ≈ meio
+	// frame. Cada frame na fila é ~16.7ms de latência na tela, então a fila
+	// absorve jitter sem virar acumulador de atraso.
 	t60 := StreamConfig{Width: 1920, Height: 1080, FPS: 60, Bitrate: 8000}.Tuning()
-	if t60.FrameQueueDepth != 3 { // 65 * 60 / 1000 = 3
-		t.Fatalf("60fps queue = %d, want 3", t60.FrameQueueDepth)
+	if t60.FrameQueueDepth != 2 { // 40 * 60 / 1000 = 2
+		t.Fatalf("60fps queue = %d, want 2", t60.FrameQueueDepth)
 	}
 	wantHold := (time.Second / 60) / 2 // ~8.3ms
 	if t60.PacerMaxHold != wantHold {
@@ -141,15 +145,19 @@ func TestX264TuningUsesShorterLatencyBudget(t *testing.T) {
 	}
 }
 
+// Surfaces são buffers de trabalho do NVENC (não fila de reordenação: seguimos
+// com -bf 0 / -delay 0). Medido a 1080p60: 3 surfaces => 13% dos frames fora da
+// cadência de 16.7ms; 8 surfaces => 10%. Mais folga evita que o encoder espere
+// por um buffer livre para iniciar o frame seguinte.
 func TestTuningSurfacesScaleWithLoad(t *testing.T) {
 	cases := []struct {
 		name string
 		cfg  StreamConfig
 		want int
 	}{
-		{name: "1080p", cfg: StreamConfig{Width: 1920, Height: 1080, FPS: 60, Bitrate: 8000}, want: 3},
-		{name: "1440p", cfg: StreamConfig{Width: 2560, Height: 1440, FPS: 60, Bitrate: 16000}, want: 4},
-		{name: "4k", cfg: StreamConfig{Width: 3840, Height: 2160, FPS: 60, Bitrate: 42000}, want: 6},
+		{name: "1080p", cfg: StreamConfig{Width: 1920, Height: 1080, FPS: 60, Bitrate: 8000}, want: 8},
+		{name: "1440p", cfg: StreamConfig{Width: 2560, Height: 1440, FPS: 60, Bitrate: 16000}, want: 10},
+		{name: "4k", cfg: StreamConfig{Width: 3840, Height: 2160, FPS: 60, Bitrate: 42000}, want: 12},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

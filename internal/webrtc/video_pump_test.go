@@ -107,7 +107,9 @@ func TestWriteVideoFramesDoesNotBacklogBurst(t *testing.T) {
 
 	frames := make(chan encodedFrame, 10)
 	for i := 1; i <= 10; i++ {
-		frames <- encodedFrame{data: []byte{byte(i)}, duration: frameDur}
+		// O primeiro frame precisa ser keyframe: o writer só começa a emitir a
+		// partir de um ponto de entrada válido para o decoder.
+		frames <- encodedFrame{data: []byte{byte(i)}, duration: frameDur, keyframe: i == 1}
 	}
 	close(frames)
 
@@ -118,19 +120,60 @@ func TestWriteVideoFramesDoesNotBacklogBurst(t *testing.T) {
 	// em relação ao relógio de parede, todos devem sair quase imediatamente. Se o
 	// pacer estivesse dormindo frameDur por frame (o bug de 1s), levaria ~166ms.
 	start := time.Now()
-	if err := writeVideoFrames(frames, writer, frameDur, frameDur/2, &stats); err != nil {
+	if err := writeVideoFrames(frames, writer, frameDur, frameDur/2, &stats, nil); err != nil {
 		t.Fatalf("write frames: %v", err)
 	}
 	if elapsed := time.Since(start); elapsed > 5*frameDur {
 		t.Fatalf("writeVideoFrames segurou rajada por %s (>%s); pacer está acumulando backlog", elapsed, 5*frameDur)
 	}
-	if got := len(writer.samples); got != 10 {
-		t.Fatalf("samples = %d, want 10", got)
+	// Sob rajada, P-frames obsoletos são DESCARTADOS em vez de enviados
+	// atrasados (ver staleFrameBacklog): o que sai é sempre o presente. O teste
+	// garante que algo saiu, que nada ficou preso e que a ordem foi preservada.
+	if len(writer.samples) == 0 {
+		t.Fatal("nenhum sample enviado")
 	}
+	if got := len(writer.samples); got > 10 {
+		t.Fatalf("samples = %d, não pode exceder os 10 enfileirados", got)
+	}
+	var last byte
 	for i, sample := range writer.samples {
-		want := byte(i + 1)
-		if got := sample.Data[0]; got != want {
-			t.Fatalf("sample %d data = %d, want %d", i, got, want)
+		if got := sample.Data[0]; got <= last && i > 0 {
+			t.Fatalf("sample %d fora de ordem: %d após %d", i, got, last)
+		} else {
+			last = sample.Data[0]
+		}
+	}
+	// O último frame da rajada é o mais recente e NUNCA pode ser descartado:
+	// descartá-lo deixaria a imagem congelada num frame velho.
+	if got := writer.samples[len(writer.samples)-1].Data[0]; got != 10 {
+		t.Fatalf("último sample = %d, want 10 (o frame mais recente tem de chegar)", got)
+	}
+}
+
+// Um keyframe NUNCA pode ser descartado por backlog: sem ele o decoder perde a
+// referência e a imagem quebra até o próximo IDR.
+func TestWriteVideoFramesNeverDropsKeyframes(t *testing.T) {
+	frameDur := time.Second / 60
+
+	frames := make(chan encodedFrame, 12)
+	frames <- encodedFrame{data: []byte{1}, duration: frameDur, keyframe: true}
+	for i := 2; i <= 11; i++ {
+		frames <- encodedFrame{data: []byte{byte(i)}, duration: frameDur, keyframe: i%5 == 0}
+	}
+	close(frames)
+
+	writer := &recordingSampleWriter{}
+	if err := writeVideoFrames(frames, writer, frameDur, frameDur/2, nil, nil); err != nil {
+		t.Fatalf("write frames: %v", err)
+	}
+
+	got := map[byte]bool{}
+	for _, s := range writer.samples {
+		got[s.Data[0]] = true
+	}
+	for _, kf := range []byte{1, 5, 10} {
+		if !got[kf] {
+			t.Fatalf("keyframe %d foi descartado", kf)
 		}
 	}
 }
