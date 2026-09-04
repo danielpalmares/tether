@@ -26,6 +26,7 @@ type Server struct {
 	cfgPath string
 	active  *webrtc.Session
 	hostNm  string
+	lanAddr string
 }
 
 func NewServer(hostName string) *Server {
@@ -44,6 +45,14 @@ func NewServer(hostName string) *Server {
 		log.Printf("[config] carregada de %s: %dx%d@%dfps %dkbps", path, cfg.Width, cfg.Height, cfg.FPS, cfg.Bitrate)
 	}
 	return &Server{cfg: cfg, cfgPath: path, hostNm: hostName}
+}
+
+// SetLANAddress informa o IP pelo qual a TV alcança este host, para o painel
+// exibir o endereço certo (ver localIP no main: a rota padrão pode ser a VPN).
+func (s *Server) SetLANAddress(ip string) {
+	s.mu.Lock()
+	s.lanAddr = ip
+	s.mu.Unlock()
 }
 
 type wsMsg struct {
@@ -174,6 +183,7 @@ func (s *Server) HandleConfig(w http.ResponseWriter, r *http.Request) {
 func (s *Server) HandleInfo(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	streaming := s.active != nil
+	lan := s.lanAddr
 	s.mu.Unlock()
 
 	w.Header().Set("Content-Type", "application/json")
@@ -182,5 +192,8 @@ func (s *Server) HandleInfo(w http.ResponseWriter, r *http.Request) {
 		"app":       "Tether",
 		"host":      s.hostNm,
 		"streaming": streaming,
+		// lan é o endereço que a TV deve usar; o painel do PC roda em localhost
+		// e não tem como descobrir isso sozinho.
+		"lan": lan,
 	})
 }

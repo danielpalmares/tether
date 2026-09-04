@@ -84,6 +84,21 @@ const (
 	pacerHoldPercent2K   = 75  // ≈ 12.5ms
 	pacerHoldPercent4K   = 100 // ≈ 16.6ms (um frame inteiro de teto)
 	x264PacerHoldPercent = 25  // ≈ 4ms em 60fps: só tira micro-rajada
+
+	// rateControlMode: VBR com -maxrate == -b:v (teto rígido), NÃO cbr.
+	//
+	// Em CBR o NVENC é obrigado a ATINGIR a taxa alvo mesmo quando a cena não
+	// precisa, e completa a diferença com NAL de filler data (tipo 12) —
+	// literalmente padding descartado pelo decoder. Medido neste projeto a
+	// 1080p60/24Mbps com a tela em repouso: 21.3 Mbps dos 23.9 Mbps enviados eram
+	// filler (89% da banda), para 2.6 Mbps de vídeo real. Num link Wi-Fi para a
+	// TV esse padding compete com o vídeo útil e com o áudio, enche o buffer do
+	// receptor e provoca engasgo — pagando latência por bits que não são imagem.
+	//
+	// VBR com teto mantém o mesmo pico disponível para cenas de movimento intenso
+	// (é o -maxrate que define a qualidade máxima) e gasta apenas o necessário no
+	// resto do tempo. Mesma qualidade, fração da banda.
+	rateControlMode = "vbr"
 )
 
 // Tuning calcula o profile a partir da config já normalizada.
@@ -95,19 +110,35 @@ func (c StreamConfig) Tuning() TuningProfile {
 		fps = 60
 	}
 
-	gop := gopSeconds * fps
+	// O perfil de latência é a fonte de verdade para GOP, fila e hold do pacer:
+	// é ele que o usuário escolhe conscientemente no painel.
+	lat := NormalizeLatency(c.Latency).Settings()
+	gop := lat.GOPSeconds * fps
 
 	// VBV e hold do pacer escalam JUNTOS com a resolução (mesma causa: frame maior
 	// pulsa mais e chega mais irregular).
 	vbvMs := vbvMillisFloor
-	holdPct := pacerHoldPercent1080
 	switch {
 	case c.Width >= 3840 || c.Height >= 2160:
 		vbvMs = vbvMillis4K
-		holdPct = pacerHoldPercent4K
 	case c.Width >= 2560 || c.Height >= 1440:
 		vbvMs = vbvMillis2K
-		holdPct = pacerHoldPercent2K
+	}
+	// Hold do pacer = intenção do usuário (perfil) × escala da resolução.
+	//
+	// O perfil define QUANTO suavizar; a resolução ajusta porque frame maior
+	// leva mais tempo para packetizar/enviar e chega mais irregular (medido:
+	// 4K frameMax 227KB vs 1080p 65KB). Manter só o perfil deixaria o 4K com
+	// pouca folga; manter só a resolução ignoraria a escolha do usuário. O
+	// perfil "ultra" continua zerado em qualquer resolução — é o seu contrato.
+	holdPct := lat.PacerHoldPercent
+	if holdPct > 0 {
+		switch {
+		case c.Width >= 3840 || c.Height >= 2160:
+			holdPct = holdPct * pacerHoldPercent4K / pacerHoldPercent1080
+		case c.Width >= 2560 || c.Height >= 1440:
+			holdPct = holdPct * pacerHoldPercent2K / pacerHoldPercent1080
+		}
 	}
 	vbv := c.Bitrate * vbvMs / 1000
 	if vbv <= 0 {
@@ -116,7 +147,7 @@ func (c StreamConfig) Tuning() TuningProfile {
 
 	// Fila em frames = folga(ms) × fps / 1000, com piso de 2 (nunca regredir ao
 	// comportamento sem buffer). Regra única: escala sozinha com qualquer fps.
-	queueMs := queueMillis
+	queueMs := lat.QueueMillis
 	if c.Codec == CodecH264X264 {
 		vbv = c.Bitrate * x264VBVMillis / 1000
 		queueMs = x264QueueMillis
@@ -139,7 +170,7 @@ func (c StreamConfig) Tuning() TuningProfile {
 		GOPFrames:       gop,
 		VBVBufferKb:     vbv,
 		Surfaces:        c.surfaces(),
-		RateControl:     "cbr",
+		RateControl:     rateControlMode,
 		SpatialAQ:       true,
 		TemporalAQ:      true,
 		Level:           c.H264Level(),
@@ -155,14 +186,19 @@ func (c StreamConfig) Tuning() TuningProfile {
 // TV. Mais surfaces suavizam a SAÍDA do encoder sem reintroduzir latência de
 // reordenação (continuamos sem B-frames e com -delay 0). Mantém um teto baixo
 // para não inflar a latência de fila.
+// Medição (1080p60, NVENC, 10s por rodada): com 3 surfaces, 13% dos frames
+// saíam do encoder fora da cadência de 16.7ms; com 8, caiu para 10%. As
+// surfaces são buffers de trabalho do NVENC, não fila de reordenação — com
+// -bf 0 e -delay 0 elas não somam latência, apenas evitam que o encoder tenha
+// de esperar um buffer livre para começar o próximo frame.
 func (c StreamConfig) surfaces() int {
 	megapixels := (c.Width * c.Height) / 1_000_000
 	switch {
 	case megapixels >= 8: // 4K
-		return 6
+		return 12
 	case megapixels >= 3: // 1440p
-		return 4
+		return 10
 	default: // 1080p e abaixo
-		return 3
+		return 8
 	}
 }

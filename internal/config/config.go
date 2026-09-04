@@ -10,6 +10,13 @@ import (
 const (
 	CodecH264NVENC = "h264_nvenc"
 	CodecH264X264  = "h264_x264"
+	CodecH264AMF   = "h264_amf" // AMD
+	CodecH264QSV   = "h264_qsv" // Intel QuickSync
+
+	// CodecAuto pede a detecção automática (ver DetectCodec). É o valor padrão:
+	// a escolha do encoder saiu do painel porque não significa nada para o
+	// usuário final e escolher errado quebra o stream.
+	CodecAuto = "auto"
 )
 
 // StreamConfig guarda as configurações de streaming definidas no painel do host.
@@ -18,8 +25,11 @@ type StreamConfig struct {
 	Height  int    `json:"height"`
 	FPS     int    `json:"fps"`
 	Bitrate int    `json:"bitrate"` // kbps
-	Codec   string `json:"codec"`   // "h264_nvenc" ou "h264_x264"
+	Codec   string `json:"codec"`   // detectado automaticamente; ver DetectCodec
 	Display int    `json:"display"` // índice do monitor (0 = primário)
+
+	// Latency é o compromisso entre resposta e suavidade. Ver latency.go.
+	Latency LatencyProfile `json:"latency"`
 }
 
 // Default retorna uma config sensata para a LAN.
@@ -34,9 +44,10 @@ func Default() StreamConfig {
 		Width:   1920,
 		Height:  1080,
 		FPS:     60,
-		Bitrate: 8000,
-		Codec:   CodecH264NVENC,
+		Bitrate: 12000, // recomendado do preset 1080p; ver presets.go
+		Codec:   CodecAuto,
 		Display: 0,
+		Latency: LatencyBalanced,
 	}
 }
 
@@ -46,6 +57,7 @@ type ResolutionPreset struct {
 }
 
 var ResolutionPresets = []ResolutionPreset{
+	{Width: 1280, Height: 720},
 	{Width: 1920, Height: 1080},
 	{Width: 2560, Height: 1440},
 	{Width: 3840, Height: 2160},
@@ -109,16 +121,24 @@ func (c StreamConfig) Normalize() StreamConfig {
 		c.Bitrate = d.Bitrate
 	}
 	switch strings.ToLower(strings.TrimSpace(c.Codec)) {
-	case "", "h264", CodecH264NVENC:
-		c.Codec = d.Codec
+	case "", "h264", CodecAuto:
+		// Detecção automática: o painel não expõe mais essa escolha.
+		c.Codec = DetectCodec()
 	case CodecH264X264, "libx264", "x264":
 		c.Codec = CodecH264X264
+	case CodecH264NVENC:
+		c.Codec = CodecH264NVENC
+	case CodecH264AMF:
+		c.Codec = CodecH264AMF
+	case CodecH264QSV:
+		c.Codec = CodecH264QSV
 	default:
-		c.Codec = d.Codec
+		c.Codec = DetectCodec()
 	}
 	if c.Display < 0 {
 		c.Display = d.Display
 	}
+	c.Latency = NormalizeLatency(c.Latency)
 	return c
 }
 

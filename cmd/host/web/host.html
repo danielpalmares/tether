@@ -7,6 +7,14 @@
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
+<!--
+  Tela do PC host: apenas STATUS e endereço de acesso.
+
+  Toda a configuração (resolução, bitrate, latência, monitor) vive no cliente,
+  em painel único. Ter os mesmos controles em dois lugares obrigava a ir e voltar
+  entre o PC e a TV para ajustar uma coisa só — e deixava dúvida sobre qual
+  interface mandava. Aqui ficou o que só o PC pode responder: onde conectar.
+-->
 <div class="wrap">
 
   <div class="topbar">
@@ -32,187 +40,112 @@
     </div>
   </div>
 
-  <div class="grid cols-2">
-    <div class="panel">
-      <div class="hdr">vídeo <span class="idx">CFG · 01</span></div>
-
-      <div class="field">
-        <label>resolução</label>
-        <div class="seg" id="resSeg">
-          <button data-w="1920" data-h="1080" class="active">Full HD</button>
-          <button data-w="2560" data-h="1440">2K</button>
-          <button data-w="3840" data-h="2160">4K</button>
+  <div class="panel">
+    <div class="hdr">conectar da TV <span class="idx">NET · 01</span></div>
+    <div style="display:flex; gap:26px; flex-wrap:wrap; align-items:center;">
+      <div id="qrBox" style="background:#fff; padding:12px; border-radius:10px; line-height:0"></div>
+      <div style="flex:1; min-width:260px">
+        <div class="field" style="margin:0">
+          <label>abra este endereço no navegador da TV</label>
+          <input type="text" id="clientUrl" readonly value="—"
+                 style="font-size:15px; font-weight:700" onclick="this.select()">
         </div>
-      </div>
-
-      <div class="field">
-        <label>taxa de quadros <span class="val" id="fpsVal">60 fps</span></label>
-        <div class="seg" id="fpsSeg">
-          <button class="active" disabled>60 FPS fixo</button>
+        <div class="hint" style="margin-top:10px">
+          Toda a configuração da transmissão — qualidade, latência, monitor e teste
+          de rede — fica no painel do cliente, na própria TV.
         </div>
-      </div>
-
-      <div class="field">
-        <label>bitrate <span class="val" id="brVal">8 Mbps</span></label>
-        <input type="range" id="bitrate" min="4000" max="50000" step="1000" value="8000">
-      </div>
-    </div>
-
-    <div class="panel">
-      <div class="hdr">encoder <span class="idx">CFG · 02</span></div>
-
-      <div class="field">
-        <label>codec</label>
-        <div class="seg" id="codecSeg">
-          <button data-codec="h264_nvenc" class="active">H.264 · NVENC</button>
-          <button data-codec="h264_x264">H.264 · Universal CPU (TESTE)</button>
-        </div>
-      </div>
-
-      <div class="field">
-        <label>monitor de origem</label>
-        <select id="display">
-          <option value="0">Monitor primário (0)</option>
-          <option value="1">Monitor secundário (1)</option>
-        </select>
-      </div>
-
-      <div class="field">
-        <label>perfil de latência</label>
-        <div class="seg">
-          <button class="active">ULTRA-LOW · ll</button>
-        </div>
-      </div>
-
-      <div class="hint" style="margin-top:14px">
-        Monitor de origem é qual tela do Windows será capturada. Alterar a
-        configuração durante uma live reinicia a sessão para aplicar o novo
-        perfil. Use NVENC em NVIDIA; use Universal CPU (TESTE) para AMD/Intel.
+        <div class="hint" id="cfgSummary" style="margin-top:10px"></div>
       </div>
     </div>
   </div>
 
   <div class="panel">
-    <div class="hdr">log do sistema <span class="idx">LOG · 03</span></div>
-    <div class="console" id="log"></div>
+    <div class="hdr">desempenho <span class="idx">GPU · 02</span></div>
+    <div class="hint" id="gpuLine">consultando GPU…</div>
   </div>
-
-  <button class="btn primary" id="saveBtn">salvar configuração</button>
 
 </div>
 
 <script>
-const log = (msg, cls='') => {
-  const el = document.getElementById('log');
-  const ln = document.createElement('div');
-  ln.className = 'ln ' + cls;
-  ln.textContent = msg;
-  el.appendChild(ln); el.scrollTop = el.scrollHeight;
-};
+/* Status do host. Sem controles de configuração: ver comentário no topo. */
 
-let cfg = { width:1920, height:1080, fps:60, bitrate:8000, codec:'h264_nvenc', display:0 };
-
-function setResolutionActive(width, height){
-  let matched=false;
-  document.querySelectorAll('#resSeg button').forEach(b => {
-    const active=(+b.dataset.w===width && +b.dataset.h===height);
-    b.classList.toggle('active', active);
-    if(active) matched=true;
-  });
-  if(!matched){
-    const fallback=document.querySelector('#resSeg button[data-w="1920"][data-h="1080"]');
-    if(fallback) fallback.classList.add('active');
-  }
-}
-
-function codecLabel(codec){
-  return codec === 'h264_x264' ? 'H.264 CPU TESTE' : 'H.264 NVENC';
-}
-
-function setCodecActive(codec){
-  const normalized = codec === 'h264_x264' ? 'h264_x264' : 'h264_nvenc';
-  cfg.codec = normalized;
-  document.querySelectorAll('#codecSeg button').forEach(b => {
-    b.classList.toggle('active', b.dataset.codec === normalized);
+function j(path){
+  return fetch(path, {cache:'no-store'}).then(function(r){
+    if(!r.ok) throw new Error('HTTP '+r.status);
+    return r.json();
   });
 }
 
-function syncControls(){
-  cfg.fps=60;
-  setResolutionActive(cfg.width, cfg.height);
-  setCodecActive(cfg.codec);
-  document.getElementById('fpsVal').textContent = '60 fps';
-  document.getElementById('brVal').textContent = (cfg.bitrate/1000).toFixed(0)+' Mbps';
-  br.value = cfg.bitrate;
-  document.getElementById('display').value = String(cfg.display || 0);
-}
+var clientUrl = '';
 
-// segmented controls
-document.querySelectorAll('#resSeg button').forEach(b => b.onclick = () => {
-  document.querySelectorAll('#resSeg button').forEach(x=>x.classList.remove('active'));
-  b.classList.add('active');
-  cfg.width=+b.dataset.w;
-  cfg.height=+b.dataset.h;
-  cfg.fps=60;
-});
-document.querySelectorAll('#codecSeg button').forEach(b => b.onclick = () => {
-  setCodecActive(b.dataset.codec);
-});
-const br = document.getElementById('bitrate');
-br.oninput = () => {
-  cfg.bitrate = +br.value;
-  document.getElementById('brVal').textContent = (cfg.bitrate/1000).toFixed(0) + ' Mbps';
-};
-document.getElementById('display').onchange = e => cfg.display = +e.target.value;
-
-document.getElementById('saveBtn').onclick = async () => {
-  try {
-    cfg.fps=60;
-    const before = await fetch('/api/info').then(r=>r.json()).catch(()=>({streaming:false}));
-    const r = await fetch('/api/config', {method:'POST', body: JSON.stringify(cfg)});
-    if (r.ok) {
-      cfg = await r.json();
-      syncControls();
-      log('configuração salva · ' + cfg.width+'x'+cfg.height+' @60fps · '+(cfg.bitrate/1000).toFixed(0)+' Mbps · '+codecLabel(cfg.codec), 'ok');
-      if(before.streaming) log('live reiniciada para aplicar o novo perfil', 'warn');
-    }
-    else log('falha ao salvar config', 'err');
-  } catch(e){ log('erro: '+e.message, 'err'); }
-};
-
-// boot
-(async () => {
-  log('inicializando nó tether...', 'ok');
-  try {
-    const info = await (await fetch('/api/info')).json();
+function refreshInfo(){
+  j('/api/info').then(function(info){
     document.getElementById('hostname').textContent = info.host || '—';
-    log('host identificado: ' + info.host);
-  } catch(e){ log('não foi possível ler /api/info', 'warn'); }
-  try {
-    const c = await (await fetch('/api/config')).json();
-    cfg = c;
-    syncControls();
-    log('config carregada do host', 'ok');
-  } catch(e){}
-  document.getElementById('lanaddr').textContent = location.host;
-  log('aguardando conexão de client na rede...', 'warn');
-})();
-
-// poll de status de streaming
-setInterval(async () => {
-  try {
-    const info = await (await fetch('/api/info')).json();
-    const sp = document.getElementById('streamPill');
-    const op = document.getElementById('onlinePill');
-    if (info.streaming) {
-      sp.className = 'pill live'; sp.querySelector('.dot').nextSibling.textContent=' stream ativo · transmitindo';
-      sp.innerHTML = '<span class="dot"></span> stream ativo · transmitindo';
-      op.innerHTML = '<span class="dot"></span> online · em sessão';
+    var pill = document.getElementById('streamPill');
+    if(info.streaming){
+      pill.className = 'pill on';
+      pill.innerHTML = '<span class="dot"></span> transmitindo';
     } else {
-      sp.className = 'pill'; sp.innerHTML = '<span class="dot"></span> stream inativo';
+      pill.className = 'pill';
+      pill.innerHTML = '<span class="dot"></span> stream inativo';
     }
-  } catch(e){}
-}, 2000);
+  }).catch(function(){});
+}
+
+function refreshStats(){
+  j('/api/stats').then(function(s){
+    var c = s.config, line = '';
+    if(c){
+      line = c.width + '×' + c.height + ' @ ' + c.fps + 'fps · '
+           + Math.round(c.bitrate/1000) + ' Mbps · ' + (c.latency || 'balanced');
+      document.getElementById('cfgSummary').textContent = 'Configuração atual: ' + line;
+    }
+    var g = s.gpu, el = document.getElementById('gpuLine');
+    if(!g || !g.available){
+      el.textContent = 'Monitoramento de GPU indisponível (requer driver NVIDIA).';
+      return;
+    }
+    var t = g.name + ' — núcleo ' + g.gpuUtil + '% · encoder ' + g.encUtil + '%';
+    if(g.throttle) t += ' · throttle ' + g.throttle;
+    if(g.advice) t += '\n⚠ ' + g.advice;
+    el.style.whiteSpace = 'pre-line';
+    el.textContent = t;
+  }).catch(function(){});
+}
+
+/* O endereço da LAN vem do próprio host: o navegador aqui está em localhost,
+   que não serve para a TV. */
+function resolveClientUrl(){
+  var port = location.port || '8787';
+  j('/api/info').then(function(info){
+    var ip = info.lan || location.hostname;
+    clientUrl = 'http://' + ip + ':' + port + '/client.html';
+    document.getElementById('clientUrl').value = clientUrl;
+    document.getElementById('lanaddr').textContent = ip + ':' + port;
+    drawQR(clientUrl);
+  }).catch(function(){});
+}
+
+/* QR mínimo sem dependência externa: usa a API de gráficos do próprio
+   navegador desenhando um link clicável quando não há gerador disponível.
+   Mantemos simples de propósito — o endereço em texto já resolve. */
+function drawQR(url){
+  var box = document.getElementById('qrBox');
+  box.innerHTML = '';
+  var a = document.createElement('a');
+  a.href = url;
+  a.target = '_blank';
+  a.rel = 'noopener';
+  a.textContent = 'abrir no navegador';
+  a.style.cssText = 'display:block;font:12px monospace;color:#111;text-decoration:none;padding:26px 18px;text-align:center';
+  box.appendChild(a);
+}
+
+refreshInfo();
+refreshStats();
+resolveClientUrl();
+setInterval(refreshInfo, 2000);
+setInterval(refreshStats, 3000);
 </script>
 </body>
 </html>

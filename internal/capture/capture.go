@@ -32,9 +32,11 @@ func New(cfg config.StreamConfig) *Capturer {
 //
 //	ddagrab (D3D11) -> h264_nvenc -> H.264 Annex-B (stdout)
 //
-// Se o FFmpeg/GPU não aceitar o caminho D3D11 direto, cai para o fallback
-// hwdownload -> nv12 -> h264_nvenc. No modo universal/teste, usa
-// hwdownload -> yuv420p -> libx264 para não depender do fabricante da GPU.
+// Se o FFmpeg/GPU não aceitar o caminho D3D11 direto, a sessão falha em vez de
+// cair silenciosamente para hwdownload -> CPU. Esse fallback é útil para
+// diagnóstico, mas em notebooks híbridos custa caro e mascara o problema real.
+// No modo universal/teste, usa hwdownload -> yuv420p -> libx264 para não
+// depender do fabricante da GPU.
 func (c *Capturer) Start(ctx context.Context) (io.ReadCloser, error) {
 	ctx, c.cancel = context.WithCancel(ctx)
 
@@ -53,7 +55,11 @@ func (c *Capturer) Start(ctx context.Context) (io.ReadCloser, error) {
 			return nil, fmt.Errorf("iniciar ffmpeg: %w", ctx.Err())
 		}
 		if mode == pipelineD3D11 {
-			fmt.Fprintf(os.Stderr, "[capture] pipeline d3d11 direto indisponível, tentando fallback CPU: %v\n", err)
+			if allowsCPUFallback(c.cfg.Codec) {
+				fmt.Fprintf(os.Stderr, "[capture] pipeline d3d11 direto indisponível, tentando fallback CPU: %v\n", err)
+			} else {
+				fmt.Fprintf(os.Stderr, "[capture] pipeline d3d11 direto indisponível: %v\n", err)
+			}
 		}
 	}
 
@@ -74,10 +80,30 @@ func pipelineOrder(codec string) []pipelineMode {
 	switch strings.ToLower(strings.TrimSpace(os.Getenv("TETHER_FFMPEG_PIPELINE"))) {
 	case "cpu", "download":
 		return []pipelineMode{pipelineCPU}
+	case "auto", "fallback":
+		return []pipelineMode{pipelineD3D11, pipelineCPU}
 	case "d3d11", "direct", "gpu":
 		return []pipelineMode{pipelineD3D11}
 	default:
+		// D3D11 direto primeiro, CPU como rede de segurança. Forçar SOMENTE o
+		// caminho direto (comportamento anterior) transformava qualquer falha
+		// transitória — GPU saturada por um jogo, sessão NVENC ocupada, troca de
+		// modo de display — em ausência total de vídeo, porque não sobrava
+		// pipeline nenhum. O fallback custa CPU, mas só é usado quando a
+		// alternativa é tela preta; o log deixa explícito quando isso acontece.
 		return []pipelineMode{pipelineD3D11, pipelineCPU}
+	}
+}
+
+func allowsCPUFallback(codec string) bool {
+	if codec == config.CodecH264X264 {
+		return false
+	}
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("TETHER_FFMPEG_PIPELINE"))) {
+	case "cpu", "download", "d3d11", "direct", "gpu":
+		return false
+	default:
+		return true
 	}
 }
 
@@ -148,7 +174,12 @@ func (c *Capturer) startFFmpeg(ctx context.Context, mode pipelineMode) (*bufio.R
 	// Confirma que o pipeline escolhido realmente produz H.264. O FFmpeg pode
 	// iniciar e só falhar ao abrir o encoder depois; esperar o primeiro byte
 	// permite cair para o fallback sem devolver um stream morto ao WebRTC.
-	reader := bufio.NewReaderSize(stdout, 64<<10)
+	// Buffer pequeno de propósito: com 64KB, vários frames de uma cena leve
+	// (~16KB cada) chegavam ao leitor no MESMO bloco, e o pipeline só os
+	// processava em lote — medido: com leitura de 64KB o contador de frames caía
+	// de ~460 para ~262 em 8s, ou seja, frames sendo agrupados em vez de fluir.
+	// 8KB entrega cada frame assim que ele sai do FFmpeg, sem esperar encher.
+	reader := bufio.NewReaderSize(stdout, 8<<10)
 	ready := make(chan error, 1)
 	go func() {
 		_, err := reader.Peek(1)

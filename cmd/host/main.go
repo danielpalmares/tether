@@ -47,9 +47,16 @@ func main() {
 	mux.Handle("/", cacheControl(http.FileServer(http.FS(webFS))))
 	mux.HandleFunc("/api/info", srv.HandleInfo)
 	mux.HandleFunc("/api/config", srv.HandleConfig)
+	// Painel único (no cliente): opções, saúde do host e teste de banda da LAN.
+	mux.HandleFunc("/api/options", srv.HandleOptions)
+	mux.HandleFunc("/api/stats", srv.HandleStats)
+	mux.HandleFunc("/api/bandwidth", srv.HandleBandwidth)
+	mux.HandleFunc("/api/bandwidth/up", srv.HandleBandwidthUp)
+	mux.HandleFunc("/api/recommend", srv.HandleRecommend)
 	mux.HandleFunc("/ws", srv.HandleSignal)
 
 	ip := localIP()
+	srv.SetLANAddress(ip)
 	fmt.Println("╔══════════════════════════════════════════╗")
 	fmt.Println("║              TETHER  ·  host               ║")
 	fmt.Println("╠══════════════════════════════════════════╣")
@@ -92,7 +99,72 @@ func isPWAAsset(path string) bool {
 		strings.HasPrefix(path, "/icons/")
 }
 
+// localIP descobre o endereço que a TV deve usar para alcançar o host.
+//
+// A abordagem ingênua — abrir um socket para 8.8.8.8 e ler o endereço local —
+// devolve o IP da rota padrão, que numa máquina com VPN ativa é o IP da VPN
+// (medido: 10.5.0.2 do NordLynx). A TV está na LAN e não alcança esse endereço,
+// então o painel anunciava um endereço inútil. Aqui varremos as interfaces e
+// escolhemos um IP de rede privada em interface física ativa, ignorando
+// túneis/VPN e adaptadores virtuais.
 func localIP() string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return fallbackLocalIP()
+	}
+
+	var best string
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		if isVirtualInterface(iface.Name) {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, addr := range addrs {
+			ipNet, ok := addr.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ip := ipNet.IP.To4()
+			if ip == nil || !ip.IsPrivate() || ip.IsLinkLocalUnicast() {
+				continue
+			}
+			// Preferimos 192.168.x.x — a faixa doméstica típica, onde a TV está.
+			if strings.HasPrefix(ip.String(), "192.168.") {
+				return ip.String()
+			}
+			if best == "" {
+				best = ip.String()
+			}
+		}
+	}
+	if best != "" {
+		return best
+	}
+	return fallbackLocalIP()
+}
+
+// isVirtualInterface filtra adaptadores que não levam à LAN: VPNs, túneis,
+// hypervisors e pontes de contêiner.
+func isVirtualInterface(name string) bool {
+	n := strings.ToLower(name)
+	for _, bad := range []string{
+		"vpn", "nordlynx", "wireguard", "tailscale", "zerotier", "tap", "tun",
+		"virtualbox", "vmware", "hyper-v", "vethernet", "docker", "wsl", "loopback",
+	} {
+		if strings.Contains(n, bad) {
+			return true
+		}
+	}
+	return false
+}
+
+func fallbackLocalIP() string {
 	conn, err := net.Dial("udp", "8.8.8.8:80")
 	if err != nil {
 		return "127.0.0.1"

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"log"
+	"math/rand"
 	"os"
 	"strings"
 	"sync"
@@ -12,6 +13,7 @@ import (
 	"time"
 
 	"github.com/pion/interceptor"
+	"github.com/pion/rtcp"
 	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v4"
 	"github.com/pion/webrtc/v4/pkg/media"
@@ -34,7 +36,21 @@ type Session struct {
 	input    inputStats
 	audioOn  bool
 	onClose  func()
+
+	// paramResend é armado pelo receptor de RTCP quando chega um PLI/FIR e
+	// consumido pelo writer de vídeo, que prefixa SPS/PPS no próximo frame.
+	paramResend atomic.Bool
+
+	// mu protege a troca do capturador durante um reinício da captura.
+	mu sync.Mutex
+	// closed/done encerram o supervisor de captura junto com a sessão, para que
+	// o fim da sessão não seja confundido com uma queda do ddagrab.
+	closed    atomic.Bool
+	done      chan struct{}
+	closeOnce sync.Once
 }
+
+func (s *Session) requestParamResend() { s.paramResend.Store(true) }
 
 type streamCapturer interface {
 	Start(context.Context) (io.ReadCloser, error)
@@ -139,7 +155,7 @@ func NewSession(cfg config.StreamConfig, injector input.Injector, onClose func()
 		return nil, err
 	}
 
-	s := &Session{pc: pc, cfg: cfg, injector: injector, onClose: onClose}
+	s := &Session{pc: pc, cfg: cfg, injector: injector, onClose: onClose, done: make(chan struct{})}
 
 	// --- Track de vídeo ---
 	// A track carrega o MESMO capability do codec registrado.
@@ -171,10 +187,20 @@ func NewSession(cfg config.StreamConfig, injector input.Injector, onClose func()
 	// NACK responder nunca vê os pedidos de retransmissão e o feedback é ignorado
 	// em silêncio. Buffer descartável; encerra quando a sessão fecha.
 	go func() {
-		buf := make([]byte, 1500)
 		for {
-			if _, _, rtcpErr := rtpSender.Read(buf); rtcpErr != nil {
+			packets, _, rtcpErr := rtpSender.ReadRTCP()
+			if rtcpErr != nil {
 				return
+			}
+			// PLI/FIR = "perdi o quadro de referência, me manda parâmetros e um
+			// ponto de entrada". Antes esse feedback era lido e DESCARTADO, então a
+			// TV só se recuperava no próximo IDR do GOP (até 3s de tela preta).
+			// Agora ele arma o reenvio imediato de SPS/PPS no pump.
+			for _, p := range packets {
+				switch p.(type) {
+				case *rtcp.PictureLossIndication, *rtcp.FullIntraRequest:
+					s.requestParamResend()
+				}
 			}
 		}
 	}()
@@ -197,7 +223,7 @@ func NewSession(cfg config.StreamConfig, injector input.Injector, onClose func()
 	if capErr != nil {
 		log.Printf("[capture] erro ao pré-aquecer: %v", capErr)
 	} else {
-		go s.pumpVideo(stream, videoTrack)
+		go s.superviseVideo(stream, videoTrack)
 	}
 	var startAudioOnce sync.Once
 	startAudio := func() {
@@ -291,7 +317,28 @@ const audioFrameDuration = 20 * time.Millisecond
 
 // audioPaceQueueDepth é a folga máxima antes de descartar. Mantém latência baixa:
 // se a fila passa disto, preferimos soltar o pacote mais antigo a acumular atraso.
-const audioPaceQueueDepth = 8
+// Fila de 16 (~320ms): espaço para a rajada do FFmpeg sem o LEITOR ter de
+// descartar. O controle de latência é feito no escritor (audioBacklogTarget),
+// que decide com critério; o leitor descartando por fila cheia perdia áudio bom
+// só porque a saída estava momentaneamente ocupada.
+const audioPaceQueueDepth = 16
+
+// audioBacklogTarget é a folga tolerada na fila de áudio (em pacotes de 20ms)
+// ANTES de considerar que há atraso acumulado. Só o que exceder isso é
+// descartado; o resto é ENVIADO, não jogado fora.
+//
+// Cuidado ao mexer: o ticker do Go no Windows tem resolução de ~15.6ms, então um
+// NewTicker(20ms) dispara ~24x/s, não 50x/s. Emitir 1 pacote por tick limita a
+// vazão a ~24 pkt/s — metade do necessário — e o áudio fica entrecortado
+// (medido: 24 pkt/s, 40kbps de 96kbps, 480ms de áudio por segundo real). Por
+// isso o writer drena TODOS os pacotes prontos a cada tick.
+// 5 pacotes = 100ms de folga: absorve a rajada natural do FFmpeg (medida em
+// ~80ms) sem descartar áudio bom, e ainda assim limita o atraso acumulado.
+const audioBacklogTarget = 5
+
+// audioSamplesPerFrame: 20ms a 48kHz = 960 amostras por frame Opus. É o passo do
+// timestamp RTP reescrito no envio.
+const audioSamplesPerFrame = 960
 
 func (s *Session) pumpAudio(stream *audio.RTPStream, track *webrtc.TrackLocalStaticRTP) {
 	defer stream.Close()
@@ -324,55 +371,109 @@ func (s *Session) pumpAudio(stream *audio.RTPStream, track *webrtc.TrackLocalSta
 		}
 	}()
 
-	// Escritor: emite em cadência fixa de 20ms, transformando a rajada do FFmpeg
-	// num fluxo suave que a TV consome sem inflar o jitter buffer.
-	ticker := time.NewTicker(audioFrameDuration)
-	defer ticker.Stop()
+	// Escritor: suaviza a rajada do FFmpeg num fluxo de 20ms/pacote SEM depender
+	// da resolução do timer do SO.
+	//
+	// Um time.Ticker(20ms) no Windows dispara só ~24x/s (resolução de ~15.6ms):
+	// como cada disparo escoava um pacote, a vazão ficava travada em ~24 pkt/s
+	// contra os 50 necessários — metade do áudio se perdia e o som saía
+	// entrecortado. Aqui o relógio de saída é ABSOLUTO (nextSlot += 20ms por
+	// pacote), então o atraso de um sleep não reduz a vazão: ele apenas faz o
+	// pacote seguinte sair imediatamente, e a média se mantém em 50 pkt/s.
 	logTicker := time.NewTicker(time.Second)
 	defer logTicker.Stop()
 
-	var packets, bytes int64
+	var nextSlot time.Time
+
+	var packets, bytes, dropped int64
 	var maxGap time.Duration
 	var last time.Time
 
+	// Sequência/timestamp próprios: ver a reescrita no envio. Começam em valores
+	// aleatórios como manda o RFC 3550 para não colidir entre sessões.
+	audioSeq := uint16(rand.Uint32())
+	audioTS := rand.Uint32()
+
 	for {
+		// Log é oportunista: não pode atrasar o áudio, então roda entre pacotes.
 		select {
-		case <-ticker.C:
-			var raw []byte
-			select {
-			case r, ok := <-queue:
-				if !ok {
-					return
-				}
-				raw = r
-			default:
-				// Sem pacote pronto neste tick: silêncio breve, sem stall.
-				continue
-			}
-			var pkt rtp.Packet
-			if err := pkt.Unmarshal(raw); err != nil {
-				log.Printf("[audio] pacote RTP inválido: %v", err)
-				continue
-			}
-			if err := track.WriteRTP(&pkt); err != nil {
-				log.Printf("[audio] WriteRTP: %v", err)
-				return
-			}
-
-			now := time.Now()
-			if !last.IsZero() && now.Sub(last) > maxGap {
-				maxGap = now.Sub(last)
-			}
-			last = now
-			packets++
-			bytes += int64(len(raw))
-
 		case <-logTicker.C:
-			log.Printf("[audio] enviados=%d pkt/s taxa=%d KB/s gapMax=%s fila=%d/%d", packets, bytes/1024, maxGap, len(queue), audioPaceQueueDepth)
+			log.Printf("[audio] enviados=%d pkt/s desc=%d taxa=%d KB/s gapMax=%s fila=%d/%d", packets, dropped, bytes/1024, maxGap, len(queue), audioPaceQueueDepth)
 			packets = 0
 			bytes = 0
+			dropped = 0
 			maxGap = 0
+		default:
 		}
+
+		// Bloqueia esperando o próximo pacote: a cadência é ditada pelo FFmpeg
+		// (que já produz 50 frames/s de 20ms), não por um timer do SO.
+		raw, ok := <-queue
+		if !ok {
+			return
+		}
+
+		// Anti-atraso: se a fila acumulou acima do alvo, o excedente é backlog
+		// real (a saída não está acompanhando a entrada) e vira latência
+		// permanente. Só nesse caso descartamos, ficando com o pacote mais novo.
+		for len(queue) > audioBacklogTarget {
+			select {
+			case newer, okk := <-queue:
+				if !okk {
+					return
+				}
+				dropped++
+				raw = newer
+			default:
+			}
+		}
+
+		var pkt rtp.Packet
+		if err := pkt.Unmarshal(raw); err != nil {
+			log.Printf("[audio] pacote RTP inválido: %v", err)
+			continue
+		}
+
+		// Como podemos ter descartado excedente, os sequence numbers do FFmpeg
+		// ficam com buracos — e um buraco é indistinguível de PERDA para o
+		// receptor, que dispara NACK e ocultação de erro (chiado). Reescrevemos
+		// sequence e timestamp para um fluxo contínuo: o que sai é sempre
+		// consecutivo, avançando 20ms de relógio Opus (48kHz) por pacote.
+		pkt.Header.SequenceNumber = audioSeq
+		pkt.Header.Timestamp = audioTS
+		audioSeq++
+		audioTS += audioSamplesPerFrame
+
+		// Pacing por relógio ABSOLUTO: espera só o que falta para o slot do
+		// pacote. Um sleep que durma demais (resolução do timer) não reduz a
+		// vazão — o próximo pacote sai na hora, e a média fica em 50 pkt/s.
+		// Se estamos atrasados, envia imediato e realinha o relógio.
+		now := time.Now()
+		if nextSlot.IsZero() {
+			nextSlot = now
+		}
+		if wait := nextSlot.Sub(now); wait > 0 {
+			if wait > audioFrameDuration {
+				wait = audioFrameDuration
+			}
+			time.Sleep(wait)
+			nextSlot = nextSlot.Add(audioFrameDuration)
+		} else {
+			nextSlot = time.Now().Add(audioFrameDuration)
+		}
+
+		if err := track.WriteRTP(&pkt); err != nil {
+			log.Printf("[audio] WriteRTP: %v", err)
+			return
+		}
+
+		sent := time.Now()
+		if !last.IsZero() && sent.Sub(last) > maxGap {
+			maxGap = sent.Sub(last)
+		}
+		last = sent
+		packets++
+		bytes += int64(len(raw))
 	}
 }
 
@@ -498,6 +599,47 @@ const (
 
 const annexBStartCode = "\x00\x00\x00\x01"
 
+// paramSetInterval: periodicidade do reenvio de SPS/PPS em frames que não são
+// keyframe. Barato (~30 bytes) e garante que um client que entre no meio do
+// stream — ou que perca o IDR — consiga inicializar o decoder em ~1s.
+const paramSetInterval = time.Second
+
+// staleBacklogFor decide, a partir da CAPACIDADE da fila, quando um P-frame é
+// considerado obsoleto e descartado em vez de enviado.
+//
+// Tem de ser relativo, não uma constante: a profundidade da fila vem do perfil
+// de latência (ultra=2, balanced=3, smooth=6 frames). Um limiar fixo de 3
+// descartava sem parar justamente no perfil "smooth" — cuja fila é 6 e que
+// existe para SUAVIZAR — jogando fora 123 frames numa sessão de 2 minutos e
+// produzindo o engasgo que deveria evitar.
+//
+// O descarte existe só para o caso patológico: a captura trava por contenção de
+// GPU e depois despeja o represado de uma vez (medido: fps=378 num segundo).
+// Enviar essa avalanche entrega imagem velha e trava a TV. Disparar apenas
+// quando a fila está praticamente cheia mantém o comportamento normal intacto.
+func staleBacklogFor(queueCap int) int {
+	if queueCap <= 0 {
+		return staleBacklogFloor
+	}
+	// Um frame esperando na fila é latência pura: a 60fps, cada posição ocupada
+	// custa ~16.7ms na tela. Deixar a fila INTEIRA como espaço operacional
+	// (tentativa anterior) fez com que ela vivesse cheia — 6 frames = 100ms
+	// fixos de atraso, com gapEnvio medido em 50-83ms. O usuário sentiu como
+	// "lag de 1s" somado ao buffer da TV.
+	//
+	// O equilíbrio é permitir folga para absorver jitter, mas não a fila toda:
+	// acima da metade, o excedente é atraso acumulado e sai fora.
+	t := queueCap / 2
+	if t < staleBacklogFloor {
+		t = staleBacklogFloor
+	}
+	return t
+}
+
+// staleBacklogFloor: piso do limiar. Com filas curtas (perfil ultra, fila=2)
+// um limiar menor que isto descartaria em operação normal.
+const staleBacklogFloor = 3
+
 // pumpVideo lê NAL units do H.264 Annex-B, agrupa-as em access units (frames)
 // e entrega cada frame completo ao Pion como um único media.Sample.
 //
@@ -524,7 +666,88 @@ type videoPumpStats struct {
 	maxWriteNs      atomic.Int64
 	maxQueueDepth   atomic.Int64
 	maxQueueBlockNs atomic.Int64
+	droppedFrames   atomic.Int64
+	lateFrames      atomic.Int64
 }
+
+// superviseVideo mantém a captura viva pelo tempo da sessão, reiniciando o
+// FFmpeg quando o pipeline de captura morre.
+//
+// Por que é necessário: o ddagrab (Desktop Duplication) é derrubado pelo Windows
+// quando a swapchain do desktop é recriada — o caso comum é um jogo entrando em
+// tela cheia exclusiva ou trocando a resolução/monitor. O FFmpeg reporta
+// "Error during demuxing: Generic error in an external library" e encerra.
+//
+// Antes, pumpVideo simplesmente retornava: a PeerConnection continuava
+// conectada, o áudio seguia tocando e o vídeo ficava PRETO para sempre, sem
+// nenhuma chance de recuperação a não ser reconectar na mão. Como a sessão
+// segue perfeitamente utilizável, o certo é levantar a captura de novo.
+func (s *Session) superviseVideo(stream io.ReadCloser, track sampleWriter) {
+	attempt := 0
+	for {
+		s.pumpVideo(stream, track)
+
+		// A sessão acabou (usuário saiu, conexão caiu): não reinicia nada.
+		if s.closed.Load() {
+			return
+		}
+
+		attempt++
+		if attempt > captureRestartLimit {
+			log.Printf("[capture] captura falhou %d vezes seguidas; desistindo. "+
+				"Reconecte para tentar novamente.", attempt)
+			return
+		}
+
+		delay := captureRestartDelay * time.Duration(attempt)
+		if delay > captureRestartMaxDelay {
+			delay = captureRestartMaxDelay
+		}
+		log.Printf("[capture] pipeline de vídeo caiu (jogo em tela cheia ou troca de "+
+			"modo de display?); reiniciando em %s (tentativa %d/%d)", delay, attempt, captureRestartLimit)
+
+		select {
+		case <-time.After(delay):
+		case <-s.done:
+			return
+		}
+		if s.closed.Load() {
+			return
+		}
+
+		// Sobe uma captura nova. A anterior já se encerrou junto com o FFmpeg.
+		newCap := newCapturer(s.cfg)
+		newStream, err := newCap.Start(context.Background())
+		if err != nil {
+			log.Printf("[capture] falha ao reiniciar: %v", err)
+			continue
+		}
+
+		s.mu.Lock()
+		old := s.cap
+		s.cap = newCap
+		s.mu.Unlock()
+		if old != nil {
+			old.Stop()
+		}
+
+		log.Println("[capture] captura restabelecida")
+		stream = newStream
+		attempt = 0 // recuperou: zera o contador para futuras quedas
+	}
+}
+
+const (
+	// captureRestartLimit: tentativas seguidas antes de desistir. Sem teto, uma
+	// falha permanente (GPU removida, driver caído) viraria um laço infinito de
+	// processos FFmpeg.
+	captureRestartLimit = 5
+	// captureRestartDelay: espera base entre tentativas, multiplicada pelo número
+	// da tentativa. Dá tempo ao Windows de terminar a troca de modo de display
+	// antes de tentarmos capturar de novo.
+	captureRestartDelay    = 700 * time.Millisecond
+	captureRestartMaxDelay = 3 * time.Second
+)
 
 func (s *Session) pumpVideo(stream io.ReadCloser, track sampleWriter) {
 	defer stream.Close()
@@ -541,9 +764,29 @@ func (s *Session) pumpVideo(stream io.ReadCloser, track sampleWriter) {
 		}
 	}()
 
-	if err := writeVideoFrames(frames, track, frameDur, tune.PacerMaxHold, &stats); err != nil {
+	if err := writeVideoFrames(frames, track, frameDur, tune.PacerMaxHold, &stats, s.takeParamResend); err != nil {
 		log.Printf("[video] WriteSample: %v", err)
 	}
+}
+
+// takeParamResend consome (e limpa) o pedido de reenvio de parâmetros vindo do
+// PLI/FIR do receptor.
+func (s *Session) takeParamResend() bool {
+	return s.paramResend.Swap(false)
+}
+
+// bindWaiter é satisfeito pela track real; permite ao pump saber se o RTP já tem
+// para onde ir. Tracks de teste que não implementam a interface são tratadas
+// como sempre ligadas.
+type bindWaiter interface {
+	Bound() bool
+}
+
+func trackBound(track sampleWriter) bool {
+	if bw, ok := track.(bindWaiter); ok {
+		return bw.Bound()
+	}
+	return true
 }
 
 func readH264AccessUnits(stream io.Reader, frameDur time.Duration, out chan encodedFrame, stats *videoPumpStats) error {
@@ -581,7 +824,16 @@ func readH264AccessUnits(stream io.Reader, frameDur time.Duration, out chan enco
 			}
 			now := time.Now()
 			if !lastRead.IsZero() {
-				recordMaxDuration(&stats.maxReadGapNs, now.Sub(lastRead))
+				gap := now.Sub(lastRead)
+				recordMaxDuration(&stats.maxReadGapNs, gap)
+				// Conta os frames que chegaram FORA da cadência (mais de 2x o
+				// intervalo esperado). O máximo por segundo sozinho engana: um
+				// único pico de 100ms produz a mesma leitura de uma rajada
+				// constante, e são situações opostas. O que o olho percebe como
+				// "não suave" é a FREQUÊNCIA de frames irregulares, não o pior.
+				if gap > 2*frameDur {
+					stats.lateFrames.Add(1)
+				}
 			}
 			lastRead = now
 		}
@@ -641,7 +893,7 @@ func readH264AccessUnits(stream io.Reader, frameDur time.Duration, out chan enco
 	}
 }
 
-func writeVideoFrames(frames <-chan encodedFrame, track sampleWriter, frameDur, maxHold time.Duration, stats *videoPumpStats) error {
+func writeVideoFrames(frames <-chan encodedFrame, track sampleWriter, frameDur, maxHold time.Duration, stats *videoPumpStats, paramResendRequested func() bool) error {
 	logTicker := time.NewTicker(time.Second)
 	defer logTicker.Stop()
 
@@ -677,8 +929,83 @@ func writeVideoFrames(frames <-chan encodedFrame, track sampleWriter, frameDur, 
 	// quando em dia; no pior caso < maxHold (meio frame).
 	var nextSlot time.Time
 
+	// Gate de início: enquanto a track não estiver ligada (Bind), o WriteSample é
+	// descartado silenciosamente pelo Pion. O stream é pré-aquecido antes do
+	// handshake, então os primeiros frames — INCLUSIVE o IDR inicial que carrega
+	// SPS/PPS — cairiam no vazio, e a TV ficaria sem parâmetros de decode (tela
+	// preta) até o próximo keyframe do GOP. Guardamos o último SPS/PPS visto e só
+	// começamos a emitir a partir de um keyframe, prefixando os parâmetros se o
+	// keyframe vier sem eles.
+	started := false
+	var paramSets []byte
+	var lastParamSend time.Time
+
+	// Limiar de obsolescência relativo à fila deste perfil de latência.
+	staleBacklog := staleBacklogFor(cap(frames))
+
 	paced := func(frame encodedFrame, backlog int) error {
+		if ps := extractParameterSets(frame.data); len(ps) > 0 {
+			paramSets = ps
+		}
+
+		if !started {
+			// Espera a track ligar (durante o pré-aquecimento o RTP não tem para
+			// onde ir) E um ponto de entrada válido para o decoder.
+			if !trackBound(track) {
+				return nil
+			}
+			// O ponto de entrada TEM de ser um keyframe: um P-frame depende de
+			// referências que o decoder não tem, e prefixá-lo com SPS/PPS não muda
+			// isso — daria imagem quebrada em vez de imagem nenhuma.
+			//
+			// O custo de esperar é real (até um GOP inteiro de tela preta), e por
+			// isso o GOP foi encurtado — ver gopSecondsFor em tuning.go.
+			if !frame.keyframe {
+				return nil
+			}
+			started = true
+		}
+
+		// Descarte de frames OBSOLETOS. Quando a captura engasga (contenção de GPU:
+		// o ddagrab para de entregar e depois despeja o represado de uma vez —
+		// medido fps=378 num segundo, com pico de 114 Mbps num teto de 24), enviar
+		// tudo é contraproducente: são imagens do passado que chegam atrasadas,
+		// estouram o buffer da TV e travam justamente o que deveriam mostrar.
+		// Numa live, o frame mais recente é o único que importa.
+		//
+		// Só descartamos P-frames: soltar um keyframe quebraria a referência do
+		// decoder. E só quando o backlog passa do limiar, para não interferir na
+		// operação normal (backlog típico medido: 1-3).
+		if backlog > staleBacklog && !frame.keyframe {
+			if stats != nil {
+				stats.droppedFrames.Add(1)
+			}
+			return nil
+		}
+
+		// Reenvio periódico de SPS/PPS: sem isso, os parâmetros só trafegam junto
+		// do IDR (a cada GOP). Se ESSE pacote se perde no Wi-Fi, a TV fica sem como
+		// inicializar o decoder e exibe tela preta até o próximo keyframe — ou para
+		// sempre, se a perda se repetir. Reemitir a cada ~1s custa ~30 bytes/s e
+		// torna o stream auto-recuperável em qualquer ponto de entrada.
 		now := time.Now()
+		if hasParameterSets(frame.data) {
+			// O frame já carrega os parâmetros (keyframe): serve como reenvio e
+			// satisfaz qualquer PLI pendente.
+			lastParamSend = now
+			if paramResendRequested != nil {
+				paramResendRequested()
+			}
+		} else if len(paramSets) > 0 {
+			// Só consome o pedido de PLI quando ele pode de fato ser atendido —
+			// consumi-lo num frame que já tinha SPS/PPS perderia o sinal.
+			forced := paramResendRequested != nil && paramResendRequested()
+			if forced || lastParamSend.IsZero() || now.Sub(lastParamSend) >= paramSetInterval {
+				frame.data = append(append([]byte(nil), paramSets...), frame.data...)
+				lastParamSend = now
+			}
+		}
+
 		if nextSlot.IsZero() {
 			nextSlot = now
 		}
@@ -712,6 +1039,50 @@ func writeVideoFrames(frames <-chan encodedFrame, track sampleWriter, frameDur, 
 			logVideoPumpStats(stats)
 		}
 	}
+}
+
+// forEachNAL percorre as NALs de um buffer Annex-B chamando fn(tipo, nal
+// completa com start code).
+func forEachNAL(au []byte, fn func(nalType byte, nal []byte)) {
+	starts := []int{}
+	for i := 0; i+3 < len(au); i++ {
+		if au[i] == 0 && au[i+1] == 0 && au[i+2] == 1 {
+			starts = append(starts, i)
+		}
+	}
+	for idx, start := range starts {
+		end := len(au)
+		if idx+1 < len(starts) {
+			end = starts[idx+1]
+		}
+		payload := start + 3
+		if payload >= end {
+			continue
+		}
+		fn(au[payload]&0x1f, au[start:end])
+	}
+}
+
+// extractParameterSets devolve SPS+PPS (com start codes) presentes no access
+// unit, na ordem em que aparecem.
+func extractParameterSets(au []byte) []byte {
+	var out []byte
+	forEachNAL(au, func(nalType byte, nal []byte) {
+		if nalType == nalTypeSPS || nalType == nalTypePPS {
+			out = append(out, nal...)
+		}
+	})
+	return out
+}
+
+func hasParameterSets(au []byte) bool {
+	found := false
+	forEachNAL(au, func(nalType byte, _ []byte) {
+		if nalType == nalTypeSPS {
+			found = true
+		}
+	})
+	return found
 }
 
 func recordMaxDuration(target *atomic.Int64, d time.Duration) {
@@ -750,13 +1121,15 @@ func logVideoPumpStats(stats *videoPumpStats) {
 	maxWrite := time.Duration(stats.maxWriteNs.Swap(0))
 	maxQueueDepth := stats.maxQueueDepth.Swap(0)
 	maxQueueBlock := time.Duration(stats.maxQueueBlockNs.Swap(0))
+	dropped := stats.droppedFrames.Swap(0)
+	late := stats.lateFrames.Swap(0)
 
 	if read == 0 && sent == 0 && keyframes == 0 && bytes == 0 {
 		return
 	}
 
-	log.Printf("[video] lidos=%d fps enviados=%d fps keyframes=%d taxa=%d KB/s frameMax=%d KB gapMax leitura/envio=%s/%s writeMax=%s filaPicoMax=%d filaBloqMax=%s",
-		read, sent, keyframes, bytes/1024, maxFrameBytes/1024, maxReadGap, maxSendGap, maxWrite, maxQueueDepth, maxQueueBlock)
+	log.Printf("[video] lidos=%d fps enviados=%d fps desc=%d atras=%d keyframes=%d taxa=%d KB/s frameMax=%d KB gapMax leitura/envio=%s/%s writeMax=%s filaPicoMax=%d filaBloqMax=%s",
+		read, sent, dropped, late, keyframes, bytes/1024, maxFrameBytes/1024, maxReadGap, maxSendGap, maxWrite, maxQueueDepth, maxQueueBlock)
 }
 
 // HandleOffer processa a SDP offer do client e devolve a answer.
@@ -788,8 +1161,20 @@ func offerIncludesAudio(sdp string) bool {
 
 // Close encerra a sessão.
 func (s *Session) Close() {
-	if s.cap != nil {
-		s.cap.Stop()
+	// Sinaliza ANTES de parar a captura: assim o supervisor sabe que o fim do
+	// stream é o encerramento da sessão, e não uma queda do ddagrab a recuperar.
+	s.closed.Store(true)
+	s.closeOnce.Do(func() {
+		if s.done != nil {
+			close(s.done)
+		}
+	})
+
+	s.mu.Lock()
+	cap := s.cap
+	s.mu.Unlock()
+	if cap != nil {
+		cap.Stop()
 	}
 	if s.audioCap != nil {
 		s.audioCap.Stop()
